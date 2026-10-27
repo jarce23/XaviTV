@@ -54,14 +54,12 @@ import org.jetbrains.skia.Paint
 import org.jetbrains.skia.Rect
 import org.jetbrains.skia.SamplingMode
 import org.jetbrains.skia.Surface
+import platform.AVFAudio.*
 import platform.AVFoundation.*
 import platform.AVKit.AVPlayerViewController
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMakeWithSeconds
 import platform.Foundation.NSData
-import platform.Foundation.NSDictionary
-import platform.Foundation.NSDocumentDirectory
-import platform.Foundation.NSSearchPathForDirectoriesInDomains
 import platform.Foundation.NSString
 import platform.Foundation.NSTemporaryDirectory
 import platform.Foundation.NSURL
@@ -69,10 +67,8 @@ import platform.Foundation.NSURLCache
 import platform.Foundation.NSURLRequestReloadIgnoringLocalCacheData
 import platform.Foundation.NSUTF8StringEncoding
 import platform.Foundation.NSUserDefaults
-import platform.Foundation.NSUserDomainMask
 import platform.Foundation.create
 import platform.Foundation.dataUsingEncoding
-import platform.Foundation.stringWithContentsOfFile
 import platform.Foundation.writeToFile
 import platform.UIKit.UIApplication
 import platform.UIKit.UIColor
@@ -88,18 +84,6 @@ private const val IOS_LIVE_FORWARD_BUFFER_SECONDS = 0.45
 private const val IOS_VOD_FORWARD_BUFFER_SECONDS = 2.0
 
 actual object PlatformStorage {
-    private fun resolveM3uCacheFilePath(cacheKey: String): String {
-        val safeName = cacheKey.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-        val docsDir = NSSearchPathForDirectoriesInDomains(
-            NSDocumentDirectory,
-            NSUserDomainMask,
-            true
-        ).firstOrNull() as? String
-        val baseDir = docsDir?.takeIf { it.isNotBlank() } ?: NSTemporaryDirectory()
-        val normalizedBase = if (baseDir.endsWith("/")) baseDir else "$baseDir/"
-        return "${normalizedBase}xavitv_m3u_${safeName}.m3u"
-    }
-
     actual fun loadStateJson(): String? {
         return NSUserDefaults.standardUserDefaults.stringForKey(PREFS_STATE_KEY)
     }
@@ -110,47 +94,19 @@ actual object PlatformStorage {
     }
 
     actual fun loadCachedM3u(cacheKey: String): String? {
-        return try {
-            val path = resolveM3uCacheFilePath(cacheKey)
-            val fromFile = NSString.stringWithContentsOfFile(
-                path = path,
-                encoding = NSUTF8StringEncoding,
-                error = null
-            )
-            if (!fromFile.isNullOrBlank()) {
-                fromFile
-            } else {
-                NSUserDefaults.standardUserDefaults.stringForKey(PREFS_M3U_FALLBACK_PREFIX + cacheKey)
-            }
-        } catch (_: Throwable) {
-            runCatching {
-                NSUserDefaults.standardUserDefaults.stringForKey(PREFS_M3U_FALLBACK_PREFIX + cacheKey)
-            }.getOrNull()
-        }
+        return runCatching {
+            NSUserDefaults.standardUserDefaults.stringForKey(PREFS_M3U_FALLBACK_PREFIX + cacheKey)
+        }.getOrNull()
     }
 
     actual fun saveCachedM3u(cacheKey: String, content: String) {
         if (content.isBlank()) return
-        try {
-            val path = resolveM3uCacheFilePath(cacheKey)
-            val nsString = NSString.create(string = content)
-            val data: NSData? = nsString.dataUsingEncoding(NSUTF8StringEncoding)
-            val wroteFile = data?.writeToFile(path, atomically = true) == true
-            if (!wroteFile) {
-                NSUserDefaults.standardUserDefaults.setObject(
-                    content,
-                    forKey = PREFS_M3U_FALLBACK_PREFIX + cacheKey
-                )
-                NSUserDefaults.standardUserDefaults.synchronize()
-            }
-        } catch (_: Throwable) {
-            runCatching {
-                NSUserDefaults.standardUserDefaults.setObject(
-                    content,
-                    forKey = PREFS_M3U_FALLBACK_PREFIX + cacheKey
-                )
-                NSUserDefaults.standardUserDefaults.synchronize()
-            }
+        runCatching {
+            NSUserDefaults.standardUserDefaults.setObject(
+                content,
+                forKey = PREFS_M3U_FALLBACK_PREFIX + cacheKey
+            )
+            NSUserDefaults.standardUserDefaults.synchronize()
         }
     }
 }
@@ -340,14 +296,7 @@ private fun createSyntheticHlsWrapperForTs(tsUrl: String): String? {
  */
 private fun createConfiguredPlayerItem(candidateUrl: String, isLive: Boolean): AVPlayerItem? {
     val nsUrl = NSURL.URLWithString(candidateUrl) ?: return null
-
-    val headers = mapOf<Any?, Any?>(
-        "User-Agent" to "VLC/3.0.20 LibVLC/3.0.20 (iOS; XaviTV)"
-    )
-    val options = mapOf<Any?, Any?>(
-        "AVURLAssetHTTPHeaderFieldsKey" to (headers as NSDictionary)
-    )
-    val asset = AVURLAsset.URLAssetWithURL(nsUrl, options = options)
+    val asset = AVURLAsset.URLAssetWithURL(nsUrl, null)
     return AVPlayerItem.playerItemWithAsset(asset).apply {
         preferredForwardBufferDuration = if (isLive) {
             IOS_LIVE_FORWARD_BUFFER_SECONDS
@@ -369,17 +318,13 @@ actual fun NativeVideoPlayer(
     onSavePosition: (Long) -> Unit,
     onClose: () -> Unit
 ) {
-    // Configura AVAudioSession para reproducción continua en segundo plano y Picture-in-Picture (PiP)
+    // Configura la sesión de audio nativa de Apple (AVFAudio / AVFoundation) para PiP y segundo plano
     LaunchedEffect(Unit) {
         runCatching {
             val session = AVAudioSession.sharedInstance()
-            session.setCategory(
-                AVAudioSessionCategoryPlayback,
-                mode = AVAudioSessionModeMoviePlayback,
-                options = 0u,
-                error = null
-            )
-            session.setActive(true, error = null)
+            session.setCategory(AVAudioSessionCategoryPlayback, null)
+            session.setMode(AVAudioSessionModeMoviePlayback, null)
+            session.setActive(true, null)
         }
     }
 
@@ -427,7 +372,7 @@ actual fun NativeVideoPlayer(
             avPlayer.replaceCurrentItemWithPlayerItem(item)
             if (!isLive && initialPositionMs > 3_000L) {
                 val targetSeconds = initialPositionMs.toDouble() / 1000.0
-                avPlayer.seekToTime(CMTimeMakeWithSeconds(targetSeconds, preferredTimescale = 1000))
+                avPlayer.seekToTime(CMTimeMakeWithSeconds(targetSeconds, 1000))
             }
             if (isLive) {
                 avPlayer.playImmediatelyAtRate(1.0f)
