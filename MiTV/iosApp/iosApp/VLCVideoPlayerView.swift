@@ -154,12 +154,10 @@ public class VLCPlayerHostView: UIView {
         // Opciones por stream
         let addOptionsSel = NSSelectorFromString("addOptions:")
         if (media as AnyObject).responds(to: addOptionsSel) {
-            let opts: [String: Any] = [
-                "network-caching": 300,
-                "live-caching": 300,
-                ":network-caching=300",
-                ":live-caching=300",
-                ":clock-jitter=0"
+            let opts: [String] = [
+                "--network-caching=300",
+                "--live-caching=300",
+                "--clock-jitter=0"
             ]
             _ = (media as AnyObject).perform(addOptionsSel, with: opts)
         }
@@ -244,15 +242,10 @@ public class VLCPlayerHostView: UIView {
 
     @objc(seekToNumber:)
     public func seekToNumber(number: NSNumber) {
-        seekTo(seconds: number.doubleValue)
+        seekToSeconds(seconds: number.doubleValue)
     }
 
-    @objc(seekToSeconds:)
-    public func seekToSeconds(seconds: Double) {
-        seekTo(seconds: seconds)
-    }
-
-    @objc public func seekTo(seconds: Double) {
+    @objc public func seekToSeconds(seconds: Double) {
         if let player = vlcMediaPlayer {
             let timeClass = NSClassFromString("VLCTime") as? NSObject.Type
             if let timeClass = timeClass {
@@ -391,7 +384,7 @@ public class VLCPlayerBridge: NSObject {
     }
 
     @objc public static func seekTo(seconds: Double) {
-        shared.currentHost?.seekTo(seconds: seconds)
+        shared.currentHost?.seekToSeconds(seconds: seconds)
     }
 
     @objc public static func setAspectRatio(_ ratio: String) {
@@ -407,7 +400,10 @@ public class VLCPlayerBridge: NSObject {
     }
 
     @objc public static func getTimeMs() -> Int64 {
-        return shared.currentHost?.getPlaybackTimeMs() ?? 0
+        if let num = shared.currentHost?.getPlaybackTimeMs() {
+            return Int64(truncating: num)
+        }
+        return 0
     }
 
     @objc public static func isPlaying() -> Bool {
