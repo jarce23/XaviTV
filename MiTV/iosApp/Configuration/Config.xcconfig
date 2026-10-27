@@ -1,3 +1,8 @@
+PODS_ROOT=$(SRCROOT)/Pods
+PODS_PODFILE_DIR_PATH=$(SRCROOT)
+#include? "../Pods/Target Support Files/Pods-iosApp/Pods-iosApp.release.xcconfig"
+#include? "../Pods/Target Support Files/Pods-iosApp/Pods-iosApp.debug.xcconfig"
+
 TEAM_ID=
 PRODUCT_NAME=XaviTV
 PRODUCT_BUNDLE_IDENTIFIER=com.minuevaapp.tv.ios

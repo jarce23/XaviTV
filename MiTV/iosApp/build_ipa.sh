@@ -72,10 +72,11 @@ for TARGET_SDK_DIR in "iphoneos" "$DETECTED_SDK_NAME"; do
     echo "Framework disponible en: $XCODE_FW_DIR/ComposeApp.framework"
 done
 
-if [ -f "$SCRIPT_DIR/Podfile" ] && [ ! -d "$SCRIPT_DIR/iosApp.xcworkspace" ] && command -v pod >/dev/null 2>&1; then
-    echo "========================================================"
-    echo "  2b. Instalando CocoaPods (MobileVLCKit)..."
-    echo "========================================================"
+echo "========================================================"
+echo "  2b. Instalando CocoaPods (MobileVLCKit)..."
+echo "========================================================"
+if command -v pod >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/Podfile" ]; then
+    echo "Ejecutando pod install --repo-update en $SCRIPT_DIR..."
     (cd "$SCRIPT_DIR" && (pod install --repo-update || pod install)) || echo "Aviso: pod install finalizó con advertencias."
 fi
 
@@ -100,6 +101,8 @@ if [ "${SIGNED_ARCHIVE:-0}" = "1" ]; then
         -configuration Release \
         -sdk iphoneos \
         -archivePath "$ARCHIVE_PATH" \
+        PODS_ROOT="$SCRIPT_DIR/Pods" \
+        PODS_PODFILE_DIR_PATH="$SCRIPT_DIR" \
         CODE_SIGN_IDENTITY="" \
         CODE_SIGNING_REQUIRED=NO \
         CODE_SIGNING_ALLOWED=NO \
@@ -116,6 +119,8 @@ else
         -configuration Release \
         -sdk iphoneos \
         -derivedDataPath "$BUILD_DIR/DerivedData" \
+        PODS_ROOT="$SCRIPT_DIR/Pods" \
+        PODS_PODFILE_DIR_PATH="$SCRIPT_DIR" \
         CODE_SIGN_IDENTITY="" \
         CODE_SIGNING_REQUIRED=NO \
         CODE_SIGNING_ALLOWED=NO \
