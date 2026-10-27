@@ -90,17 +90,24 @@ echo "========================================================"
 echo "  2c. Copiando MobileVLCKit.framework en iosApp/Frameworks"
 echo "========================================================"
 mkdir -p "$SCRIPT_DIR/Frameworks"
-VLC_FW_SRC="$(find "$SCRIPT_DIR/Pods" -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -E "ios-arm64[^/]*|MobileVLCKit\.framework$" | head -n 1 || true)"
+VLC_FW_SRC="$(find "$SCRIPT_DIR/Pods" -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -i "ios-arm64" | grep -v -i "simulator" | grep -v -i "macos" | head -n 1 || true)"
 if [ -z "$VLC_FW_SRC" ]; then
-    VLC_FW_SRC="$(find "$SCRIPT_DIR/Pods" -name "MobileVLCKit.framework" -type d 2>/dev/null | head -n 1 || true)"
+    VLC_FW_SRC="$(find "$SCRIPT_DIR/Pods" -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -v -i "simulator" | grep -v -i "macos" | head -n 1 || true)"
 fi
 
 if [ -n "$VLC_FW_SRC" ] && [ -d "$VLC_FW_SRC" ]; then
-    echo "MobileVLCKit.framework localizado en: $VLC_FW_SRC"
+    echo "MobileVLCKit.framework físico (arm64) localizado en: $VLC_FW_SRC"
     rm -rf "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework"
     cp -R "$VLC_FW_SRC" "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework"
-    if [ -f "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework/MobileVLCKit" ]; then
-        chmod +x "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework/MobileVLCKit"
+    FW_BIN="$SCRIPT_DIR/Frameworks/MobileVLCKit.framework/MobileVLCKit"
+    if [ -f "$FW_BIN" ]; then
+        chmod +x "$FW_BIN"
+        if xcrun lipo -info "$FW_BIN" 2>/dev/null | grep -q "Non-fat"; then
+            echo "MobileVLCKit ya es single-architecture"
+        else
+            echo "Adelgazando MobileVLCKit a arm64 puro con lipo..."
+            xcrun lipo -thin arm64 "$FW_BIN" -output "$FW_BIN" 2>/dev/null || true
+        fi
     fi
     rm -rf "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework/_CodeSignature"
     codesign --remove-signature "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework" 2>/dev/null || true
@@ -201,6 +208,12 @@ else
                 codesign --remove-signature "$fw" 2>/dev/null || true
                 if [ -f "$fw/$fw_name" ]; then
                     chmod +x "$fw/$fw_name"
+                    if xcrun lipo -info "$fw/$fw_name" 2>/dev/null | grep -q "Non-fat"; then
+                        echo "$fw_name ya es single-architecture"
+                    else
+                        echo "Adelgazando $fw_name a arm64 puro con lipo..."
+                        xcrun lipo -thin arm64 "$fw/$fw_name" -output "$fw/$fw_name" 2>/dev/null || true
+                    fi
                 fi
                 xattr -rc "$fw" 2>/dev/null || true
             fi

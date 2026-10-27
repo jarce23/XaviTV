@@ -57,9 +57,9 @@ jobs:
             cd MiTV/iosApp
             pod install --repo-update
             mkdir -p Frameworks
-            VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -E "ios-arm64[^/]*|MobileVLCKit\.framework$" | head -n 1 || true)"
+            VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -i "ios-arm64" | grep -v -i "simulator" | grep -v -i "macos" | head -n 1 || true)"
             if [ -z "$VLC_FW" ]; then
-              VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | head -n 1 || true)"
+              VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -v -i "simulator" | grep -v -i "macos" | head -n 1 || true)"
             fi
             if [ -n "$VLC_FW" ] && [ -d "$VLC_FW" ]; then
               echo "==> Copiando MobileVLCKit.framework a Frameworks/..."
@@ -67,6 +67,11 @@ jobs:
               cp -R "$VLC_FW" Frameworks/MobileVLCKit.framework
               if [ -f "Frameworks/MobileVLCKit.framework/MobileVLCKit" ]; then
                 chmod +x Frameworks/MobileVLCKit.framework/MobileVLCKit
+                if xcrun lipo -info Frameworks/MobileVLCKit.framework/MobileVLCKit 2>/dev/null | grep -q "Non-fat"; then
+                  echo "MobileVLCKit ya es single-architecture"
+                else
+                  xcrun lipo -thin arm64 Frameworks/MobileVLCKit.framework/MobileVLCKit -output Frameworks/MobileVLCKit.framework/MobileVLCKit 2>/dev/null || true
+                fi
               fi
               rm -rf Frameworks/MobileVLCKit.framework/_CodeSignature
               codesign --remove-signature Frameworks/MobileVLCKit.framework 2>/dev/null || true
@@ -78,9 +83,9 @@ jobs:
             cd iosApp
             pod install --repo-update
             mkdir -p Frameworks
-            VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -E "ios-arm64[^/]*|MobileVLCKit\.framework$" | head -n 1 || true)"
+            VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -i "ios-arm64" | grep -v -i "simulator" | grep -v -i "macos" | head -n 1 || true)"
             if [ -z "$VLC_FW" ]; then
-              VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | head -n 1 || true)"
+              VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -v -i "simulator" | grep -v -i "macos" | head -n 1 || true)"
             fi
             if [ -n "$VLC_FW" ] && [ -d "$VLC_FW" ]; then
               echo "==> Copiando MobileVLCKit.framework a Frameworks/..."
@@ -88,6 +93,11 @@ jobs:
               cp -R "$VLC_FW" Frameworks/MobileVLCKit.framework
               if [ -f "Frameworks/MobileVLCKit.framework/MobileVLCKit" ]; then
                 chmod +x Frameworks/MobileVLCKit.framework/MobileVLCKit
+                if xcrun lipo -info Frameworks/MobileVLCKit.framework/MobileVLCKit 2>/dev/null | grep -q "Non-fat"; then
+                  echo "MobileVLCKit ya es single-architecture"
+                else
+                  xcrun lipo -thin arm64 Frameworks/MobileVLCKit.framework/MobileVLCKit -output Frameworks/MobileVLCKit.framework/MobileVLCKit 2>/dev/null || true
+                fi
               fi
               rm -rf Frameworks/MobileVLCKit.framework/_CodeSignature
               codesign --remove-signature Frameworks/MobileVLCKit.framework 2>/dev/null || true
