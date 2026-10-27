@@ -1,0 +1,55 @@
+name: Build Windows (.exe)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Compilar XaviTV Windows (.exe)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Build Windows Executables (.exe Installer & Portable)
+        shell: pwsh
+        run: |
+          if (Test-Path "MiTV\gradlew.bat") {
+            Set-Location "MiTV"
+          }
+          .\gradlew.bat :desktop:packageDistributionForCurrentOS :desktop:createDistributable --no-daemon
+          $exeDir = "desktop\build\compose\binaries\main\exe"
+          if (Test-Path "$exeDir\XaviTV-1.0.0.exe") {
+            Copy-Item "$exeDir\XaviTV-1.0.0.exe" "$exeDir\XaviTV.exe" -Force
+          }
+
+      - name: Upload XaviTV Windows Installer (.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: XaviTV-Windows-Installer-EXE
+          path: |
+            MiTV/desktop/build/compose/binaries/main/exe/*.exe
+            MiTV/desktop/build/compose/binaries/main/msi/*.msi
+            desktop/build/compose/binaries/main/exe/*.exe
+            desktop/build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error
+
+      - name: Upload XaviTV Windows Portable App
+        uses: actions/upload-artifact@v4
+        with:
+          name: XaviTV-Windows-Portable
+          path: |
+            MiTV/desktop/build/compose/binaries/main/app/XaviTV/**
+            desktop/build/compose/binaries/main/app/XaviTV/**
+          if-no-files-found: warn
