@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Tune
@@ -60,6 +61,7 @@ import platform.AVKit.AVPlayerViewController
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMakeWithSeconds
 import platform.Foundation.NSData
+import platform.Foundation.NSNumber
 import platform.Foundation.NSString
 import platform.Foundation.NSTemporaryDirectory
 import platform.Foundation.NSURL
@@ -72,6 +74,10 @@ import platform.Foundation.dataUsingEncoding
 import platform.Foundation.writeToFile
 import platform.UIKit.UIApplication
 import platform.UIKit.UIColor
+import platform.UIKit.UIView
+import platform.objc.NSClassFromString
+import platform.objc.NSObjectMeta
+import platform.objc.NSSelectorFromString
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.native.runtime.GC
@@ -221,9 +227,9 @@ actual fun openStreamInExternalApp(url: String, title: String): Boolean {
 }
 
 /**
- * Construye la cascada de URLs optimizadas para AVPlayer (AVFoundation) en iOS/iPadOS:
- * Prioriza el manifiesto HLS (.m3u8) para zapping instantáneo y soporta flujos MPEG-TS (.ts)
- * tanto directos como mediante puente HLS local.
+ * Construye la lista de URLs candidatas para el motor multimedia VLCKit / AVPlayer en iOS/iPadOS:
+ * Prioriza la reproducción directa de flujos MPEG-TS (.ts) y HLS (.m3u8), soportando además
+ * conversiones automáticas entre formatos para servidores Xtream Codes.
  */
 private fun buildIosCandidateStreamUrls(originalUrl: String, isLive: Boolean): List<String> {
     val clean = originalUrl.trim()
@@ -235,11 +241,12 @@ private fun buildIosCandidateStreamUrls(originalUrl: String, isLive: Boolean): L
         }
     }
 
-    val isTsUrl = clean.endsWith(".ts", ignoreCase = true) ||
-        clean.contains(".ts?", ignoreCase = true)
+    // 1) Flujo original directo (máxima compatibilidad nativa con VLCKit)
+    addUnique(clean)
 
+    val isTsUrl = clean.endsWith(".ts", ignoreCase = true) || clean.contains(".ts?", ignoreCase = true)
     if (isTsUrl) {
-        // 1) Variante .m3u8 nativa de servidores Xtream Codes para reproducción inmediata en AVPlayer
+        // Variante .m3u8 para servidores Xtream Codes
         val m3u8Variant = clean.replace(Regex("\\.ts(\\?.*)?$", RegexOption.IGNORE_CASE), ".m3u8$1")
         addUnique(m3u8Variant)
         if (!clean.contains("/live/", ignoreCase = true)) {
@@ -250,61 +257,12 @@ private fun buildIosCandidateStreamUrls(originalUrl: String, isLive: Boolean): L
                 addUnique("$base/live/$rest")
             }
         }
-        // 2) Enlace TS directo
-        addUnique(clean)
-        // 3) Puente HLS sintético local (.m3u8 en NSTemporaryDirectory)
-        createSyntheticHlsWrapperForTs(clean)?.let { addUnique(it) }
     } else if (clean.endsWith(".m3u8", ignoreCase = true) || clean.contains(".m3u8?", ignoreCase = true)) {
-        addUnique(clean)
         val tsVariant = clean.replace(Regex("\\.m3u8(\\?.*)?$", RegexOption.IGNORE_CASE), ".ts$1")
         addUnique(tsVariant)
-    } else {
-        addUnique(clean)
-        if (isLive && !clean.endsWith(".mp4", ignoreCase = true)) {
-            addUnique("$clean.m3u8")
-        }
     }
 
     return candidates
-}
-
-private fun createSyntheticHlsWrapperForTs(tsUrl: String): String? {
-    return try {
-        val m3u8Content = buildString {
-            appendLine("#EXTM3U")
-            appendLine("#EXT-X-VERSION:3")
-            appendLine("#EXT-X-TARGETDURATION:3600")
-            appendLine("#EXT-X-MEDIA-SEQUENCE:0")
-            appendLine("#EXTINF:3600.0,Live TS Stream")
-            appendLine(tsUrl)
-        }
-        val tempFile = NSTemporaryDirectory() + "xavitv_ts_bridge.m3u8"
-        val nsString = NSString.create(string = m3u8Content)
-        val data: NSData? = nsString.dataUsingEncoding(NSUTF8StringEncoding)
-        if (data != null && data.writeToFile(tempFile, atomically = true)) {
-            NSURL.fileURLWithPath(tempFile).absoluteString
-        } else {
-            null
-        }
-    } catch (_: Exception) {
-        null
-    }
-}
-
-/**
- * Crea un AVPlayerItem optimizado con búfer reducido (0.45s en directo) para lograr un zapping casi instantáneo.
- */
-private fun createConfiguredPlayerItem(candidateUrl: String, isLive: Boolean): AVPlayerItem? {
-    val nsUrl = NSURL.URLWithString(candidateUrl) ?: return null
-    val asset = AVURLAsset.URLAssetWithURL(nsUrl, null)
-    return AVPlayerItem.playerItemWithAsset(asset).apply {
-        preferredForwardBufferDuration = if (isLive) {
-            IOS_LIVE_FORWARD_BUFFER_SECONDS
-        } else {
-            IOS_VOD_FORWARD_BUFFER_SECONDS
-        }
-        canUseNetworkResourcesForLiveStreamingWhilePaused = true
-    }
 }
 
 @Composable
@@ -318,7 +276,7 @@ actual fun NativeVideoPlayer(
     onSavePosition: (Long) -> Unit,
     onClose: () -> Unit
 ) {
-    // Configura la sesión de audio nativa de Apple (AVFAudio / AVFoundation) para PiP y segundo plano
+    // Configura la sesión de audio nativa de Apple para reproducción continua, en segundo plano y AirPlay
     LaunchedEffect(Unit) {
         runCatching {
             val session = AVAudioSession.sharedInstance()
@@ -331,22 +289,18 @@ actual fun NativeVideoPlayer(
     val candidates = remember(url, isLive) { buildIosCandidateStreamUrls(url, isLive) }
     var candidateIndex by remember(url) { mutableStateOf(0) }
     var reloadSalt by remember(url) { mutableStateOf(0) }
-    var statusLabel by remember(url) { mutableStateOf("Zapping rápido AVPlayer...") }
+    var isPlaying by remember(url) { mutableStateOf(true) }
+    var currentAspectIndex by remember(url) { mutableStateOf(0) }
+    val aspectRatios = remember { listOf("DEFAULT", "16:9", "4:3", "FILL") }
+    var statusLabel by remember(url) { mutableStateOf("VLCKit • Iniciando decodificador de baja latencia...") }
     var hasPlaybackError by remember(url) { mutableStateOf(false) }
     var showOverlayBar by remember { mutableStateOf(true) }
     var lastInteractionTick by remember { mutableStateOf(0) }
+    var hostViewRef by remember { mutableStateOf<UIView?>(null) }
 
     val currentStreamUrl = candidates.getOrElse(candidateIndex) { url }
 
-    val avPlayer = remember {
-        AVPlayer().apply {
-            // Desactiva la espera de pre-búfer largo en canales en directo para arrancar en el primer fotograma
-            automaticallyWaitsToMinimizeStalling = !isLive
-            allowsExternalPlayback = true
-        }
-    }
-
-    // Ocultación automática de la barra superior tras 4 segundos para dejar limpio el vídeo y controles PiP/AirPlay
+    // Ocultación automática de la barra de controles tras 4 segundos sin interacción
     LaunchedEffect(showOverlayBar, lastInteractionTick, hasPlaybackError) {
         if (showOverlayBar && !hasPlaybackError) {
             delay(4_000L)
@@ -354,77 +308,64 @@ actual fun NativeVideoPlayer(
         }
     }
 
-    // Carga o conmuta la URL candidata en AVPlayer con arranque inmediato
-    LaunchedEffect(currentStreamUrl, reloadSalt) {
+    // Carga o reinicia el flujo en el motor interno VLCKit (con fallback AVPlayer si la librería no está enlazada)
+    LaunchedEffect(currentStreamUrl, reloadSalt, hostViewRef) {
+        val hostView = hostViewRef ?: return@LaunchedEffect
         hasPlaybackError = false
+        isPlaying = true
         showOverlayBar = true
-        val formatTag = when {
-            currentStreamUrl.contains("xavitv_ts_bridge.m3u8") -> "HLS Bridge (.ts)"
-            currentStreamUrl.contains(".m3u8", ignoreCase = true) -> "HLS (.m3u8)"
-            currentStreamUrl.contains(".ts", ignoreCase = true) -> "MPEG-TS (.ts)"
-            else -> "Direct Stream"
-        }
-        statusLabel = "Zapping $formatTag..."
 
-        avPlayer.automaticallyWaitsToMinimizeStalling = !isLive
-        val item = createConfiguredPlayerItem(currentStreamUrl, isLive)
-        if (item != null) {
-            avPlayer.replaceCurrentItemWithPlayerItem(item)
-            if (!isLive && initialPositionMs > 3_000L) {
-                val targetSeconds = initialPositionMs.toDouble() / 1000.0
-                avPlayer.seekToTime(CMTimeMakeWithSeconds(targetSeconds, 1000))
-            }
-            if (isLive) {
-                avPlayer.playImmediatelyAtRate(1.0f)
-            } else {
-                avPlayer.play()
-            }
-        } else {
-            hasPlaybackError = true
-            statusLabel = "URL no válida"
+        val formatTag = when {
+            currentStreamUrl.contains(".ts", ignoreCase = true) -> "MPEG-TS (.ts)"
+            currentStreamUrl.contains(".m3u8", ignoreCase = true) -> "HLS (.m3u8)"
+            else -> "Stream directo"
         }
+        statusLabel = "VLCKit • Conectando $formatTag..."
+
+        val playSel = if (isLive) NSSelectorFromString("playStreamUrl:") else NSSelectorFromString("playVodUrl:")
+        val nsUrl = NSString.create(string = currentStreamUrl)
+        hostView.performSelector(playSel, withObject = nsUrl)
+
+        if (!isLive && initialPositionMs > 3_000L) {
+            val sec = initialPositionMs.toDouble() / 1000.0
+            val seekSel = NSSelectorFromString("seekToNumber:")
+            val nsSec = NSNumber(double = sec)
+            hostView.performSelector(seekSel, withObject = nsSec)
+        }
+
+        // Aplica relación de aspecto actual
+        val aspectSel = NSSelectorFromString("setAspectRatio:")
+        val nsRatio = NSString.create(string = aspectRatios[currentAspectIndex])
+        hostView.performSelector(aspectSel, withObject = nsRatio)
     }
 
-    // Supervisión rápida (cada 500ms) para zapping ágil entre variantes HLS y TS si un servidor requiere fallback
-    LaunchedEffect(currentStreamUrl, reloadSalt) {
-        var halfSecondsWaiting = 0
+    // Supervisión periódica (cada 1s) para telemetría de estado y detección de fallos de reproducción
+    LaunchedEffect(currentStreamUrl, reloadSalt, hostViewRef) {
+        val hostView = hostViewRef ?: return@LaunchedEffect
         while (true) {
-            delay(500)
-            val item = avPlayer.currentItem
-            if (item == null) {
-                halfSecondsWaiting++
-            } else {
-                when (item.status) {
-                    AVPlayerItemStatusReadyToPlay -> {
-                        hasPlaybackError = false
-                        val modeLabel = if (currentStreamUrl.contains(".m3u8", ignoreCase = true)) "HLS" else "TS/MP4"
-                        statusLabel = if (isLive) "EN DIRECTO • $modeLabel • PiP Activo" else "VOD • $modeLabel • PiP Activo"
-                        if (!isLive) {
-                            val sec = CMTimeGetSeconds(avPlayer.currentTime())
-                            if (!sec.isNaN() && sec > 2.0) {
-                                onSavePosition((sec * 1000.0).toLong())
-                            }
-                        }
-                    }
-                    AVPlayerItemStatusFailed -> {
-                        if (candidateIndex + 1 < candidates.size) {
-                            statusLabel = "Conmutando variante (${candidateIndex + 2}/${candidates.size})..."
-                            candidateIndex += 1
-                            break
-                        } else {
-                            hasPlaybackError = true
-                            showOverlayBar = true
-                            statusLabel = "El canal requiere reconexión o abrir en VLC"
-                        }
-                    }
-                    else -> {
-                        halfSecondsWaiting++
-                        if (halfSecondsWaiting >= 12 && candidateIndex + 1 < candidates.size) {
-                            statusLabel = "Probando variante HLS/TS alternativa..."
-                            candidateIndex += 1
-                            break
-                        }
-                    }
+            delay(1000L)
+            val msg = hostView.valueForKey("currentStatusMessage") as? String
+            if (!msg.isNullOrBlank()) {
+                statusLabel = msg
+            }
+            val hasErr = (hostView.valueForKey("currentHasError") as? NSNumber)?.boolValue ?: false
+            if (hasErr && !hasPlaybackError) {
+                if (candidateIndex + 1 < candidates.size) {
+                    candidateIndex += 1
+                    statusLabel = "Conmutando variante (${candidateIndex + 1}/${candidates.size})..."
+                    break
+                } else {
+                    hasPlaybackError = true
+                    showOverlayBar = true
+                    statusLabel = "Fallo de decodificación. Reintenta o abre en VLC externo"
+                }
+            }
+            if (!isLive) {
+                val timeSel = NSSelectorFromString("getPlaybackTimeMs")
+                val timeNum = hostView.performSelector(timeSel) as? NSNumber
+                val timeMs = timeNum?.longLongValue ?: 0L
+                if (timeMs > 2000L) {
+                    onSavePosition(timeMs)
                 }
             }
         }
@@ -432,14 +373,8 @@ actual fun NativeVideoPlayer(
 
     DisposableEffect(Unit) {
         onDispose {
-            if (!isLive) {
-                val sec = CMTimeGetSeconds(avPlayer.currentTime())
-                if (!sec.isNaN() && sec > 2.0) {
-                    onSavePosition((sec * 1000.0).toLong())
-                }
-            }
-            avPlayer.pause()
-            avPlayer.replaceCurrentItemWithPlayerItem(null)
+            hostViewRef?.performSelector(NSSelectorFromString("stopStream"))
+            hostViewRef = null
             trimPlatformMemory()
         }
     }
@@ -448,25 +383,26 @@ actual fun NativeVideoPlayer(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .clickable {
+                showOverlayBar = !showOverlayBar
+                lastInteractionTick++
+            }
     ) {
-        // Reproductor nativo AVPlayerViewController con Picture-in-Picture (PiP) automático e inline habilitado
+        // Vista nativa UIKit alojada: VLCPlayerHostView con decodificador MobileVLCKit / LibVLC
         UIKitView(
             factory = {
-                val controller = AVPlayerViewController().apply {
-                    player = avPlayer
-                    showsPlaybackControls = true
-                    allowsPictureInPicturePlayback = true
-                    canStartPictureInPictureAutomaticallyFromInline = true
-                    updatesNowPlayingInfoCenter = true
-                    view.backgroundColor = UIColor.blackColor
+                val hostClass = NSClassFromString("VLCPlayerHostView") as? platform.darwin.NSObjectMeta
+                val view = (hostClass?.alloc()?.init() as? UIView) ?: UIView().apply {
+                    backgroundColor = UIColor.blackColor
                 }
-                controller.view
+                hostViewRef = view
+                view
             },
             update = { _ -> },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Botón discreto en área segura para volver a mostrar la barra superior cuando está oculta
+        // Botón flotante para restaurar controles cuando la barra superior se oculta
         if (!showOverlayBar && !hasPlaybackError) {
             Box(
                 modifier = Modifier
@@ -490,7 +426,7 @@ actual fun NativeVideoPlayer(
                 ) {
                     Icon(
                         Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Mostrar barra",
+                        contentDescription = "Mostrar controles",
                         tint = GoldPrimary,
                         modifier = Modifier.size(16.dp)
                     )
@@ -507,7 +443,7 @@ actual fun NativeVideoPlayer(
             }
         }
 
-        // Barra superior superpuesta respetando las Safe Areas (Notch, Isla Dinámica y esquinas redondeadas)
+        // Barra superior de controles superpuesta con soporte de Safe Area
         AnimatedVisibility(
             visible = showOverlayBar || hasPlaybackError,
             enter = fadeIn(tween(200)) + slideInVertically(tween(200)) { -it },
@@ -517,8 +453,8 @@ actual fun NativeVideoPlayer(
                 .fillMaxWidth()
         ) {
             Surface(
-                color = Color(0xFF0B1F15).copy(alpha = 0.88f),
-                border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.30f))
+                color = Color(0xFF0B1F15).copy(alpha = 0.90f),
+                border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.35f))
             ) {
                 Row(
                     modifier = Modifier
@@ -569,6 +505,60 @@ actual fun NativeVideoPlayer(
                         )
                     }
 
+                    // Selector de relación de aspecto (DEFAULT, 16:9, 4:3, FILL)
+                    OutlinedButton(
+                        onClick = {
+                            lastInteractionTick++
+                            currentAspectIndex = (currentAspectIndex + 1) % aspectRatios.size
+                            val selectedRatio = aspectRatios[currentAspectIndex]
+                            val aspectSel = NSSelectorFromString("setAspectRatio:")
+                            val nsRatio = NSString.create(string = selectedRatio)
+                            hostViewRef?.performSelector(aspectSel, withObject = nsRatio)
+                        },
+                        border = BorderStroke(1.dp, GoldPrimary),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Tune,
+                            contentDescription = "Relación de aspecto",
+                            tint = GoldPrimary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            aspectRatios[currentAspectIndex],
+                            color = GoldPrimary,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    // Botón Reproducir / Pausa
+                    IconButton(
+                        onClick = {
+                            lastInteractionTick++
+                            val hostView = hostViewRef
+                            if (hostView != null) {
+                                val sel = if (isPlaying) {
+                                    NSSelectorFromString("pauseStream")
+                                } else {
+                                    NSSelectorFromString("resumeStream")
+                                }
+                                hostView.performSelector(sel)
+                                isPlaying = !isPlaying
+                            }
+                        },
+                        modifier = Modifier
+                            .size(38.dp)
+                            .background(SurfaceCard, RoundedCornerShape(10.dp))
+                    ) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = if (isPlaying) "Pausar" else "Reproducir",
+                            tint = GoldPrimary
+                        )
+                    }
+
                     if (candidates.size > 1) {
                         OutlinedButton(
                             onClick = {
@@ -578,13 +568,6 @@ actual fun NativeVideoPlayer(
                             border = BorderStroke(1.dp, GoldPrimary),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                         ) {
-                            Icon(
-                                Icons.Default.Tune,
-                                contentDescription = null,
-                                tint = GoldPrimary,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(Modifier.width(4.dp))
                             Text(
                                 "${candidateIndex + 1}/${candidates.size}",
                                 color = GoldPrimary,
@@ -594,6 +577,7 @@ actual fun NativeVideoPlayer(
                         }
                     }
 
+                    // Botón Recargar stream
                     IconButton(
                         onClick = {
                             lastInteractionTick++
@@ -606,6 +590,7 @@ actual fun NativeVideoPlayer(
                         Icon(Icons.Default.Refresh, contentDescription = "Recargar stream", tint = TextWhite)
                     }
 
+                    // Botón Abrir en VLC externo
                     IconButton(
                         onClick = { openStreamInExternalApp(url, title) },
                         modifier = Modifier
@@ -615,7 +600,7 @@ actual fun NativeVideoPlayer(
                     ) {
                         Icon(
                             Icons.AutoMirrored.Filled.OpenInNew,
-                            contentDescription = "Abrir en VLC / Externo",
+                            contentDescription = "Abrir en VLC externo",
                             tint = GoldPrimary
                         )
                     }
@@ -623,7 +608,7 @@ actual fun NativeVideoPlayer(
             }
         }
 
-        // Tarjeta de recuperación rápida si un flujo falla tras probar todas las variantes
+        // Tarjeta de aviso y recuperación si el flujo no se puede reproducir
         if (hasPlaybackError) {
             Surface(
                 color = SurfaceCard.copy(alpha = 0.96f),
@@ -647,7 +632,7 @@ actual fun NativeVideoPlayer(
                         fontWeight = FontWeight.ExtraBold
                     )
                     Text(
-                        "AVPlayer ha intentado conectar en modo HLS (.m3u8) y MPEG-TS (.ts) con búfer rápido. Puedes reintentar o abrir el flujo en VLC para iPhone/iPad.",
+                        "El motor interno VLCKit ha intentado procesar el stream en formato MPEG-TS (.ts) y HLS (.m3u8). Si el enlace está caído o protegido, puedes reintentar la conexión o lanzarlo en la app oficial de VLC para iOS.",
                         color = TextMuted,
                         style = MaterialTheme.typography.bodySmall
                     )

@@ -72,12 +72,30 @@ for TARGET_SDK_DIR in "iphoneos" "$DETECTED_SDK_NAME"; do
     echo "Framework disponible en: $XCODE_FW_DIR/ComposeApp.framework"
 done
 
+if command -v pod >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/Podfile" ]; then
+    echo "========================================================"
+    echo "  2b. Instalando CocoaPods (MobileVLCKit)..."
+    echo "========================================================"
+    (cd "$SCRIPT_DIR" && pod install) || echo "Aviso: pod install finalizó con advertencias."
+fi
+
+# Selección de target: Espacio de trabajo de CocoaPods si existe, o proyecto Xcode
+if [ -d "$SCRIPT_DIR/iosApp.xcworkspace" ]; then
+    XCODE_TARGET_ARG="-workspace"
+    XCODE_TARGET_PATH="$SCRIPT_DIR/iosApp.xcworkspace"
+    echo "Usando espacio de trabajo CocoaPods: iosApp.xcworkspace"
+else
+    XCODE_TARGET_ARG="-project"
+    XCODE_TARGET_PATH="$SCRIPT_DIR/iosApp.xcodeproj"
+    echo "Usando proyecto Xcode estándar: iosApp.xcodeproj"
+fi
+
 echo "========================================================"
 echo "  3. Compilando proyecto Xcode (iosApp -> XaviTV.app)..."
 echo "========================================================"
 if [ "${SIGNED_ARCHIVE:-0}" = "1" ]; then
     xcodebuild archive \
-        -project "$SCRIPT_DIR/iosApp.xcodeproj" \
+        "$XCODE_TARGET_ARG" "$XCODE_TARGET_PATH" \
         -scheme iosApp \
         -configuration Release \
         -sdk iphoneos \
@@ -90,7 +108,7 @@ if [ "${SIGNED_ARCHIVE:-0}" = "1" ]; then
         -exportPath "$IPA_OUTPUT_DIR"
 else
     xcodebuild build \
-        -project "$SCRIPT_DIR/iosApp.xcodeproj" \
+        "$XCODE_TARGET_ARG" "$XCODE_TARGET_PATH" \
         -scheme iosApp \
         -configuration Release \
         -sdk iphoneos \

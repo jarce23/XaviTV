@@ -44,6 +44,16 @@ jobs:
           cp -R "$FRAMEWORK_DIR" iosApp/Frameworks/ComposeApp.framework
           echo "ComposeApp.framework exportado exitosamente en iosApp/Frameworks"
 
+      - name: Install CocoaPods dependencies (MobileVLCKit)
+        run: |
+          if [ -d "MiTV/iosApp" ]; then
+            cd MiTV/iosApp
+          else
+            cd iosApp
+          fi
+          echo "==> Instalando MobileVLCKit mediante CocoaPods..."
+          pod install --repo-update || pod install
+
       - name: Build XaviTV.ipa with Xcode (iPhone & iPad Universal)
         run: |
           if [ -d "MiTV/iosApp" ]; then

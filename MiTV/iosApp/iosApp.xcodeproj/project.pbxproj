@@ -10,6 +10,7 @@
 		B9DA97B02DC1472C00A4DA20 /* iOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9DA97AF2DC1472C00A4DA20 /* iOSApp.swift */; };
 		B9DA97B22DC1472C00A4DA20 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9DA97B12DC1472C00A4DA20 /* ContentView.swift */; };
 		B9DA97B42DC1472E00A4DA20 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B9DA97B32DC1472E00A4DA20 /* Assets.xcassets */; };
+		B9DA97B62DC1472C00A4DA20 /* VLCVideoPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9DA97B52DC1472C00A4DA20 /* VLCVideoPlayerView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -18,6 +19,7 @@
 		B9DA97AF2DC1472C00A4DA20 /* iOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iOSApp.swift; sourceTree = "<group>"; };
 		B9DA97B12DC1472C00A4DA20 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		B9DA97B32DC1472E00A4DA20 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B9DA97B52DC1472C00A4DA20 /* VLCVideoPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VLCVideoPlayerView.swift; sourceTree = "<group>"; };
 		B9DA97B82DC1472E00A4DA20 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -62,6 +64,7 @@
 			children = (
 				B9DA97AF2DC1472C00A4DA20 /* iOSApp.swift */,
 				B9DA97B12DC1472C00A4DA20 /* ContentView.swift */,
+				B9DA97B52DC1472C00A4DA20 /* VLCVideoPlayerView.swift */,
 				B9DA97B32DC1472E00A4DA20 /* Assets.xcassets */,
 				B9DA97B82DC1472E00A4DA20 /* Info.plist */,
 			);
@@ -163,6 +166,7 @@
 			files = (
 				B9DA97B22DC1472C00A4DA20 /* ContentView.swift in Sources */,
 				B9DA97B02DC1472C00A4DA20 /* iOSApp.swift in Sources */,
+				B9DA97B62DC1472C00A4DA20 /* VLCVideoPlayerView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
