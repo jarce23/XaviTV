@@ -117,16 +117,17 @@ public class VLCPlayerHostView: UIView {
         }
 
         // Argumentos agresivos de optimización de búfer y compatibilidad IPTV para LibVLC
-        let vlcOptions: [String] = [
-            "--network-caching=300",
-            "--live-caching=300",
+        let vlcOptions: NSArray = [
+            "--network-caching=\(isLive ? 1500 : 2000)",
+            "--live-caching=1500",
             "--clock-jitter=0",
             "--clock-synchro=0",
             "--codec=all",
             "--no-spu",
             "--drop-late-frames",
             "--skip-frames",
-            "--rtsp-tcp"
+            "--rtsp-tcp",
+            "--http-reconnect"
         ]
 
         let player: AnyObject
@@ -145,21 +146,22 @@ public class VLCPlayerHostView: UIView {
         // Asignamos la vista de dibujo de vídeo a LibVLC
         player.setValue(videoSurface, forKey: "drawable")
 
-        // Creamos la media
+        // Creamos la media pasando NSURL explícito
         let mediaSel = NSSelectorFromString("mediaWithURL:")
-        guard let media = vlcMediaClass.perform(mediaSel, with: url)?.takeUnretainedValue() else {
+        guard let media = vlcMediaClass.perform(mediaSel, with: url as NSURL)?.takeUnretainedValue() else {
             return false
         }
 
-        // Opciones por stream
+        // Opciones por stream (requiere estrictamente un NSDictionary para -[VLCMedia addOptions:])
         let addOptionsSel = NSSelectorFromString("addOptions:")
         if (media as AnyObject).responds(to: addOptionsSel) {
-            let opts: [String] = [
-                "--network-caching=300",
-                "--live-caching=300",
-                "--clock-jitter=0"
+            let optionsDict: NSDictionary = [
+                "network-caching": isLive ? 1500 : 2000,
+                "live-caching": 1500,
+                "clock-jitter": 0,
+                "clock-synchro": 0
             ]
-            _ = (media as AnyObject).perform(addOptionsSel, with: opts)
+            _ = (media as AnyObject).perform(addOptionsSel, with: optionsDict)
         }
 
         player.setValue(media, forKey: "media")
@@ -263,18 +265,8 @@ public class VLCPlayerHostView: UIView {
     public func setAspectRatio(ratio: String) {
         let clean = ratio.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         if let player = vlcMediaPlayer {
-            let setAspectSel = NSSelectorFromString("setVideoAspectRatio:")
-            if (player as AnyObject).responds(to: setAspectSel) {
-                if clean == "DEFAULT" || clean == "AUTO" {
-                    let nilVal: UnsafeMutablePointer<CChar>? = nil
-                    _ = (player as AnyObject).perform(setAspectSel, with: nilVal)
-                } else {
-                    clean.withCString { cStr in
-                        let ptr = UnsafeMutablePointer<CChar>(mutating: cStr)
-                        _ = (player as AnyObject).perform(setAspectSel, with: ptr)
-                    }
-                }
-            }
+            let valToSet: String? = (clean == "DEFAULT" || clean == "AUTO") ? nil : clean
+            player.setValue(valToSet, forKey: "videoAspectRatio")
         }
         if let layer = avPlayerLayer {
             if clean == "FILL" {
