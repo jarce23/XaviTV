@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import ComposeApp
 
 @main
 struct iOSApp: App {
@@ -10,6 +11,11 @@ struct iOSApp: App {
             try session.setActive(true)
         } catch {
             // La sesión también es gestionada por NativeVideoPlayer al reproducir
+        }
+
+        // Registra la factoría nativa de VLCKit para que Compose cree directamente la vista
+        PlatformBridge_iosKt.registerVlcPlayerViewFactory {
+            VLCPlayerHostView()
         }
     }
 

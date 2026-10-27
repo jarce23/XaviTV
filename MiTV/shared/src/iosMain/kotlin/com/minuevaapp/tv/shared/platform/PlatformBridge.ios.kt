@@ -66,11 +66,18 @@ import platform.Foundation.NSSelectorFromString
 import platform.UIKit.UIApplication
 import platform.UIKit.UIColor
 import platform.UIKit.UIView
+import platform.darwin.NSObject
 import platform.darwin.NSObjectMeta
 import kotlinx.cinterop.*
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.native.runtime.GC
+
+var vlcPlayerViewFactory: (() -> UIView)? = null
+
+fun registerVlcPlayerViewFactory(factory: () -> UIView) {
+    vlcPlayerViewFactory = factory
+}
 
 private const val PREFS_STATE_KEY = "xavitv_ios_local_state_v1"
 private const val PREFS_M3U_FALLBACK_PREFIX = "xavitv_ios_m3u_cache_"
@@ -314,19 +321,19 @@ actual fun NativeVideoPlayer(
 
         val playSel = if (isLive) NSSelectorFromString("playStreamUrl:") else NSSelectorFromString("playVodUrl:")
         val nsUrl = NSString.create(string = currentStreamUrl)
-        hostView.performSelector(playSel, withObject = nsUrl)
+        (hostView as? NSObject)?.performSelector(playSel, withObject = nsUrl)
 
         if (!isLive && initialPositionMs > 3_000L) {
             val sec = initialPositionMs.toDouble() / 1000.0
             val seekSel = NSSelectorFromString("seekToNumber:")
             val nsSec = NSNumber(double = sec)
-            hostView.performSelector(seekSel, withObject = nsSec)
+            (hostView as? NSObject)?.performSelector(seekSel, withObject = nsSec)
         }
 
         // Aplica relación de aspecto actual
         val aspectSel = NSSelectorFromString("setAspectRatio:")
         val nsRatio = NSString.create(string = aspectRatios[currentAspectIndex])
-        hostView.performSelector(aspectSel, withObject = nsRatio)
+        (hostView as? NSObject)?.performSelector(aspectSel, withObject = nsRatio)
     }
 
     // Supervisión periódica (cada 1s) para telemetría de estado y detección de fallos de reproducción
@@ -334,11 +341,11 @@ actual fun NativeVideoPlayer(
         val hostView = hostViewRef ?: return@LaunchedEffect
         while (true) {
             delay(1000L)
-            val msg = hostView.valueForKey("currentStatusMessage") as? String
+            val msg = (hostView as? NSObject)?.valueForKey("currentStatusMessage") as? String
             if (!msg.isNullOrBlank()) {
                 statusLabel = msg
             }
-            val hasErr = (hostView.valueForKey("currentHasError") as? NSNumber)?.boolValue ?: false
+            val hasErr = ((hostView as? NSObject)?.valueForKey("currentHasError") as? NSNumber)?.boolValue ?: false
             if (hasErr && !hasPlaybackError) {
                 if (candidateIndex + 1 < candidates.size) {
                     candidateIndex += 1
@@ -352,7 +359,7 @@ actual fun NativeVideoPlayer(
             }
             if (!isLive) {
                 val timeSel = NSSelectorFromString("getPlaybackTimeMs")
-                val timeNum = hostView.performSelector(timeSel) as? NSNumber
+                val timeNum = (hostView as? NSObject)?.performSelector(timeSel) as? NSNumber
                 val timeMs = timeNum?.longLongValue ?: 0L
                 if (timeMs > 2000L) {
                     onSavePosition(timeMs)
@@ -363,7 +370,7 @@ actual fun NativeVideoPlayer(
 
     DisposableEffect(Unit) {
         onDispose {
-            hostViewRef?.performSelector(NSSelectorFromString("stopStream"))
+            (hostViewRef as? NSObject)?.performSelector(NSSelectorFromString("stopStream"))
             hostViewRef = null
             trimPlatformMemory()
         }
@@ -381,12 +388,11 @@ actual fun NativeVideoPlayer(
         // Vista nativa UIKit alojada: VLCPlayerHostView con decodificador MobileVLCKit / LibVLC
         UIKitView(
             factory = {
-                val hostClass = NSClassFromString("VLCPlayerHostView") as? NSObjectMeta
-                val view = (hostClass?.alloc()?.performSelector(NSSelectorFromString("init")) as? UIView)
-                    ?: (hostClass?.performSelector(NSSelectorFromString("new")) as? UIView)
-                    ?: UIView().apply {
-                        backgroundColor = UIColor.blackColor
-                    }
+                val rawClass = NSClassFromString("VLCPlayerHostView") ?: NSClassFromString("iosApp.VLCPlayerHostView")
+                val classAsObj = rawClass as? NSObject
+                val view = vlcPlayerViewFactory?.invoke()
+                    ?: (classAsObj?.performSelector(NSSelectorFromString("new")) as? UIView)
+                    ?: UIView().apply { backgroundColor = UIColor.blackColor }
                 hostViewRef = view
                 view
             },
@@ -505,7 +511,7 @@ actual fun NativeVideoPlayer(
                             val selectedRatio = aspectRatios[currentAspectIndex]
                             val aspectSel = NSSelectorFromString("setAspectRatio:")
                             val nsRatio = NSString.create(string = selectedRatio)
-                            hostViewRef?.performSelector(aspectSel, withObject = nsRatio)
+                            (hostViewRef as? NSObject)?.performSelector(aspectSel, withObject = nsRatio)
                         },
                         border = BorderStroke(1.dp, GoldPrimary),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
@@ -536,7 +542,7 @@ actual fun NativeVideoPlayer(
                                 } else {
                                     NSSelectorFromString("resumeStream")
                                 }
-                                hostView.performSelector(sel)
+                                (hostView as? NSObject)?.performSelector(sel)
                                 isPlaying = !isPlaying
                             }
                         },
