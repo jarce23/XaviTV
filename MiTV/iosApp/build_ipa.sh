@@ -162,23 +162,26 @@ else
         exit 1
     fi
 
-    # Garantiza que tanto MobileVLCKit como ComposeApp estén en la carpeta Frameworks del binario final para dyld
+    # Garantiza que ÚNICAMENTE MobileVLCKit.framework esté dentro de Frameworks/ de la aplicación.
+    # MobileVLCKit es un framework dinámico externo que dyld debe cargar en runtime.
+    # Por el contrario, ComposeApp es un framework estático (isStatic = true) que Xcode enlaza
+    # directamente dentro del ejecutable principal XaviTV; NO debe incluirse en Frameworks/
+    # para evitar que herramientas como Sideloadly intenten firmarlo y fallen con Error -11.
     mkdir -p "$APP_BUNDLE/Frameworks"
     if [ -d "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework" ]; then
         rm -rf "$APP_BUNDLE/Frameworks/MobileVLCKit.framework"
         cp -R "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework" "$APP_BUNDLE/Frameworks/"
         echo "MobileVLCKit.framework incrustado en el bundle: $APP_BUNDLE/Frameworks/"
     fi
-    if [ -d "$SCRIPT_DIR/Frameworks/ComposeApp.framework" ]; then
-        rm -rf "$APP_BUNDLE/Frameworks/ComposeApp.framework"
-        cp -R "$SCRIPT_DIR/Frameworks/ComposeApp.framework" "$APP_BUNDLE/Frameworks/"
-        echo "ComposeApp.framework incrustado en el bundle: $APP_BUNDLE/Frameworks/"
-    fi
+    rm -rf "$APP_BUNDLE/Frameworks/ComposeApp.framework"
 
     PAYLOAD_DIR="$BUILD_DIR/Payload"
     rm -rf "$PAYLOAD_DIR"
     mkdir -p "$PAYLOAD_DIR"
     cp -R "$APP_BUNDLE" "$PAYLOAD_DIR/XaviTV.app"
+
+    # Eliminación obligatoria y estricta de ComposeApp.framework del bundle final
+    rm -rf "$PAYLOAD_DIR/XaviTV.app/Frameworks/ComposeApp.framework"
 
     echo "========================================================"
     echo "  4. Saneando firmas y permisos Mach-O para Sideloadly"
@@ -187,12 +190,13 @@ else
     xattr -rc "$PAYLOAD_DIR" 2>/dev/null || true
     find "$PAYLOAD_DIR" -name "._*" -delete 2>/dev/null || true
 
-    # 4b. Sanea cada framework incrustado (ComposeApp, MobileVLCKit)
+    # 4b. Sanea cada framework dinámico incrustado (MobileVLCKit)
     if [ -d "$PAYLOAD_DIR/XaviTV.app/Frameworks" ]; then
+        rm -rf "$PAYLOAD_DIR/XaviTV.app/Frameworks/ComposeApp.framework"
         for fw in "$PAYLOAD_DIR/XaviTV.app/Frameworks/"*.framework; do
             if [ -d "$fw" ]; then
                 fw_name="$(basename "$fw" .framework)"
-                echo "Saneando framework Mach-O: $fw_name..."
+                echo "Saneando framework dinámico Mach-O: $fw_name..."
                 rm -rf "$fw/_CodeSignature"
                 codesign --remove-signature "$fw" 2>/dev/null || true
                 if [ -f "$fw/$fw_name" ]; then
