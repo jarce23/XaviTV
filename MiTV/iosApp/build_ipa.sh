@@ -80,6 +80,24 @@ if command -v pod >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/Podfile" ]; then
     (cd "$SCRIPT_DIR" && (pod install --repo-update || pod install)) || echo "Aviso: pod install finalizó con advertencias."
 fi
 
+echo "========================================================"
+echo "  2c. Copiando MobileVLCKit.framework en iosApp/Frameworks"
+echo "========================================================"
+mkdir -p "$SCRIPT_DIR/Frameworks"
+VLC_FW_SRC="$(find "$SCRIPT_DIR/Pods" -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -E "ios-arm64[^/]*|MobileVLCKit\.framework$" | head -n 1 || true)"
+if [ -z "$VLC_FW_SRC" ]; then
+    VLC_FW_SRC="$(find "$SCRIPT_DIR/Pods" -name "MobileVLCKit.framework" -type d 2>/dev/null | head -n 1 || true)"
+fi
+
+if [ -n "$VLC_FW_SRC" ] && [ -d "$VLC_FW_SRC" ]; then
+    echo "MobileVLCKit.framework localizado en: $VLC_FW_SRC"
+    rm -rf "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework"
+    cp -R "$VLC_FW_SRC" "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework"
+    echo "MobileVLCKit.framework copiado con éxito a: $SCRIPT_DIR/Frameworks/MobileVLCKit.framework"
+else
+    echo "Aviso: No se localizó MobileVLCKit.framework en Pods aún."
+fi
+
 # Selección de target: Espacio de trabajo de CocoaPods si existe, o proyecto Xcode
 if [ -d "$SCRIPT_DIR/iosApp.xcworkspace" ]; then
     XCODE_TARGET_ARG="-workspace"
@@ -130,6 +148,19 @@ else
     if [ -z "$APP_BUNDLE" ]; then
         echo "Error: No se encontró XaviTV.app tras la compilación."
         exit 1
+    fi
+
+    # Garantiza que tanto MobileVLCKit como ComposeApp estén en la carpeta Frameworks del binario final para dyld
+    mkdir -p "$APP_BUNDLE/Frameworks"
+    if [ -d "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework" ]; then
+        rm -rf "$APP_BUNDLE/Frameworks/MobileVLCKit.framework"
+        cp -R "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework" "$APP_BUNDLE/Frameworks/"
+        echo "MobileVLCKit.framework incrustado en el bundle: $APP_BUNDLE/Frameworks/"
+    fi
+    if [ -d "$SCRIPT_DIR/Frameworks/ComposeApp.framework" ]; then
+        rm -rf "$APP_BUNDLE/Frameworks/ComposeApp.framework"
+        cp -R "$SCRIPT_DIR/Frameworks/ComposeApp.framework" "$APP_BUNDLE/Frameworks/"
+        echo "ComposeApp.framework incrustado en el bundle: $APP_BUNDLE/Frameworks/"
     fi
 
     PAYLOAD_DIR="$BUILD_DIR/Payload"

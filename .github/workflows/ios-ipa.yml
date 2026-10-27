@@ -50,10 +50,31 @@ jobs:
           if [ -d "MiTV/iosApp" ]; then
             cd MiTV/iosApp
             pod install --repo-update
+            mkdir -p Frameworks
+            VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -E "ios-arm64[^/]*|MobileVLCKit\.framework$" | head -n 1 || true)"
+            if [ -z "$VLC_FW" ]; then
+              VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | head -n 1 || true)"
+            fi
+            if [ -n "$VLC_FW" ] && [ -d "$VLC_FW" ]; then
+              echo "==> Copiando MobileVLCKit.framework a Frameworks/..."
+              rm -rf Frameworks/MobileVLCKit.framework
+              cp -R "$VLC_FW" Frameworks/MobileVLCKit.framework
+              echo "MobileVLCKit.framework copiado exitosamente en MiTV/iosApp/Frameworks/"
+            fi
             cd ../..
           else
             cd iosApp
             pod install --repo-update
+            mkdir -p Frameworks
+            VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | grep -E "ios-arm64[^/]*|MobileVLCKit\.framework$" | head -n 1 || true)"
+            if [ -z "$VLC_FW" ]; then
+              VLC_FW="$(find Pods -name "MobileVLCKit.framework" -type d 2>/dev/null | head -n 1 || true)"
+            fi
+            if [ -n "$VLC_FW" ] && [ -d "$VLC_FW" ]; then
+              echo "==> Copiando MobileVLCKit.framework a Frameworks/..."
+              rm -rf Frameworks/MobileVLCKit.framework
+              cp -R "$VLC_FW" Frameworks/MobileVLCKit.framework
+            fi
             cd ..
           fi
 

@@ -12,3 +12,4 @@ IPHONEOS_DEPLOYMENT_TARGET=15.0
 TARGETED_DEVICE_FAMILY=1,2
 FRAMEWORK_SEARCH_PATHS=$(inherited) "$(SRCROOT)/Frameworks" "$(SRCROOT)/../shared/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)" "$(SRCROOT)/../shared/build/xcode-frameworks/$(CONFIGURATION)/iphoneos" "$(SRCROOT)/../shared/build/bin/iosArm64/releaseFramework"
 OTHER_LDFLAGS=$(inherited) -framework ComposeApp -framework AVFAudio -framework AVFoundation -framework AVKit -framework CoreMedia -framework UIKit -framework Foundation
+LD_RUNPATH_SEARCH_PATHS=$(inherited) @executable_path/Frameworks
