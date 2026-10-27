@@ -60,24 +60,14 @@ import platform.AVFoundation.*
 import platform.AVKit.AVPlayerViewController
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMakeWithSeconds
-import platform.Foundation.NSData
-import platform.Foundation.NSNumber
-import platform.Foundation.NSString
-import platform.Foundation.NSTemporaryDirectory
-import platform.Foundation.NSURL
-import platform.Foundation.NSURLCache
-import platform.Foundation.NSURLRequestReloadIgnoringLocalCacheData
-import platform.Foundation.NSUTF8StringEncoding
-import platform.Foundation.NSUserDefaults
-import platform.Foundation.create
-import platform.Foundation.dataUsingEncoding
-import platform.Foundation.writeToFile
+import platform.Foundation.*
+import platform.Foundation.NSClassFromString
+import platform.Foundation.NSSelectorFromString
 import platform.UIKit.UIApplication
 import platform.UIKit.UIColor
 import platform.UIKit.UIView
-import platform.objc.NSClassFromString
-import platform.objc.NSObjectMeta
-import platform.objc.NSSelectorFromString
+import platform.darwin.NSObjectMeta
+import kotlinx.cinterop.*
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.native.runtime.GC
@@ -391,7 +381,7 @@ actual fun NativeVideoPlayer(
         // Vista nativa UIKit alojada: VLCPlayerHostView con decodificador MobileVLCKit / LibVLC
         UIKitView(
             factory = {
-                val hostClass = NSClassFromString("VLCPlayerHostView") as? platform.darwin.NSObjectMeta
+                val hostClass = NSClassFromString("VLCPlayerHostView") as? NSObjectMeta
                 val view = (hostClass?.alloc()?.init() as? UIView) ?: UIView().apply {
                     backgroundColor = UIColor.blackColor
                 }
