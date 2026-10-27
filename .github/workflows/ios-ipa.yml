@@ -42,7 +42,13 @@ jobs:
           mkdir -p iosApp/Frameworks
           rm -rf iosApp/Frameworks/ComposeApp.framework
           cp -R "$FRAMEWORK_DIR" iosApp/Frameworks/ComposeApp.framework
-          echo "ComposeApp.framework exportado exitosamente en iosApp/Frameworks"
+          if [ -f "iosApp/Frameworks/ComposeApp.framework/ComposeApp" ]; then
+            chmod +x iosApp/Frameworks/ComposeApp.framework/ComposeApp
+          fi
+          rm -rf iosApp/Frameworks/ComposeApp.framework/_CodeSignature
+          codesign --remove-signature iosApp/Frameworks/ComposeApp.framework 2>/dev/null || true
+          xattr -rc iosApp/Frameworks/ComposeApp.framework 2>/dev/null || true
+          echo "ComposeApp.framework exportado y saneado en iosApp/Frameworks"
 
       - name: Install CocoaPods dependencies (MobileVLCKit)
         run: |
@@ -59,6 +65,12 @@ jobs:
               echo "==> Copiando MobileVLCKit.framework a Frameworks/..."
               rm -rf Frameworks/MobileVLCKit.framework
               cp -R "$VLC_FW" Frameworks/MobileVLCKit.framework
+              if [ -f "Frameworks/MobileVLCKit.framework/MobileVLCKit" ]; then
+                chmod +x Frameworks/MobileVLCKit.framework/MobileVLCKit
+              fi
+              rm -rf Frameworks/MobileVLCKit.framework/_CodeSignature
+              codesign --remove-signature Frameworks/MobileVLCKit.framework 2>/dev/null || true
+              xattr -rc Frameworks/MobileVLCKit.framework 2>/dev/null || true
               echo "MobileVLCKit.framework copiado exitosamente en MiTV/iosApp/Frameworks/"
             fi
             cd ../..
@@ -74,6 +86,12 @@ jobs:
               echo "==> Copiando MobileVLCKit.framework a Frameworks/..."
               rm -rf Frameworks/MobileVLCKit.framework
               cp -R "$VLC_FW" Frameworks/MobileVLCKit.framework
+              if [ -f "Frameworks/MobileVLCKit.framework/MobileVLCKit" ]; then
+                chmod +x Frameworks/MobileVLCKit.framework/MobileVLCKit
+              fi
+              rm -rf Frameworks/MobileVLCKit.framework/_CodeSignature
+              codesign --remove-signature Frameworks/MobileVLCKit.framework 2>/dev/null || true
+              xattr -rc Frameworks/MobileVLCKit.framework 2>/dev/null || true
             fi
             cd ..
           fi

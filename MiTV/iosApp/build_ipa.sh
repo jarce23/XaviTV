@@ -62,6 +62,12 @@ fi
 mkdir -p "$SCRIPT_DIR/Frameworks"
 rm -rf "$SCRIPT_DIR/Frameworks/ComposeApp.framework"
 cp -R "$FRAMEWORK_SRC" "$SCRIPT_DIR/Frameworks/ComposeApp.framework"
+if [ -f "$SCRIPT_DIR/Frameworks/ComposeApp.framework/ComposeApp" ]; then
+    chmod +x "$SCRIPT_DIR/Frameworks/ComposeApp.framework/ComposeApp"
+fi
+rm -rf "$SCRIPT_DIR/Frameworks/ComposeApp.framework/_CodeSignature"
+codesign --remove-signature "$SCRIPT_DIR/Frameworks/ComposeApp.framework" 2>/dev/null || true
+xattr -rc "$SCRIPT_DIR/Frameworks/ComposeApp.framework" 2>/dev/null || true
 echo "Framework disponible en: $SCRIPT_DIR/Frameworks/ComposeApp.framework"
 
 for TARGET_SDK_DIR in "iphoneos" "$DETECTED_SDK_NAME"; do
@@ -93,6 +99,12 @@ if [ -n "$VLC_FW_SRC" ] && [ -d "$VLC_FW_SRC" ]; then
     echo "MobileVLCKit.framework localizado en: $VLC_FW_SRC"
     rm -rf "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework"
     cp -R "$VLC_FW_SRC" "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework"
+    if [ -f "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework/MobileVLCKit" ]; then
+        chmod +x "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework/MobileVLCKit"
+    fi
+    rm -rf "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework/_CodeSignature"
+    codesign --remove-signature "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework" 2>/dev/null || true
+    xattr -rc "$SCRIPT_DIR/Frameworks/MobileVLCKit.framework" 2>/dev/null || true
     echo "MobileVLCKit.framework copiado con éxito a: $SCRIPT_DIR/Frameworks/MobileVLCKit.framework"
 else
     echo "Aviso: No se localizó MobileVLCKit.framework en Pods aún."
@@ -167,6 +179,39 @@ else
     rm -rf "$PAYLOAD_DIR"
     mkdir -p "$PAYLOAD_DIR"
     cp -R "$APP_BUNDLE" "$PAYLOAD_DIR/XaviTV.app"
+
+    echo "========================================================"
+    echo "  4. Saneando firmas y permisos Mach-O para Sideloadly"
+    echo "========================================================"
+    # 4a. Elimina extended attributes de Apple (quarantine, Finder info) y archivos ._*
+    xattr -rc "$PAYLOAD_DIR" 2>/dev/null || true
+    find "$PAYLOAD_DIR" -name "._*" -delete 2>/dev/null || true
+
+    # 4b. Sanea cada framework incrustado (ComposeApp, MobileVLCKit)
+    if [ -d "$PAYLOAD_DIR/XaviTV.app/Frameworks" ]; then
+        for fw in "$PAYLOAD_DIR/XaviTV.app/Frameworks/"*.framework; do
+            if [ -d "$fw" ]; then
+                fw_name="$(basename "$fw" .framework)"
+                echo "Saneando framework Mach-O: $fw_name..."
+                rm -rf "$fw/_CodeSignature"
+                codesign --remove-signature "$fw" 2>/dev/null || true
+                if [ -f "$fw/$fw_name" ]; then
+                    chmod +x "$fw/$fw_name"
+                fi
+                xattr -rc "$fw" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # 4c. Sanea el ejecutable principal y elimina firmas ad-hoc corruptas
+    MAIN_APP_EXEC="$PAYLOAD_DIR/XaviTV.app/XaviTV"
+    if [ -f "$MAIN_APP_EXEC" ]; then
+        chmod +x "$MAIN_APP_EXEC"
+    fi
+    rm -rf "$PAYLOAD_DIR/XaviTV.app/_CodeSignature"
+    codesign --remove-signature "$PAYLOAD_DIR/XaviTV.app" 2>/dev/null || true
+    xattr -rc "$PAYLOAD_DIR" 2>/dev/null || true
+    chmod -R u+w,go+rX "$PAYLOAD_DIR"
 
     cd "$BUILD_DIR"
     zip -qry "$IPA_FILE" Payload
