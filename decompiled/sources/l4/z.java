@@ -1,0 +1,11 @@
+package l4;
+
+import android.view.View;
+
+/* compiled from: r8-map-id-d8f78b0b892205f23cbf9de15380b222f43276593fa4b3f0d12b47401bc18e39 */
+/* loaded from: classes.dex */
+public abstract class z {
+    public static void a(View view, int i10, int i11, int i12, int i13) {
+        view.setLeftTopRightBottom(i10, i11, i12, i13);
+    }
+}

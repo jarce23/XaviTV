@@ -1,0 +1,33 @@
+# Directorios de compilación y Gradle
+build/
+**/build/
+.gradle/
+**/.gradle/
+.kotlin/
+
+# Configuración del IDE (IntelliJ IDEA / Android Studio / Xcode)
+.idea/
+**/.idea/
+*.iml
+*.ipr
+*.iws
+local.properties
+xcuserdata/
+**/xcuserdata/
+DerivedData/
+**/DerivedData/
+
+# Ejecutables, instaladores y paquetes compilados
+*.exe
+*.msi
+*.apk
+*.aab
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Herramientas locales y archivos temporales del sistema
+tools/
+.DS_Store
+Thumbs.db
+*.log

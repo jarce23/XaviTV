@@ -1,0 +1,63 @@
+package com.google.android.gms.cast.framework.internal.featurehighlight;
+
+import android.graphics.Canvas;
+import android.graphics.ColorFilter;
+import android.graphics.drawable.Drawable;
+import androidx.annotation.Keep;
+
+/* compiled from: r8-map-id-d8f78b0b892205f23cbf9de15380b222f43276593fa4b3f0d12b47401bc18e39 */
+/* loaded from: classes.dex */
+class OuterHighlightDrawable extends Drawable {
+
+    /* renamed from: a, reason: collision with root package name */
+    public float f3172a;
+
+    /* renamed from: b, reason: collision with root package name */
+    public float f3173b;
+
+    /* renamed from: c, reason: collision with root package name */
+    public float f3174c;
+
+    @Override // android.graphics.drawable.Drawable
+    public final void draw(Canvas canvas) {
+        canvas.drawCircle(this.f3173b + 0.0f, this.f3174c + 0.0f, 0.0f * this.f3172a, null);
+    }
+
+    @Override // android.graphics.drawable.Drawable
+    public final int getAlpha() {
+        throw null;
+    }
+
+    @Override // android.graphics.drawable.Drawable
+    public final int getOpacity() {
+        return -3;
+    }
+
+    @Override // android.graphics.drawable.Drawable
+    public final void setAlpha(int i10) {
+        throw null;
+    }
+
+    @Override // android.graphics.drawable.Drawable
+    public final void setColorFilter(ColorFilter colorFilter) {
+        throw null;
+    }
+
+    @Keep
+    public void setScale(float f10) {
+        this.f3172a = f10;
+        invalidateSelf();
+    }
+
+    @Keep
+    public void setTranslationX(float f10) {
+        this.f3173b = f10;
+        invalidateSelf();
+    }
+
+    @Keep
+    public void setTranslationY(float f10) {
+        this.f3174c = f10;
+        invalidateSelf();
+    }
+}

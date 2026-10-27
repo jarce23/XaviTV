@@ -1,0 +1,818 @@
+package k2;
+
+import android.util.Base64;
+import java.io.EOFException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import okhttp3.internal.ws.WebSocketProtocol;
+import org.chromium.net.UrlRequest;
+
+/* compiled from: r8-map-id-d8f78b0b892205f23cbf9de15380b222f43276593fa4b3f0d12b47401bc18e39 */
+/* loaded from: classes.dex */
+public abstract class b {
+
+    /* renamed from: a, reason: collision with root package name */
+    public static final int[] f7663a = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+
+    /* renamed from: b, reason: collision with root package name */
+    public static final int[] f7664b = {0, 1, 2, 3, 4, 5, 6, 8, -1, -1, -1, 7, 8, -1, 8, -1};
+
+    /* renamed from: c, reason: collision with root package name */
+    public static final int[] f7665c = {1, 2, 3, 6};
+
+    /* renamed from: d, reason: collision with root package name */
+    public static final int[] f7666d = {48000, 44100, 32000};
+
+    /* renamed from: e, reason: collision with root package name */
+    public static final int[] f7667e = {24000, 22050, 16000};
+
+    /* renamed from: f, reason: collision with root package name */
+    public static final int[] f7668f = {2, 1, 2, 3, 3, 4, 4, 5};
+    public static final int[] g = {32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640};
+
+    /* renamed from: h, reason: collision with root package name */
+    public static final int[] f7669h = {69, 87, 104, 121, 139, 174, 208, 243, 278, 348, 417, 487, 557, 696, 835, 975, 1114, 1253, 1393};
+
+    /* renamed from: i, reason: collision with root package name */
+    public static final int[] f7670i = {2002, 2000, 1920, 1601, 1600, WebSocketProtocol.CLOSE_CLIENT_GOING_AWAY, 1000, 960, 800, 800, 480, 400, 400, 2048};
+
+    /* renamed from: j, reason: collision with root package name */
+    public static final int[] f7671j = {1, 2, 2, 2, 2, 3, 3, 4, 4, 5, 6, 6, 6, 7, 8, 8};
+
+    /* renamed from: k, reason: collision with root package name */
+    public static final int[] f7672k = {-1, 8000, 16000, 32000, -1, -1, 11025, 22050, 44100, -1, -1, 12000, 24000, 48000, -1, -1};
+
+    /* renamed from: l, reason: collision with root package name */
+    public static final int[] f7673l = {64, 112, 128, 192, 224, 256, 384, 448, 512, 640, 768, 896, 1024, 1152, 1280, 1536, 1920, 2048, 2304, 2560, 2688, 2816, 2823, 2944, 3072, 3840, 4096, 6144, 7680};
+
+    /* renamed from: m, reason: collision with root package name */
+    public static final int[] f7674m = {8000, 16000, 32000, 64000, 128000, 22050, 44100, 88200, 176400, 352800, 12000, 24000, 48000, 96000, 192000, 384000};
+
+    /* renamed from: n, reason: collision with root package name */
+    public static final int[] f7675n = {5, 8, 10, 12};
+
+    /* renamed from: o, reason: collision with root package name */
+    public static final int[] f7676o = {6, 9, 12, 15};
+
+    /* renamed from: p, reason: collision with root package name */
+    public static final int[] f7677p = {2, 4, 6, 8};
+
+    /* renamed from: q, reason: collision with root package name */
+    public static final int[] f7678q = {9, 11, 13, 16};
+
+    /* renamed from: r, reason: collision with root package name */
+    public static final int[] f7679r = {5, 8, 10, 12};
+
+    /* renamed from: s, reason: collision with root package name */
+    public static final String[] f7680s = {"audio/mpeg-L1", "audio/mpeg-L2", "audio/mpeg"};
+
+    /* renamed from: t, reason: collision with root package name */
+    public static final int[] f7681t = {44100, 48000, 32000};
+
+    /* renamed from: u, reason: collision with root package name */
+    public static final int[] f7682u = {32000, 64000, 96000, 128000, 160000, 192000, 224000, 256000, 288000, 320000, 352000, 384000, 416000, 448000};
+
+    /* renamed from: v, reason: collision with root package name */
+    public static final int[] f7683v = {32000, 48000, 56000, 64000, 80000, 96000, 112000, 128000, 144000, 160000, 176000, 192000, 224000, 256000};
+
+    /* renamed from: w, reason: collision with root package name */
+    public static final int[] f7684w = {32000, 48000, 56000, 64000, 80000, 96000, 112000, 128000, 160000, 192000, 224000, 256000, 320000, 384000};
+
+    /* renamed from: x, reason: collision with root package name */
+    public static final int[] f7685x = {32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000, 160000, 192000, 224000, 256000, 320000};
+
+    /* renamed from: y, reason: collision with root package name */
+    public static final int[] f7686y = {8000, 16000, 24000, 32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000, 144000, 160000};
+
+    public static ArrayList a(byte[] bArr) {
+        ArrayList arrayList = new ArrayList(3);
+        arrayList.add(bArr);
+        arrayList.add(ByteBuffer.allocate(8).order(ByteOrder.nativeOrder()).putLong(((((bArr[11] & 255) << 8) | (bArr[10] & 255)) * 1000000000) / 48000).array());
+        arrayList.add(ByteBuffer.allocate(8).order(ByteOrder.nativeOrder()).putLong(80000000L).array());
+        return arrayList;
+    }
+
+    public static boolean b(l1.t tVar, s sVar, int i10, i1.s sVar2) {
+        long y8 = tVar.y();
+        long j10 = y8 >>> 16;
+        if (j10 != i10) {
+            return false;
+        }
+        boolean z10 = (j10 & 1) == 1;
+        int i11 = (int) ((y8 >> 12) & 15);
+        int i12 = (int) ((y8 >> 8) & 15);
+        int i13 = (int) ((y8 >> 4) & 15);
+        int i14 = (int) ((y8 >> 1) & 7);
+        boolean z11 = (y8 & 1) == 1;
+        if (i13 <= 7) {
+            if (i13 != sVar.g - 1) {
+                return false;
+            }
+        } else if (i13 > 10 || sVar.g != 2) {
+            return false;
+        }
+        if (!(i14 == 0 || i14 == sVar.f7775i) || z11) {
+            return false;
+        }
+        try {
+            long D = tVar.D();
+            if (!z10) {
+                D *= sVar.f7769b;
+            }
+            sVar2.f6018a = D;
+            int t3 = t(i11, tVar);
+            if (t3 == -1 || t3 > sVar.f7769b) {
+                return false;
+            }
+            int i15 = sVar.f7772e;
+            if (i12 != 0) {
+                if (i12 <= 11) {
+                    if (i12 != sVar.f7773f) {
+                        return false;
+                    }
+                } else if (i12 != 12) {
+                    if (i12 > 14) {
+                        return false;
+                    }
+                    int C = tVar.C();
+                    if (i12 == 14) {
+                        C *= 10;
+                    }
+                    if (C != i15) {
+                        return false;
+                    }
+                } else if (tVar.w() * 1000 != i15) {
+                    return false;
+                }
+            }
+            int w10 = tVar.w();
+            int i16 = tVar.f8130b;
+            byte[] bArr = tVar.f8129a;
+            int i17 = i16 - 1;
+            int i18 = 0;
+            for (int i19 = tVar.f8130b; i19 < i17; i19++) {
+                i18 = l1.a0.f8077l[i18 ^ (bArr[i19] & 255)];
+            }
+            int i20 = l1.a0.f8067a;
+            return w10 == i18;
+        } catch (NumberFormatException unused) {
+            return false;
+        }
+    }
+
+    public static void c(String str, boolean z10) {
+        if (!z10) {
+            throw i1.h0.a(null, str);
+        }
+    }
+
+    public static void d(long j10, l1.t tVar, g0[] g0VarArr) {
+        int i10;
+        while (true) {
+            if (tVar.a() <= 1) {
+                return;
+            }
+            int i11 = 0;
+            while (true) {
+                if (tVar.a() == 0) {
+                    i10 = -1;
+                    break;
+                }
+                int w10 = tVar.w();
+                i11 += w10;
+                if (w10 != 255) {
+                    i10 = i11;
+                    break;
+                }
+            }
+            int i12 = 0;
+            while (true) {
+                if (tVar.a() == 0) {
+                    i12 = -1;
+                    break;
+                }
+                int w11 = tVar.w();
+                i12 += w11;
+                if (w11 != 255) {
+                    break;
+                }
+            }
+            int i13 = tVar.f8130b + i12;
+            if (i12 == -1 || i12 > tVar.a()) {
+                l1.b.q("CeaUtil", "Skipping remainder of malformed SEI NAL unit.");
+                i13 = tVar.f8131c;
+            } else if (i10 == 4 && i12 >= 8) {
+                int w12 = tVar.w();
+                int C = tVar.C();
+                int j11 = C == 49 ? tVar.j() : 0;
+                int w13 = tVar.w();
+                if (C == 47) {
+                    tVar.J(1);
+                }
+                boolean z10 = w12 == 181 && (C == 49 || C == 47) && w13 == 3;
+                if (C == 49) {
+                    z10 &= j11 == 1195456820;
+                }
+                if (z10) {
+                    e(j10, tVar, g0VarArr);
+                }
+            }
+            tVar.I(i13);
+        }
+    }
+
+    public static void e(long j10, l1.t tVar, g0[] g0VarArr) {
+        int w10 = tVar.w();
+        if ((w10 & 64) != 0) {
+            tVar.J(1);
+            int i10 = (w10 & 31) * 3;
+            int i11 = tVar.f8130b;
+            for (g0 g0Var : g0VarArr) {
+                tVar.I(i11);
+                g0Var.c(i10, tVar);
+                l1.d.g(j10 != -9223372036854775807L);
+                g0Var.e(j10, 1, i10, 0, null);
+            }
+        }
+    }
+
+    public static int f(int i10, int i11) {
+        int i12 = i11 / 2;
+        if (i10 < 0 || i10 >= 3 || i11 < 0 || i12 >= 19) {
+            return -1;
+        }
+        int i13 = f7666d[i10];
+        if (i13 == 44100) {
+            return ((i11 % 2) + f7669h[i12]) * 2;
+        }
+        int i14 = g[i12];
+        return i13 == 32000 ? i14 * 6 : i14 * 4;
+    }
+
+    public static void g(int i10, l1.t tVar) {
+        tVar.F(7);
+        byte[] bArr = tVar.f8129a;
+        bArr[0] = -84;
+        bArr[1] = 64;
+        bArr[2] = -1;
+        bArr[3] = -1;
+        bArr[4] = (byte) ((i10 >> 16) & 255);
+        bArr[5] = (byte) ((i10 >> 8) & 255);
+        bArr[6] = (byte) (i10 & 255);
+    }
+
+    public static int h(int i10) {
+        int i11;
+        int i12;
+        int i13;
+        int i14;
+        if ((i10 & (-2097152)) != -2097152 || (i11 = (i10 >>> 19) & 3) == 1 || (i12 = (i10 >>> 17) & 3) == 0 || (i13 = (i10 >>> 12) & 15) == 0 || i13 == 15 || (i14 = (i10 >>> 10) & 3) == 3) {
+            return -1;
+        }
+        int i15 = f7681t[i14];
+        if (i11 == 2) {
+            i15 /= 2;
+        } else if (i11 == 0) {
+            i15 /= 4;
+        }
+        int i16 = (i10 >>> 9) & 1;
+        if (i12 == 3) {
+            return ((((i11 == 3 ? f7682u[i13 - 1] : f7683v[i13 - 1]) * 12) / i15) + i16) * 4;
+        }
+        int i17 = i11 == 3 ? i12 == 2 ? f7684w[i13 - 1] : f7685x[i13 - 1] : f7686y[i13 - 1];
+        if (i11 == 3) {
+            return ((i17 * 144) / i15) + i16;
+        }
+        return (((i12 == 1 ? 72 : 144) * i17) / i15) + i16;
+    }
+
+    public static int i(int i10) {
+        if (i10 == 20) {
+            return 63750;
+        }
+        if (i10 == 30) {
+            return 2250000;
+        }
+        switch (i10) {
+            case 5:
+                return 80000;
+            case 6:
+                return 768000;
+            case 7:
+                return 192000;
+            case 8:
+                return 2250000;
+            case 9:
+                return 40000;
+            case 10:
+                return 100000;
+            case 11:
+                return 16000;
+            case UrlRequest.Status.SENDING_REQUEST /* 12 */:
+                return 7000;
+            default:
+                switch (i10) {
+                    case UrlRequest.Status.READING_RESPONSE /* 14 */:
+                        return 3062500;
+                    case WebSocketProtocol.B0_MASK_OPCODE /* 15 */:
+                        return 8000;
+                    case WebSocketProtocol.B0_FLAG_RSV3 /* 16 */:
+                        return 256000;
+                    case 17:
+                        return 336000;
+                    case 18:
+                        return 768000;
+                    default:
+                        return -2147483647;
+                }
+        }
+    }
+
+    public static i3.f j(byte[] bArr) {
+        byte b2 = bArr[0];
+        if (b2 == Byte.MAX_VALUE || b2 == 100 || b2 == 64 || b2 == 113) {
+            return new i3.f(bArr.length, bArr);
+        }
+        byte[] copyOf = Arrays.copyOf(bArr, bArr.length);
+        byte b10 = copyOf[0];
+        if (b10 == -2 || b10 == -1 || b10 == 37 || b10 == -14 || b10 == -24) {
+            for (int i10 = 0; i10 < copyOf.length - 1; i10 += 2) {
+                byte b11 = copyOf[i10];
+                int i11 = i10 + 1;
+                copyOf[i10] = copyOf[i11];
+                copyOf[i11] = b11;
+            }
+        }
+        i3.f fVar = new i3.f(copyOf.length, copyOf);
+        if (copyOf[0] == 31) {
+            i3.f fVar2 = new i3.f(copyOf.length, copyOf);
+            while (fVar2.b() >= 16) {
+                fVar2.t(2);
+                int i12 = fVar2.i(14) & 16383;
+                int min = Math.min(8 - fVar.f6377d, 14);
+                int i13 = fVar.f6377d;
+                int i14 = (8 - i13) - min;
+                byte[] bArr2 = fVar.f6375b;
+                int i15 = fVar.f6376c;
+                byte b12 = (byte) (((65280 >> i13) | ((1 << i14) - 1)) & bArr2[i15]);
+                bArr2[i15] = b12;
+                int i16 = 14 - min;
+                bArr2[i15] = (byte) (b12 | ((i12 >>> i16) << i14));
+                int i17 = i15 + 1;
+                while (i16 > 8) {
+                    fVar.f6375b[i17] = (byte) (i12 >>> (i16 - 8));
+                    i16 -= 8;
+                    i17++;
+                }
+                int i18 = 8 - i16;
+                byte[] bArr3 = fVar.f6375b;
+                byte b13 = (byte) (bArr3[i17] & ((1 << i18) - 1));
+                bArr3[i17] = b13;
+                bArr3[i17] = (byte) (((i12 & ((1 << i16) - 1)) << i18) | b13);
+                fVar.t(14);
+                fVar.a();
+            }
+        }
+        fVar.o(copyOf.length, copyOf);
+        return fVar;
+    }
+
+    public static long k(byte b2, byte b10) {
+        int i10;
+        int i11 = b2 & 255;
+        int i12 = b2 & 3;
+        if (i12 != 0) {
+            i10 = 2;
+            if (i12 != 1 && i12 != 2) {
+                i10 = b10 & 63;
+            }
+        } else {
+            i10 = 1;
+        }
+        int i13 = i11 >> 3;
+        return i10 * (i13 >= 16 ? 2500 << r6 : i13 >= 12 ? 10000 << (i13 & 1) : (i13 & 3) == 3 ? 60000 : 10000 << r6);
+    }
+
+    public static int l(i3.f fVar) {
+        int i10 = fVar.i(4);
+        if (i10 == 15) {
+            if (fVar.b() >= 24) {
+                return fVar.i(24);
+            }
+            throw i1.h0.a(null, "AAC header insufficient data");
+        }
+        if (i10 < 13) {
+            return f7663a[i10];
+        }
+        throw i1.h0.a(null, "AAC header wrong Sampling Frequency Index");
+    }
+
+    /* JADX WARN: Code restructure failed: missing block: B:40:0x0081, code lost:
+    
+        if (r9 != 11) goto L47;
+     */
+    /* JADX WARN: Code restructure failed: missing block: B:44:0x0088, code lost:
+    
+        if (r9 != 11) goto L47;
+     */
+    /* JADX WARN: Code restructure failed: missing block: B:46:0x008d, code lost:
+    
+        if (r9 != 8) goto L47;
+     */
+    /*
+        Code decompiled incorrectly, please refer to instructions dump.
+        To view partially-correct add '--show-bad-code' argument
+    */
+    public static i2.j m(i3.f r9) {
+        /*
+            r0 = 16
+            int r1 = r9.i(r0)
+            int r0 = r9.i(r0)
+            r2 = 65535(0xffff, float:9.1834E-41)
+            r3 = 4
+            if (r0 != r2) goto L18
+            r0 = 24
+            int r0 = r9.i(r0)
+            r2 = 7
+            goto L19
+        L18:
+            r2 = r3
+        L19:
+            int r0 = r0 + r2
+            r2 = 44097(0xac41, float:6.1793E-41)
+            if (r1 != r2) goto L21
+            int r0 = r0 + 2
+        L21:
+            r1 = 2
+            int r2 = r9.i(r1)
+            r4 = 3
+            if (r2 != r4) goto L32
+        L29:
+            r9.i(r1)
+            boolean r2 = r9.h()
+            if (r2 != 0) goto L29
+        L32:
+            r2 = 10
+            int r2 = r9.i(r2)
+            boolean r5 = r9.h()
+            if (r5 == 0) goto L47
+            int r5 = r9.i(r4)
+            if (r5 <= 0) goto L47
+            r9.t(r1)
+        L47:
+            boolean r5 = r9.h()
+            r6 = 44100(0xac44, float:6.1797E-41)
+            r7 = 48000(0xbb80, float:6.7262E-41)
+            if (r5 == 0) goto L55
+            r5 = r7
+            goto L56
+        L55:
+            r5 = r6
+        L56:
+            int r9 = r9.i(r3)
+            int[] r8 = k2.b.f7670i
+            if (r5 != r6) goto L65
+            r6 = 13
+            if (r9 != r6) goto L65
+            r9 = r8[r9]
+            goto L93
+        L65:
+            if (r5 != r7) goto L92
+            r6 = 14
+            if (r9 >= r6) goto L92
+            r6 = r8[r9]
+            int r2 = r2 % 5
+            r7 = 8
+            r8 = 1
+            if (r2 == r8) goto L8b
+            r8 = 11
+            if (r2 == r1) goto L86
+            if (r2 == r4) goto L8b
+            if (r2 == r3) goto L7d
+            goto L90
+        L7d:
+            if (r9 == r4) goto L83
+            if (r9 == r7) goto L83
+            if (r9 != r8) goto L90
+        L83:
+            int r9 = r6 + 1
+            goto L93
+        L86:
+            if (r9 == r7) goto L83
+            if (r9 != r8) goto L90
+            goto L83
+        L8b:
+            if (r9 == r4) goto L83
+            if (r9 != r7) goto L90
+            goto L83
+        L90:
+            r9 = r6
+            goto L93
+        L92:
+            r9 = 0
+        L93:
+            i2.j r1 = new i2.j
+            r1.<init>(r5, r0, r9)
+            return r1
+        */
+        throw new UnsupportedOperationException("Method not decompiled: k2.b.m(i3.f):i2.j");
+    }
+
+    public static a n(i3.f fVar, boolean z10) {
+        int i10 = fVar.i(5);
+        if (i10 == 31) {
+            i10 = fVar.i(6) + 32;
+        }
+        int l10 = l(fVar);
+        int i11 = fVar.i(4);
+        String m10 = android.support.v4.media.d.m(i10, "mp4a.40.");
+        if (i10 == 5 || i10 == 29) {
+            l10 = l(fVar);
+            int i12 = fVar.i(5);
+            if (i12 == 31) {
+                i12 = fVar.i(6) + 32;
+            }
+            i10 = i12;
+            if (i10 == 22) {
+                i11 = fVar.i(4);
+            }
+        }
+        if (z10) {
+            if (i10 != 1 && i10 != 2 && i10 != 3 && i10 != 4 && i10 != 6 && i10 != 7 && i10 != 17) {
+                switch (i10) {
+                    case 19:
+                    case 20:
+                    case 21:
+                    case 22:
+                    case 23:
+                        break;
+                    default:
+                        throw i1.h0.c("Unsupported audio object type: " + i10);
+                }
+            }
+            if (fVar.h()) {
+                l1.b.q("AacUtil", "Unexpected frameLengthFlag = 1");
+            }
+            if (fVar.h()) {
+                fVar.t(14);
+            }
+            boolean h10 = fVar.h();
+            if (i11 == 0) {
+                throw new UnsupportedOperationException();
+            }
+            if (i10 == 6 || i10 == 20) {
+                fVar.t(3);
+            }
+            if (h10) {
+                if (i10 == 22) {
+                    fVar.t(16);
+                }
+                if (i10 == 17 || i10 == 19 || i10 == 20 || i10 == 23) {
+                    fVar.t(3);
+                }
+                fVar.t(1);
+            }
+            switch (i10) {
+                case 17:
+                case 19:
+                case 20:
+                case 21:
+                case 22:
+                case 23:
+                    int i13 = fVar.i(2);
+                    if (i13 == 2 || i13 == 3) {
+                        throw i1.h0.c("Unsupported epConfig: " + i13);
+                    }
+            }
+        }
+        int i14 = f7664b[i11];
+        if (i14 != -1) {
+            return new a(m10, l10, i14);
+        }
+        throw i1.h0.a(null, null);
+    }
+
+    public static void o(i3.f fVar, c cVar) {
+        int i10 = fVar.i(5);
+        fVar.t(2);
+        if (fVar.h()) {
+            fVar.t(5);
+        }
+        if (i10 >= 7 && i10 <= 10) {
+            fVar.s();
+        }
+        if (fVar.h()) {
+            int i11 = fVar.i(3);
+            if (cVar.f7691b == -1 && i10 >= 0 && i10 <= 15 && (i11 == 0 || i11 == 1)) {
+                cVar.f7691b = i10;
+            }
+            if (fVar.h()) {
+                w(fVar);
+            }
+        }
+    }
+
+    public static void p(i3.f fVar, c cVar) {
+        fVar.t(2);
+        boolean h10 = fVar.h();
+        int i10 = fVar.i(8);
+        for (int i11 = 0; i11 < i10; i11++) {
+            fVar.t(2);
+            if (fVar.h()) {
+                fVar.t(5);
+            }
+            if (h10) {
+                fVar.t(24);
+            } else {
+                if (fVar.h()) {
+                    if (!fVar.h()) {
+                        fVar.t(4);
+                    }
+                    cVar.f7692c = fVar.i(6) + 1;
+                }
+                fVar.t(4);
+            }
+        }
+        if (fVar.h()) {
+            fVar.t(3);
+            if (fVar.h()) {
+                w(fVar);
+            }
+        }
+    }
+
+    public static int q(i3.f fVar, int[] iArr) {
+        int i10 = 0;
+        for (int i11 = 0; i11 < 3 && fVar.h(); i11++) {
+            i10++;
+        }
+        int i12 = 0;
+        for (int i13 = 0; i13 < i10; i13++) {
+            i12 += 1 << iArr[i13];
+        }
+        return fVar.i(iArr[i10]) + i12;
+    }
+
+    public static i1.f0 r(List list) {
+        ArrayList arrayList = new ArrayList();
+        for (int i10 = 0; i10 < list.size(); i10++) {
+            String str = (String) list.get(i10);
+            int i11 = l1.a0.f8067a;
+            String[] split = str.split("=", 2);
+            if (split.length != 2) {
+                l1.b.q("VorbisUtil", "Failed to parse Vorbis comment: ".concat(str));
+            } else if (split[0].equals("METADATA_BLOCK_PICTURE")) {
+                try {
+                    arrayList.add(w2.a.d(new l1.t(Base64.decode(split[1], 0))));
+                } catch (RuntimeException e7) {
+                    l1.b.r("VorbisUtil", "Failed to parse vorbis picture", e7);
+                }
+            } else {
+                arrayList.add(new b3.a(split[0], split[1]));
+            }
+        }
+        if (arrayList.isEmpty()) {
+            return null;
+        }
+        return new i1.f0(arrayList);
+    }
+
+    public static i1.f0 s(o oVar, boolean z10) {
+        t1.k kVar = z10 ? null : y2.i.f13789e;
+        l1.t tVar = new l1.t(10);
+        i1.f0 f0Var = null;
+        int i10 = 0;
+        while (true) {
+            try {
+                oVar.o(tVar.f8129a, 0, 10);
+                tVar.I(0);
+                if (tVar.z() != 4801587) {
+                    break;
+                }
+                tVar.J(3);
+                int v10 = tVar.v();
+                int i11 = v10 + 10;
+                if (f0Var == null) {
+                    byte[] bArr = new byte[i11];
+                    System.arraycopy(tVar.f8129a, 0, bArr, 0, 10);
+                    oVar.o(bArr, 10, v10);
+                    f0Var = new y2.i(kVar).Q(i11, bArr);
+                } else {
+                    oVar.p(v10);
+                }
+                i10 += i11;
+            } catch (EOFException unused) {
+            }
+        }
+        oVar.h();
+        oVar.p(i10);
+        if (f0Var == null || f0Var.f5876a.length == 0) {
+            return null;
+        }
+        return f0Var;
+    }
+
+    public static int t(int i10, l1.t tVar) {
+        switch (i10) {
+            case 1:
+                return 192;
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+                return 576 << (i10 - 2);
+            case 6:
+                return tVar.w() + 1;
+            case 7:
+                return tVar.C() + 1;
+            case 8:
+            case 9:
+            case 10:
+            case 11:
+            case UrlRequest.Status.SENDING_REQUEST /* 12 */:
+            case UrlRequest.Status.WAITING_FOR_RESPONSE /* 13 */:
+            case UrlRequest.Status.READING_RESPONSE /* 14 */:
+            case WebSocketProtocol.B0_MASK_OPCODE /* 15 */:
+                return 256 << (i10 - 8);
+            default:
+                return -1;
+        }
+    }
+
+    public static x4.c u(l1.t tVar) {
+        tVar.J(1);
+        int z10 = tVar.z();
+        long j10 = tVar.f8130b + z10;
+        int i10 = z10 / 18;
+        long[] jArr = new long[i10];
+        long[] jArr2 = new long[i10];
+        int i11 = 0;
+        while (true) {
+            if (i11 >= i10) {
+                break;
+            }
+            long q10 = tVar.q();
+            if (q10 == -1) {
+                jArr = Arrays.copyOf(jArr, i11);
+                jArr2 = Arrays.copyOf(jArr2, i11);
+                break;
+            }
+            jArr[i11] = q10;
+            jArr2[i11] = tVar.q();
+            tVar.J(2);
+            i11++;
+        }
+        tVar.J((int) (j10 - tVar.f8130b));
+        return new x4.c(jArr, 10, jArr2);
+    }
+
+    public static i0 v(l1.t tVar, boolean z10, boolean z11) {
+        if (z10) {
+            x(3, tVar, false);
+        }
+        tVar.u((int) tVar.n(), StandardCharsets.UTF_8);
+        long n10 = tVar.n();
+        String[] strArr = new String[(int) n10];
+        for (int i10 = 0; i10 < n10; i10++) {
+            strArr[i10] = tVar.u((int) tVar.n(), StandardCharsets.UTF_8);
+        }
+        if (z11 && (tVar.w() & 1) == 0) {
+            throw i1.h0.a(null, "framing bit expected to be set");
+        }
+        return new i0(strArr);
+    }
+
+    public static void w(i3.f fVar) {
+        int i10 = fVar.i(6);
+        if (i10 < 2 || i10 > 42) {
+            throw i1.h0.c(String.format("Invalid language tag bytes number: %d. Must be between 2 and 42.", Integer.valueOf(i10)));
+        }
+        fVar.t(i10 * 8);
+    }
+
+    public static boolean x(int i10, l1.t tVar, boolean z10) {
+        if (tVar.a() < 7) {
+            if (z10) {
+                return false;
+            }
+            throw i1.h0.a(null, "too short header: " + tVar.a());
+        }
+        if (tVar.w() != i10) {
+            if (z10) {
+                return false;
+            }
+            throw i1.h0.a(null, "expected header type " + Integer.toHexString(i10));
+        }
+        if (tVar.w() == 118 && tVar.w() == 111 && tVar.w() == 114 && tVar.w() == 98 && tVar.w() == 105 && tVar.w() == 115) {
+            return true;
+        }
+        if (z10) {
+            return false;
+        }
+        throw i1.h0.a(null, "expected characters 'vorbis'");
+    }
+}

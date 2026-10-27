@@ -1,0 +1,8 @@
+TEAM_ID=
+PRODUCT_NAME=XaviTV
+PRODUCT_BUNDLE_IDENTIFIER=com.minuevaapp.tv.ios
+CURRENT_PROJECT_VERSION=1
+MARKETING_VERSION=1.1.0
+IPHONEOS_DEPLOYMENT_TARGET=15.0
+TARGETED_DEVICE_FAMILY=1,2
+OTHER_LDFLAGS=$(inherited) -framework ComposeApp -framework AVFoundation -framework AVKit -framework CoreMedia -framework UIKit -framework Foundation

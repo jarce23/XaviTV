@@ -1,0 +1,124 @@
+package d9;
+
+import android.content.Context;
+import android.content.res.Resources;
+import android.content.res.TypedArray;
+import android.content.res.XmlResourceParser;
+import android.util.AttributeSet;
+import android.util.StateSet;
+import org.chromium.net.R;
+
+/* compiled from: r8-map-id-d8f78b0b892205f23cbf9de15380b222f43276593fa4b3f0d12b47401bc18e39 */
+/* loaded from: classes.dex */
+public final class z {
+
+    /* renamed from: a, reason: collision with root package name */
+    public int f4346a;
+
+    /* renamed from: b, reason: collision with root package name */
+    public d f4347b;
+
+    /* renamed from: c, reason: collision with root package name */
+    public int[][] f4348c = new int[10][];
+
+    /* renamed from: d, reason: collision with root package name */
+    public d[] f4349d = new d[10];
+
+    public static z b(d dVar) {
+        z zVar = new z();
+        zVar.a(StateSet.WILD_CARD, dVar);
+        return zVar;
+    }
+
+    public final void a(int[] iArr, d dVar) {
+        int i10 = this.f4346a;
+        if (i10 == 0 || iArr.length == 0) {
+            this.f4347b = dVar;
+        }
+        int[][] iArr2 = this.f4348c;
+        if (i10 >= iArr2.length) {
+            int i11 = i10 + 10;
+            int[][] iArr3 = new int[i11][];
+            System.arraycopy(iArr2, 0, iArr3, 0, i10);
+            this.f4348c = iArr3;
+            d[] dVarArr = new d[i11];
+            System.arraycopy(this.f4349d, 0, dVarArr, 0, i10);
+            this.f4349d = dVarArr;
+        }
+        int[][] iArr4 = this.f4348c;
+        int i12 = this.f4346a;
+        iArr4[i12] = iArr;
+        this.f4349d[i12] = dVar;
+        this.f4346a = i12 + 1;
+    }
+
+    public final d c(int[] iArr) {
+        int i10;
+        int[][] iArr2 = this.f4348c;
+        int i11 = 0;
+        int i12 = 0;
+        while (true) {
+            i10 = -1;
+            if (i12 >= this.f4346a) {
+                i12 = -1;
+                break;
+            }
+            if (StateSet.stateSetMatches(iArr2[i12], iArr)) {
+                break;
+            }
+            i12++;
+        }
+        if (i12 < 0) {
+            int[] iArr3 = StateSet.WILD_CARD;
+            int[][] iArr4 = this.f4348c;
+            while (true) {
+                if (i11 >= this.f4346a) {
+                    break;
+                }
+                if (StateSet.stateSetMatches(iArr4[i11], iArr3)) {
+                    i10 = i11;
+                    break;
+                }
+                i11++;
+            }
+            i12 = i10;
+        }
+        return i12 < 0 ? this.f4347b : this.f4349d[i12];
+    }
+
+    public final void d(Context context, XmlResourceParser xmlResourceParser, AttributeSet attributeSet, Resources.Theme theme) {
+        int depth = xmlResourceParser.getDepth() + 1;
+        while (true) {
+            int next = xmlResourceParser.next();
+            if (next == 1) {
+                return;
+            }
+            int depth2 = xmlResourceParser.getDepth();
+            if (depth2 < depth && next == 3) {
+                return;
+            }
+            if (next == 2 && depth2 <= depth && xmlResourceParser.getName().equals("item")) {
+                Resources resources = context.getResources();
+                int[] iArr = j8.a.f7204y;
+                TypedArray obtainAttributes = theme == null ? resources.obtainAttributes(attributeSet, iArr) : theme.obtainStyledAttributes(attributeSet, iArr, 0, 0);
+                d c10 = n.c(obtainAttributes, 5, new a(0.0f));
+                obtainAttributes.recycle();
+                int attributeCount = attributeSet.getAttributeCount();
+                int[] iArr2 = new int[attributeCount];
+                int i10 = 0;
+                for (int i11 = 0; i11 < attributeCount; i11++) {
+                    int attributeNameResource = attributeSet.getAttributeNameResource(i11);
+                    if (attributeNameResource != R.attr.cornerSize) {
+                        int i12 = i10 + 1;
+                        if (!attributeSet.getAttributeBooleanValue(i11, false)) {
+                            attributeNameResource = -attributeNameResource;
+                        }
+                        iArr2[i10] = attributeNameResource;
+                        i10 = i12;
+                    }
+                }
+                a(StateSet.trimStateSet(iArr2, i10), c10);
+            }
+        }
+    }
+}

@@ -1,0 +1,10 @@
+package w;
+
+import androidx.constraintlayout.widget.ConstraintLayout;
+import m0.l;
+
+/* compiled from: r8-map-id-d8f78b0b892205f23cbf9de15380b222f43276593fa4b3f0d12b47401bc18e39 */
+/* loaded from: classes.dex */
+public abstract class a extends ConstraintLayout implements l {
+    public static final /* synthetic */ int G = 0;
+}

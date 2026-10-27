@@ -1,0 +1,18 @@
+package r5;
+
+import java.nio.charset.Charset;
+import java.security.MessageDigest;
+
+/* compiled from: r8-map-id-d8f78b0b892205f23cbf9de15380b222f43276593fa4b3f0d12b47401bc18e39 */
+/* loaded from: classes.dex */
+public interface e {
+
+    /* renamed from: a, reason: collision with root package name */
+    public static final Charset f10789a = Charset.forName("UTF-8");
+
+    void b(MessageDigest messageDigest);
+
+    boolean equals(Object obj);
+
+    int hashCode();
+}

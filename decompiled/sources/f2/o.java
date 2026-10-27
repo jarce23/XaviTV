@@ -1,0 +1,10 @@
+package f2;
+
+import i1.u0;
+import o9.w0;
+
+/* compiled from: r8-map-id-d8f78b0b892205f23cbf9de15380b222f43276593fa4b3f0d12b47401bc18e39 */
+/* loaded from: classes.dex */
+public interface o {
+    w0 b(int i10, u0 u0Var, int[] iArr);
+}
