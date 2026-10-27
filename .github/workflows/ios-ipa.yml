@@ -53,6 +53,11 @@ jobs:
           fi
           echo "==> Instalando MobileVLCKit mediante CocoaPods..."
           pod install --repo-update || pod install
+          if [ ! -d "iosApp.xcworkspace" ]; then
+            echo "ERROR: iosApp.xcworkspace no se generó tras pod install"
+            exit 1
+          fi
+          echo "iosApp.xcworkspace generado correctamente para xcodebuild."
 
       - name: Build XaviTV.ipa with Xcode (iPhone & iPad Universal)
         run: |

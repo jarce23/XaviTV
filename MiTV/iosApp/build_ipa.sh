@@ -72,18 +72,18 @@ for TARGET_SDK_DIR in "iphoneos" "$DETECTED_SDK_NAME"; do
     echo "Framework disponible en: $XCODE_FW_DIR/ComposeApp.framework"
 done
 
-if command -v pod >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/Podfile" ]; then
+if [ -f "$SCRIPT_DIR/Podfile" ] && [ ! -d "$SCRIPT_DIR/iosApp.xcworkspace" ] && command -v pod >/dev/null 2>&1; then
     echo "========================================================"
     echo "  2b. Instalando CocoaPods (MobileVLCKit)..."
     echo "========================================================"
-    (cd "$SCRIPT_DIR" && pod install) || echo "Aviso: pod install finalizó con advertencias."
+    (cd "$SCRIPT_DIR" && (pod install --repo-update || pod install)) || echo "Aviso: pod install finalizó con advertencias."
 fi
 
 # Selección de target: Espacio de trabajo de CocoaPods si existe, o proyecto Xcode
 if [ -d "$SCRIPT_DIR/iosApp.xcworkspace" ]; then
     XCODE_TARGET_ARG="-workspace"
     XCODE_TARGET_PATH="$SCRIPT_DIR/iosApp.xcworkspace"
-    echo "Usando espacio de trabajo CocoaPods: iosApp.xcworkspace"
+    echo "Usando espacio de trabajo CocoaPods obligatorio: iosApp.xcworkspace"
 else
     XCODE_TARGET_ARG="-project"
     XCODE_TARGET_PATH="$SCRIPT_DIR/iosApp.xcodeproj"
@@ -100,6 +100,9 @@ if [ "${SIGNED_ARCHIVE:-0}" = "1" ]; then
         -configuration Release \
         -sdk iphoneos \
         -archivePath "$ARCHIVE_PATH" \
+        CODE_SIGN_IDENTITY="" \
+        CODE_SIGNING_REQUIRED=NO \
+        CODE_SIGNING_ALLOWED=NO \
         OVERRIDE_KOTLIN_BUILD_IDE_SUPPORTED=YES
 
     xcodebuild -exportArchive \

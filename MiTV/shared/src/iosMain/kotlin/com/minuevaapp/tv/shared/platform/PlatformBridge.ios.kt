@@ -382,9 +382,11 @@ actual fun NativeVideoPlayer(
         UIKitView(
             factory = {
                 val hostClass = NSClassFromString("VLCPlayerHostView") as? NSObjectMeta
-                val view = (hostClass?.alloc()?.init() as? UIView) ?: UIView().apply {
-                    backgroundColor = UIColor.blackColor
-                }
+                val view = (hostClass?.alloc()?.performSelector(NSSelectorFromString("init")) as? UIView)
+                    ?: (hostClass?.performSelector(NSSelectorFromString("new")) as? UIView)
+                    ?: UIView().apply {
+                        backgroundColor = UIColor.blackColor
+                    }
                 hostViewRef = view
                 view
             },
