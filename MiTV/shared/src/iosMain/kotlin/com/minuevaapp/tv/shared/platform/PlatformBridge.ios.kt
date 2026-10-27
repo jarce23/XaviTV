@@ -16,6 +16,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -77,6 +78,12 @@ var vlcPlayerViewFactory: (() -> UIView)? = null
 
 fun registerVlcPlayerViewFactory(factory: () -> UIView) {
     vlcPlayerViewFactory = factory
+}
+
+var vlcToggleOverlayHandler: (() -> Unit)? = null
+
+fun registerVlcToggleOverlayHandler(handler: () -> Unit) {
+    vlcToggleOverlayHandler = handler
 }
 
 private const val PREFS_STATE_KEY = "xavitv_ios_local_state_v1"
@@ -297,10 +304,10 @@ actual fun NativeVideoPlayer(
 
     val currentStreamUrl = candidates.getOrElse(candidateIndex) { url }
 
-    // Ocultación automática de la barra de controles tras 4 segundos sin interacción
+    // Ocultación automática de la barra de controles tras 3.5 segundos sin interacción
     LaunchedEffect(showOverlayBar, lastInteractionTick, hasPlaybackError) {
         if (showOverlayBar && !hasPlaybackError) {
-            delay(4_000L)
+            delay(3_500L)
             showOverlayBar = false
         }
     }
@@ -369,7 +376,21 @@ actual fun NativeVideoPlayer(
     }
 
     DisposableEffect(Unit) {
+        val observer = NSNotificationCenter.defaultCenter.addObserverForName(
+            name = "VLCPlayerToggleOverlayNotification",
+            `object` = null,
+            queue = NSOperationQueue.mainQueue
+        ) { _ ->
+            showOverlayBar = !showOverlayBar
+            lastInteractionTick++
+        }
+        vlcToggleOverlayHandler = {
+            showOverlayBar = !showOverlayBar
+            lastInteractionTick++
+        }
         onDispose {
+            vlcToggleOverlayHandler = null
+            NSNotificationCenter.defaultCenter.removeObserver(observer)
             (hostViewRef as? NSObject)?.performSelector(NSSelectorFromString("stopStream"))
             hostViewRef = null
             trimPlatformMemory()
@@ -380,10 +401,6 @@ actual fun NativeVideoPlayer(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .clickable {
-                showOverlayBar = !showOverlayBar
-                lastInteractionTick++
-            }
     ) {
         // Vista nativa UIKit alojada: VLCPlayerHostView con decodificador MobileVLCKit / LibVLC
         UIKitView(
@@ -400,52 +417,24 @@ actual fun NativeVideoPlayer(
             modifier = Modifier.fillMaxSize()
         )
 
-        // Botón flotante para restaurar controles cuando la barra superior se oculta
-        if (!showOverlayBar && !hasPlaybackError) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .windowInsetsPadding(
-                        WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)
-                    )
-                    .padding(start = 14.dp, top = 10.dp)
-                    .clip(CircleShape)
-                    .background(DarkCharcoal.copy(alpha = 0.65f))
-                    .border(1.dp, GoldPrimary.copy(alpha = 0.65f), CircleShape)
-                    .clickable {
-                        showOverlayBar = true
-                        lastInteractionTick++
-                    }
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+        // Capa táctil transparente sobre el reproductor para alternar controles con un toque (tap to toggle)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
                 ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Mostrar controles",
-                        tint = GoldPrimary,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Text(
-                        text = title,
-                        color = TextWhite,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.widthIn(max = 180.dp)
-                    )
+                    showOverlayBar = !showOverlayBar
+                    lastInteractionTick++
                 }
-            }
-        }
+        )
 
         // Barra superior de controles superpuesta con soporte de Safe Area
         AnimatedVisibility(
             visible = showOverlayBar || hasPlaybackError,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(200)) { -it },
-            exit = fadeOut(tween(280)) + slideOutVertically(tween(280)) { -it },
+            enter = fadeIn(tween(300)) + slideInVertically(tween(300)) { -it },
+            exit = fadeOut(tween(350)) + slideOutVertically(tween(350)) { -it },
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()

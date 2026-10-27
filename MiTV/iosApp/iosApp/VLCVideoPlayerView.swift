@@ -33,18 +33,21 @@ public class VLCPlayerHostView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         setupViews()
+        setupGesture()
         configureAudioSession()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setupViews()
+        setupGesture()
         configureAudioSession()
     }
 
     private func setupViews() {
         backgroundColor = .black
         videoSurface.backgroundColor = .black
+        videoSurface.isUserInteractionEnabled = false
         videoSurface.translatesAutoresizingMaskIntoConstraints = false
         addSubview(videoSurface)
 
@@ -54,6 +57,17 @@ public class VLCPlayerHostView: UIView {
             videoSurface.topAnchor.constraint(equalTo: topAnchor),
             videoSurface.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
+    }
+
+    private func setupGesture() {
+        isUserInteractionEnabled = true
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTapGesture))
+        tap.cancelsTouchesInView = false
+        addGestureRecognizer(tap)
+    }
+
+    @objc private func handleTapGesture() {
+        NotificationCenter.default.post(name: NSNotification.Name("VLCPlayerToggleOverlayNotification"), object: nil)
     }
 
     public override func layoutSubviews() {
