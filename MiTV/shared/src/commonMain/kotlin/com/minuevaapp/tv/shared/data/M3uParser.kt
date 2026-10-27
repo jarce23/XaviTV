@@ -136,11 +136,11 @@ object M3uParser {
         val vodCatMap = linkedMapOf<String, Category>()
         val seriesCatMap = linkedMapOf<String, Category>()
 
-        val liveStreams = ArrayList<LiveStream>()
-        val vodStreams = ArrayList<VodStream>()
-        val vodDetails = HashMap<String, VodInfoResponse>()
+        val liveStreams = mutableListOf<LiveStream>()
+        val vodStreams = mutableListOf<VodStream>()
+        val vodDetails = mutableMapOf<String, VodInfoResponse>()
         val seriesAccMap = linkedMapOf<String, SeriesAcc>()
-        val directUrls = HashMap<String, String>()
+        val directUrls = mutableMapOf<String, String>()
 
         var currentTitle: String? = null
         var currentLogo: String? = null
@@ -151,7 +151,7 @@ object M3uParser {
         for (rawLine in content.lineSequence()) {
             val trimmed = rawLine.trim().removePrefix("\uFEFF")
             if (trimmed.startsWith("#EXTINF:", ignoreCase = true)) {
-                val attrs = HashMap<String, String>()
+                val attrs = mutableMapOf<String, String>()
                 attrRegex.findAll(trimmed).forEach { m ->
                     attrs[m.groupValues[1].lowercase()] = m.groupValues[2].trim()
                 }
@@ -263,7 +263,7 @@ object M3uParser {
                             val epId = "m3u_ep_$itemIndex"
                             val ext = extractExtension(streamUrl)
                             directUrls[epId] = streamUrl
-                            val seasonList = acc.episodesBySeason.getOrPut(seasonNum) { ArrayList() }
+                            val seasonList = acc.episodesBySeason.getOrPut(seasonNum) { mutableListOf() }
                             val resolvedEpNum = if (seMatch != null) epNum else (seasonList.size + 1).toString()
                             seasonList.add(
                                 Episode(
@@ -293,8 +293,8 @@ object M3uParser {
             throw IllegalStateException("No se encontraron canales ni streams válidos en la URL M3U proporcionada")
         }
 
-        val seriesList = ArrayList<Series>(seriesAccMap.size)
-        val seriesDetails = HashMap<String, Pair<SeriesDetails, Map<String, List<Episode>>>>(seriesAccMap.size)
+        val seriesList = mutableListOf<Series>()
+        val seriesDetails = mutableMapOf<String, Pair<SeriesDetails, Map<String, List<Episode>>>>()
         for (acc in seriesAccMap.values) {
             seriesList.add(
                 Series(

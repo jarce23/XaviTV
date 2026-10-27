@@ -68,8 +68,8 @@ class SharedAppState {
     }
 
     private data class CachedImageEntry(
-        val bitmap: ImageBitmap,
-        val byteCount: Int
+        val image: ImageBitmap,
+        val sizeInBytes: Int
     )
 
     val store: PlaylistStore = PlaylistStore()
@@ -85,7 +85,7 @@ class SharedAppState {
     val catalogRefreshVersion: StateFlow<Long> = _catalogRefreshVersion.asStateFlow()
 
     private val cacheMutex = Mutex()
-    private val imageCache = LinkedHashMap<String, CachedImageEntry>(32, 0.75f, true)
+    private val imageCache: MutableMap<String, CachedImageEntry> = linkedMapOf()
     private var currentCacheBytes: Int = 0
 
     private var currentRepoPlaylist: Playlist? = null
@@ -255,10 +255,10 @@ class SharedAppState {
         if (clean.isEmpty()) return null
 
         cacheMutex.withLock {
-            val existing = imageCache.remove(clean)
+            val existing: CachedImageEntry? = imageCache.remove(clean)
             if (existing != null) {
                 imageCache[clean] = existing
-                return existing.bitmap
+                return existing.image
             }
         }
 
@@ -269,8 +269,8 @@ class SharedAppState {
                 }.readBytes()
                 if (bytes.isEmpty() || bytes.size > 4 * 1024 * 1024) return@runCatching null
 
-                val bitmap = decodeImageBytes(bytes, maxDimension) ?: return@runCatching null
-                val estimatedBytes = (bitmap.width * bitmap.height * 4).coerceAtLeast(1024)
+                val decodedImage = decodeImageBytes(bytes, maxDimension) ?: return@runCatching null
+                val estimatedBytes = (decodedImage.width * decodedImage.height * 4).coerceAtLeast(1024)
 
                 cacheMutex.withLock {
                     var evictedAny = false
@@ -279,20 +279,20 @@ class SharedAppState {
                         (imageCache.size >= MAX_IMAGE_CACHE_ENTRIES ||
                             currentCacheBytes + estimatedBytes > MAX_IMAGE_CACHE_BYTES)
                     ) {
-                        val oldestKey = imageCache.keys.firstOrNull() ?: break
-                        val removed = imageCache.remove(oldestKey)
+                        val oldestKey: String = imageCache.keys.firstOrNull() ?: break
+                        val removed: CachedImageEntry? = imageCache.remove(oldestKey)
                         if (removed != null) {
-                            currentCacheBytes = (currentCacheBytes - removed.byteCount).coerceAtLeast(0)
+                            currentCacheBytes = (currentCacheBytes - removed.sizeInBytes).coerceAtLeast(0)
                             evictedAny = true
                         }
                     }
-                    imageCache[clean] = CachedImageEntry(bitmap, estimatedBytes)
+                    imageCache[clean] = CachedImageEntry(decodedImage, estimatedBytes)
                     currentCacheBytes += estimatedBytes
                     if (evictedAny && imageCache.size % 12 == 0) {
                         trimPlatformMemory()
                     }
                 }
-                bitmap
+                decodedImage
             }.getOrNull()
         }
     }
@@ -601,7 +601,7 @@ fun IosNetworkImage(
 ) {
     val appState = LocalSharedAppState.current
     val cleanUrl = url?.trim().orEmpty()
-    var bitmap by remember(cleanUrl) { mutableStateOf<ImageBitmap?>(null) }
+    var loadedImage by remember(cleanUrl) { mutableStateOf<ImageBitmap?>(null) }
     var failed by remember(cleanUrl) { mutableStateOf(false) }
 
     LaunchedEffect(cleanUrl) {
@@ -612,7 +612,7 @@ fun IosNetworkImage(
         failed = false
         val loaded = appState.loadImage(cleanUrl, maxDimension = maxDimension)
         if (loaded != null) {
-            bitmap = loaded
+            loadedImage = loaded
         } else {
             failed = true
         }
@@ -622,10 +622,10 @@ fun IosNetworkImage(
         modifier = modifier.background(DarkSurfaceVariant),
         contentAlignment = Alignment.Center
     ) {
-        val currentBitmap = bitmap
-        if (currentBitmap != null) {
+        val currentImage = loadedImage
+        if (currentImage != null) {
             Image(
-                bitmap = currentBitmap,
+                bitmap = currentImage,
                 contentDescription = contentDescription,
                 contentScale = contentScale,
                 modifier = Modifier.fillMaxSize()
