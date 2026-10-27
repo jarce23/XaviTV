@@ -22,14 +22,35 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Build XaviTV.ipa (iPhone & iPad Universal)
+      - name: Package Kotlin Multiplatform Framework (:shared:linkReleaseFrameworkIosArm64)
+        run: |
+          if [ -d "MiTV" ]; then
+            cd MiTV
+          fi
+          tr -d '\r' < gradlew > gradlew.lf && mv gradlew.lf gradlew
+          chmod +x gradlew
+          echo "==> Compilando binario de framework para iOS (arm64)..."
+          ./gradlew :shared:linkReleaseFrameworkIosArm64 --no-daemon
+
+          FRAMEWORK_DIR="shared/build/bin/iosArm64/releaseFramework/ComposeApp.framework"
+          if [ ! -d "$FRAMEWORK_DIR" ]; then
+            echo "ERROR: $FRAMEWORK_DIR no existe"
+            exit 1
+          fi
+
+          # Exportación directa en iosApp/Frameworks para que Xcode lo resuelva sin ambigüedad
+          mkdir -p iosApp/Frameworks
+          rm -rf iosApp/Frameworks/ComposeApp.framework
+          cp -R "$FRAMEWORK_DIR" iosApp/Frameworks/ComposeApp.framework
+          echo "ComposeApp.framework exportado exitosamente en iosApp/Frameworks"
+
+      - name: Build XaviTV.ipa with Xcode (iPhone & iPad Universal)
         run: |
           if [ -d "MiTV/iosApp" ]; then
             cd MiTV
           fi
-          tr -d '\r' < gradlew > gradlew.lf && mv gradlew.lf gradlew
           tr -d '\r' < iosApp/build_ipa.sh > iosApp/build_ipa.sh.lf && mv iosApp/build_ipa.sh.lf iosApp/build_ipa.sh
-          chmod +x gradlew iosApp/build_ipa.sh
+          chmod +x iosApp/build_ipa.sh
           cd iosApp
           ./build_ipa.sh
 

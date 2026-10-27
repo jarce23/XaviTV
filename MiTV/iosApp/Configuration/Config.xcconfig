@@ -5,4 +5,5 @@ CURRENT_PROJECT_VERSION=1
 MARKETING_VERSION=1.1.0
 IPHONEOS_DEPLOYMENT_TARGET=15.0
 TARGETED_DEVICE_FAMILY=1,2
-OTHER_LDFLAGS=$(inherited) -framework ComposeApp -framework AVFoundation -framework AVKit -framework CoreMedia -framework UIKit -framework Foundation
+FRAMEWORK_SEARCH_PATHS=$(inherited) "$(SRCROOT)/Frameworks" "$(SRCROOT)/../shared/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)" "$(SRCROOT)/../shared/build/xcode-frameworks/$(CONFIGURATION)/iphoneos" "$(SRCROOT)/../shared/build/bin/iosArm64/releaseFramework"
+OTHER_LDFLAGS=$(inherited) -framework ComposeApp -framework AVFAudio -framework AVFoundation -framework AVKit -framework CoreMedia -framework UIKit -framework Foundation
