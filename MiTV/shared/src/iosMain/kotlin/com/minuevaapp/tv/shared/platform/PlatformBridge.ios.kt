@@ -350,7 +350,10 @@ actual fun NativeVideoPlayer(
         val hostView = hostViewRef ?: return@LaunchedEffect
         while (true) {
             delay(1000L)
-            val hasErr = ((hostView as? NSObject)?.valueForKey("currentHasError") as? NSNumber)?.boolValue ?: false
+            val errSel = NSSelectorFromString("getHasErrorNumber")
+            val hasErr = ((hostView as? NSObject)?.performSelector(errSel) as? NSNumber)?.boolValue
+                ?: ((hostView as? NSObject)?.valueForKey("currentHasError") as? NSNumber)?.boolValue
+                ?: false
             if (hasErr && !hasPlaybackError) {
                 if (candidateIndex + 1 < candidates.size) {
                     candidateIndex += 1
