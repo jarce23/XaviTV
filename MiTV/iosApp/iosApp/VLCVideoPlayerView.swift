@@ -28,10 +28,31 @@ public class VLCPlayerHostView: UIView {
     // Gesto táctil para alternar controles (tap to toggle)
     private var tapGesture: UITapGestureRecognizer? = nil
 
-    // Estado público accesible por el puente
-    @objc public var currentStatusMessage: String = "Iniciando motor VLCKit..."
+    // Almacenamiento seguro interno de textos para evitar tagged pointers
+    private var _statusMsg: String = "Iniciando motor VLCKit..."
+    private var _currentUrl: String = ""
+
+    // Propiedades públicas expuestas a KVC / Kotlin: devuelven siempre NSMutableString (en memoria heap)
+    // para impedir que el runtime de Apple use NSIndirectTaggedPointerString (que crashea getCharacters:range: en Kotlin/Native)
+    @objc public var currentStatusMessage: NSString {
+        get { return NSMutableString(string: _statusMsg) }
+        set { _statusMsg = String(newValue) }
+    }
+
+    @objc public var currentUrl: NSString {
+        get { return NSMutableString(string: _currentUrl) }
+        set { _currentUrl = String(newValue) }
+    }
+
     @objc public var currentHasError: Bool = false
-    @objc public var currentUrl: String = ""
+
+    @objc public func getStatusMessageCopy() -> NSString {
+        return NSMutableString(string: _statusMsg)
+    }
+
+    @objc public func getCurrentUrlCopy() -> NSString {
+        return NSMutableString(string: _currentUrl)
+    }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -94,39 +115,46 @@ public class VLCPlayerHostView: UIView {
      * Inicia la decodificación y reproducción del flujo mediante LibVLC (MobileVLCKit).
      */
     @objc(playStream:isLive:)
-    public func playStream(urlString: String, isLive: Bool) {
-        let clean = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.currentUrl = clean
-        self.currentHasError = false
-
-        guard let url = URL(string: clean) else {
+    public func playStream(urlString: String?, isLive: Bool) {
+        guard let raw = urlString else {
             self.currentHasError = true
-            self.currentStatusMessage = "URL de stream no válida"
+            self._statusMsg = "URL de stream no válida"
             return
         }
+        let clean = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, let url = URL(string: clean) else {
+            self.currentHasError = true
+            self._statusMsg = "URL de stream no válida"
+            return
+        }
+
+        self._currentUrl = clean
+        self.currentHasError = false
 
         stopStream()
 
         // 1. Prioridad: Motor nativo VLCKit (MobileVLCKit)
         if startVlcEngine(url: url, isLive: isLive) {
             let formatTag = clean.lowercased().contains(".ts") ? "MPEG-TS (.ts)" : "HLS (.m3u8)"
-            self.currentStatusMessage = "VLCKit • Decodificando \(formatTag) nativo"
+            self._statusMsg = "VLCKit • Decodificando \(formatTag) nativo"
             return
         }
 
         // 2. Fallback: AVPlayer si la librería MobileVLCKit no está enlazada en el binario
-        self.currentStatusMessage = "Reproductor AVPlayer de respaldo activo"
+        self._statusMsg = "Reproductor AVPlayer de respaldo activo"
         startAvPlayerFallback(url: url, isLive: isLive)
     }
 
     @objc(playStreamUrl:)
-    public func playStreamUrl(url: String) {
-        playStream(urlString: url, isLive: true)
+    public func playStreamUrl(url: String?) {
+        let safeUrl = String(url ?? "")
+        playStream(urlString: safeUrl, isLive: true)
     }
 
     @objc(playVodUrl:)
-    public func playVodUrl(url: String) {
-        playStream(urlString: url, isLive: false)
+    public func playVodUrl(url: String?) {
+        let safeUrl = String(url ?? "")
+        playStream(urlString: safeUrl, isLive: false)
     }
 
     private func startVlcEngine(url: URL, isLive: Bool) -> Bool {
@@ -270,7 +298,7 @@ public class VLCPlayerHostView: UIView {
     public func pauseStream() {
         guard let playerObj = vlcMediaPlayer as? NSObject else {
             avPlayer?.pause()
-            self.currentStatusMessage = "En pausa"
+            self._statusMsg = "En pausa"
             return
         }
         let sel = NSSelectorFromString("pause")
@@ -280,14 +308,14 @@ public class VLCPlayerHostView: UIView {
             let fn = unsafeBitCast(imp, to: VoidIMP.self)
             fn(playerObj, sel)
         }
-        self.currentStatusMessage = "VLCKit • En pausa"
+        self._statusMsg = "VLCKit • En pausa"
     }
 
     @objc(resumeStream)
     public func resumeStream() {
         guard let playerObj = vlcMediaPlayer as? NSObject else {
             avPlayer?.play()
-            self.currentStatusMessage = "Reproduciendo"
+            self._statusMsg = "Reproduciendo"
             return
         }
         let sel = NSSelectorFromString("play")
@@ -297,7 +325,7 @@ public class VLCPlayerHostView: UIView {
             let fn = unsafeBitCast(imp, to: VoidIMP.self)
             fn(playerObj, sel)
         }
-        self.currentStatusMessage = "VLCKit • Reproduciendo"
+        self._statusMsg = "VLCKit • Reproduciendo"
     }
 
     @objc(stopStream)
@@ -373,9 +401,15 @@ public class VLCPlayerHostView: UIView {
 
     @objc(setAspectRatio:)
     public func setAspectRatio(ratio: String?) {
+        let safeRatio: String = {
+            guard let r = ratio else { return "DEFAULT" }
+            return String(r).trimmingCharacters(in: .whitespacesAndNewlines)
+        }()
+        let upper = safeRatio.uppercased()
+
         guard let playerObj = vlcMediaPlayer as? NSObject else {
-            if let layer = avPlayerLayer, let r = ratio?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
-                layer.videoGravity = (r == "FILL") ? .resizeAspectFill : .resizeAspect
+            if let layer = avPlayerLayer {
+                layer.videoGravity = (upper == "FILL") ? .resizeAspectFill : .resizeAspect
             }
             return
         }
@@ -384,17 +418,16 @@ public class VLCPlayerHostView: UIView {
             typealias SetAspectRatioIMP = @convention(c) (AnyObject, Selector, UnsafePointer<CChar>?) -> Void
             let imp = playerObj.method(for: sel)
             let fn = unsafeBitCast(imp, to: SetAspectRatioIMP.self)
-            let clean = ratio?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let ratioStr = clean, !ratioStr.isEmpty, ratioStr.uppercased() != "DEFAULT", ratioStr.uppercased() != "AUTO" {
-                ratioStr.withCString { cStr in
+            if !safeRatio.isEmpty && upper != "DEFAULT" && upper != "AUTO" {
+                safeRatio.withCString { cStr in
                     fn(playerObj, sel, cStr)
                 }
             } else {
                 fn(playerObj, sel, nil)
             }
         }
-        if let layer = avPlayerLayer, let r = ratio?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
-            layer.videoGravity = (r == "FILL") ? .resizeAspectFill : .resizeAspect
+        if let layer = avPlayerLayer {
+            layer.videoGravity = (upper == "FILL") ? .resizeAspectFill : .resizeAspect
         }
     }
 
@@ -508,22 +541,22 @@ public class VLCPlayerHostView: UIView {
             // VLCMediaPlayerState: 0=Stopped, 1=Opening, 2=Buffering, 3=Ended, 4=Error, 5=Playing, 6=Paused
             switch stateRaw {
             case 1:
-                self.currentStatusMessage = "VLCKit • Conectando al stream..."
+                self._statusMsg = "VLCKit • Conectando al stream..."
                 self.currentHasError = false
             case 2:
-                self.currentStatusMessage = "VLCKit • Búfer de baja latencia..."
+                self._statusMsg = "VLCKit • Búfer de baja latencia..."
                 self.currentHasError = false
             case 5:
-                let format = self.currentUrl.lowercased().contains(".ts") ? "MPEG-TS (.ts)" : "HLS (.m3u8)"
-                self.currentStatusMessage = "VLCKit • En directo (\(format))"
+                let format = self._currentUrl.lowercased().contains(".ts") ? "MPEG-TS (.ts)" : "HLS (.m3u8)"
+                self._statusMsg = "VLCKit • En directo (\(format))"
                 self.currentHasError = false
             case 6:
-                self.currentStatusMessage = "VLCKit • En pausa"
+                self._statusMsg = "VLCKit • En pausa"
             case 4:
-                self.currentStatusMessage = "Error decodificando stream con VLCKit"
+                self._statusMsg = "Error decodificando stream con VLCKit"
                 self.currentHasError = true
             case 0:
-                self.currentStatusMessage = "VLCKit • Detenido"
+                self._statusMsg = "VLCKit • Detenido"
             default:
                 break
             }
@@ -561,8 +594,9 @@ public class VLCPlayerBridge: NSObject {
         return view
     }
 
-    @objc public static func play(url: String, isLive: Bool) {
-        shared.currentHost?.playStream(urlString: url, isLive: isLive)
+    @objc public static func play(url: String?, isLive: Bool) {
+        let safe = String(url ?? "")
+        shared.currentHost?.playStream(urlString: safe, isLive: isLive)
     }
 
     @objc public static func pause() {
@@ -582,11 +616,13 @@ public class VLCPlayerBridge: NSObject {
     }
 
     @objc public static func setAspectRatio(_ ratio: String?) {
-        shared.currentHost?.setAspectRatio(ratio: ratio)
+        let safe = ratio != nil ? String(ratio!) : nil
+        shared.currentHost?.setAspectRatio(ratio: safe)
     }
 
-    @objc public static func getStatus() -> String {
-        return shared.currentHost?.currentStatusMessage ?? "VLCKit • Decodificador interno activo"
+    @objc public static func getStatus() -> NSString {
+        let msg = shared.currentHost?._statusMsg ?? "VLCKit • Decodificador interno activo"
+        return NSMutableString(string: msg)
     }
 
     @objc public static func getHasError() -> Bool {

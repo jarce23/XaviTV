@@ -327,7 +327,8 @@ actual fun NativeVideoPlayer(
         statusLabel = "VLCKit • Conectando $formatTag..."
 
         val playSel = if (isLive) NSSelectorFromString("playStreamUrl:") else NSSelectorFromString("playVodUrl:")
-        val nsUrl = NSString.create(string = currentStreamUrl)
+        val safeUrl = currentStreamUrl.trim().ifBlank { "" }
+        val nsUrl = NSString.create(string = safeUrl)
         (hostView as? NSObject)?.performSelector(playSel, withObject = nsUrl)
 
         if (!isLive && initialPositionMs > 3_000L) {
@@ -339,7 +340,8 @@ actual fun NativeVideoPlayer(
 
         // Aplica relación de aspecto actual
         val aspectSel = NSSelectorFromString("setAspectRatio:")
-        val nsRatio = NSString.create(string = aspectRatios[currentAspectIndex])
+        val safeRatio = aspectRatios.getOrNull(currentAspectIndex) ?: "DEFAULT"
+        val nsRatio = NSString.create(string = safeRatio)
         (hostView as? NSObject)?.performSelector(aspectSel, withObject = nsRatio)
     }
 
@@ -348,10 +350,6 @@ actual fun NativeVideoPlayer(
         val hostView = hostViewRef ?: return@LaunchedEffect
         while (true) {
             delay(1000L)
-            val msg = (hostView as? NSObject)?.valueForKey("currentStatusMessage") as? String
-            if (!msg.isNullOrBlank()) {
-                statusLabel = msg
-            }
             val hasErr = ((hostView as? NSObject)?.valueForKey("currentHasError") as? NSNumber)?.boolValue ?: false
             if (hasErr && !hasPlaybackError) {
                 if (candidateIndex + 1 < candidates.size) {
@@ -362,6 +360,17 @@ actual fun NativeVideoPlayer(
                     hasPlaybackError = true
                     showOverlayBar = true
                     statusLabel = "Fallo de decodificación. Reintenta o abre en VLC externo"
+                }
+            } else if (!hasPlaybackError) {
+                val formatTag = when {
+                    currentStreamUrl.contains(".ts", ignoreCase = true) -> "MPEG-TS (.ts)"
+                    currentStreamUrl.contains(".m3u8", ignoreCase = true) -> "HLS (.m3u8)"
+                    else -> "Stream directo"
+                }
+                statusLabel = if (isPlaying) {
+                    if (isLive) "VLCKit • En directo ($formatTag)" else "VLCKit • Reproduciendo"
+                } else {
+                    "VLCKit • En pausa"
                 }
             }
             if (!isLive) {
@@ -533,6 +542,7 @@ actual fun NativeVideoPlayer(
                                 }
                                 (hostView as? NSObject)?.performSelector(sel)
                                 isPlaying = !isPlaying
+                                statusLabel = if (isPlaying) "VLCKit • Reproduciendo" else "VLCKit • En pausa"
                             }
                         },
                         modifier = Modifier
