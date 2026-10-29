@@ -135,7 +135,7 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                                 onClick = {
                                     val sid = r.movieData?.streamId?.takeIf { it.isNotBlank() } ?: id
                                     app.store.addRecentlyViewed("movie", sid)
-                                    PlayerActivity.start(ctx, repo.movieUrl(sid, r.movieData?.extension), title, live = false)
+                                    PlayerActivity.start(ctx, repo.movieUrl(sid, r.movieData?.extension), title, live = false, streamType = "movie", streamId = sid)
                                 },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = GoldPrimary,
@@ -312,7 +312,7 @@ fun SeriesDetailScreen(id: String, onBack: () -> Unit) {
                                         idleBorderColor = GoldPrimary.copy(alpha = 0.22f),
                                     ) {
                                         app.store.addRecentlyViewed("series", id)
-                                        PlayerActivity.start(ctx, repo.episodeUrl(ep.id, ep.extension), ep.title, live = false)
+                                        PlayerActivity.start(ctx, repo.episodeUrl(ep.id, ep.extension), ep.title, live = false, streamType = "series", streamId = id)
                                     }
                                     .background(DarkSurface, epShape)
                                     .padding(10.dp),
@@ -440,7 +440,7 @@ fun SearchScreen(onMovie: (String) -> Unit, onSeries: (String) -> Unit, onBack: 
                                 when (key[0]) {
                                     'l' -> {
                                         app.store.addRecentlyViewed("live", id)
-                                        PlayerActivity.start(ctx, repo.liveUrl(id), name, live = true)
+                                        PlayerActivity.start(ctx, repo.liveUrl(id), name, live = true, streamType = "live", streamId = id)
                                     }
                                     'm' -> {
                                         app.store.addRecentlyViewed("movie", id)

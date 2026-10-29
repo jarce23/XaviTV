@@ -6,6 +6,9 @@ import com.google.gson.Gson
 import com.google.gson.JsonElement
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -131,6 +134,9 @@ class PlaylistStore(context: Context) {
         prefs.edit().putStringSet("fav_$type", updated).apply()
     }
 
+    private val _recentUpdates = MutableStateFlow(0)
+    val recentUpdates: StateFlow<Int> = _recentUpdates.asStateFlow()
+
     fun getRecentlyViewed(type: String): List<String> {
         val json = prefs.getString("recent_$type", null) ?: return emptyList()
         return runCatching {
@@ -147,18 +153,20 @@ class PlaylistStore(context: Context) {
         while (list.size > maxItems) {
             list.removeAt(list.lastIndex)
         }
-        prefs.edit().putString("recent_$type", gson.toJson(list)).apply()
+        prefs.edit().putString("recent_$type", gson.toJson(list)).commit()
+        _recentUpdates.value++
     }
 
     fun clearRecentlyViewed(type: String) {
-        prefs.edit().remove("recent_$type").apply()
+        prefs.edit().remove("recent_$type").commit()
+        _recentUpdates.value++
     }
 
     fun getSelectedCategory(type: String): String =
         prefs.getString("selected_cat_$type", "__all") ?: "__all"
 
     fun setSelectedCategory(type: String, categoryId: String) {
-        prefs.edit().putString("selected_cat_$type", categoryId).apply()
+        prefs.edit().putString("selected_cat_$type", categoryId).commit()
     }
 
     fun getScrollPosition(key: String): Pair<Int, Int> {

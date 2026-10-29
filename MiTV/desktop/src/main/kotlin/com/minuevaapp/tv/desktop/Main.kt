@@ -142,6 +142,7 @@ fun main() {
                             movie = current.movie,
                             onBack = { popBack() },
                             onPlay = { url, title, resumeKey ->
+                                appState.store.addRecentlyViewed("movie", current.movie.streamId)
                                 navigate(
                                     DesktopScreen.Player(
                                         url = url,
@@ -157,6 +158,7 @@ fun main() {
                             series = current.series,
                             onBack = { popBack() },
                             onPlayEpisode = { url, title, subtitle, resumeKey ->
+                                appState.store.addRecentlyViewed("series", current.series.seriesId)
                                 navigate(
                                     DesktopScreen.Player(
                                         url = url,
@@ -171,6 +173,7 @@ fun main() {
                         is DesktopScreen.Search -> SearchScreen(
                             onBack = { popBack() },
                             onPlayLive = { ch, url ->
+                                appState.store.addRecentlyViewed("live", ch.streamId)
                                 navigate(
                                     DesktopScreen.Player(
                                         url = url,
@@ -180,8 +183,14 @@ fun main() {
                                     )
                                 )
                             },
-                            onOpenMovie = { navigate(DesktopScreen.MovieDetail(it)) },
-                            onOpenSeries = { navigate(DesktopScreen.SeriesDetail(it)) }
+                            onOpenMovie = {
+                                appState.store.addRecentlyViewed("movie", it.streamId)
+                                navigate(DesktopScreen.MovieDetail(it))
+                            },
+                            onOpenSeries = {
+                                appState.store.addRecentlyViewed("series", it.seriesId)
+                                navigate(DesktopScreen.SeriesDetail(it))
+                            }
                         )
                         is DesktopScreen.Player -> DesktopPlayerScreen(
                             url = current.url,

@@ -68,6 +68,35 @@ class DesktopAppState {
     val store: PlaylistStore = PlaylistStore()
     private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    var isRefreshing by mutableStateOf(false)
+        private set
+    var refreshFeedback by mutableStateOf<String?>(null)
+        private set
+    var catalogRefreshVersion by mutableIntStateOf(0)
+        private set
+
+    fun refreshCurrentPlaylistAsync() {
+        if (isRefreshing) return
+        backgroundScope.launch {
+            isRefreshing = true
+            val current = store.active()
+            refreshFeedback = "Actualizando catálogo de ${current.name}..."
+            val result = repo().refreshAllXtream()
+            isRefreshing = false
+            catalogRefreshVersion++
+            refreshFeedback = if (result.success) {
+                if (current.isM3u) "Lista M3U actualizada (${result.liveCount} canales)"
+                else "Lista actualizada (${result.liveCount} TV, ${result.vodCount} Películas, ${result.seriesCount} Series)"
+            } else {
+                result.error ?: "Error al actualizar la lista"
+            }
+        }
+    }
+
+    fun clearRefreshFeedback() {
+        refreshFeedback = null
+    }
+
     // Inicialización perezosa de OkHttpClient para no penalizar el arranque del primer frame de UI
     val okHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()

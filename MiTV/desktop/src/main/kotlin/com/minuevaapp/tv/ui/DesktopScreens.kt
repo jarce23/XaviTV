@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
@@ -692,6 +693,25 @@ fun HomeScreen(
                 modifier = Modifier.padding(end = 8.dp)
             )
             OutlinedButton(
+                onClick = { appState.refreshCurrentPlaylistAsync() },
+                enabled = !appState.isRefreshing,
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, GoldAccent),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldChampagne),
+                modifier = Modifier.pointerHoverIcon(PointerIcon(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)))
+            ) {
+                if (appState.isRefreshing) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = GoldChampagne, strokeWidth = 2.dp)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Actualizando...")
+                } else {
+                    Icon(Icons.Default.Refresh, contentDescription = "Actualizar lista", modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Actualizar lista")
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            OutlinedButton(
                 onClick = onOpenSearch,
                 shape = RoundedCornerShape(10.dp),
                 border = BorderStroke(1.dp, GoldAccent),
@@ -724,6 +744,41 @@ fun HomeScreen(
                 .padding(horizontal = 32.dp, vertical = 24.dp),
             verticalArrangement = Arrangement.spacedBy(22.dp)
         ) {
+            if (appState.refreshFeedback != null) {
+                Surface(
+                    color = BgCardSurface,
+                    border = BorderStroke(1.dp, GoldAccent.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (appState.isRefreshing) {
+                            CircularProgressIndicator(Modifier.size(16.dp), color = GoldChampagne, strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = GoldChampagne, modifier = Modifier.size(18.dp))
+                        }
+                        Text(
+                            text = appState.refreshFeedback ?: "",
+                            fontSize = 13.sp,
+                            color = GoldChampagne,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (!appState.isRefreshing) {
+                            IconButton(
+                                onClick = { appState.clearRefreshFeedback() },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Cerrar", tint = TextSilverGray, modifier = Modifier.size(16.dp))
+                            }
+                        }
+                    }
+                }
+            }
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -928,8 +983,16 @@ fun CatalogScreen(
     val repo = remember(appState.store.stateVersion) { appState.repo() }
     val store = remember { appState.store }
 
+    val kindKey = when (kind) {
+        CatalogKind.LIVE -> "live"
+        CatalogKind.MOVIES -> "movie"
+        CatalogKind.SERIES -> "series"
+        CatalogKind.FAVORITES -> "favorites"
+    }
     var categories by remember { mutableStateOf<List<Category>>(emptyList()) }
-    var selectedCategory by remember { mutableStateOf("ALL") }
+    var selectedCategory by remember(kind, appState.store.stateVersion) {
+        mutableStateOf(appState.store.getSelectedCategory(kindKey))
+    }
     var searchQuery by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -944,25 +1007,26 @@ fun CatalogScreen(
     var favRefresh by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(kind, reloadTrigger) {
+    LaunchedEffect(kind, reloadTrigger, appState.catalogRefreshVersion) {
         loading = true
         error = null
         val allCat = Category("ALL", "Todos")
+        val recentCat = Category("RECENT", "⭐ Vistos recientemente")
         runCatching {
             when (kind) {
                 CatalogKind.LIVE -> {
                     val (cats, items) = repo.live(forceRefresh = reloadTrigger > 0)
-                    categories = listOf(allCat) + cats
+                    categories = listOf(allCat, recentCat) + cats
                     liveItems = items
                 }
                 CatalogKind.MOVIES -> {
                     val (cats, items) = repo.vod(forceRefresh = reloadTrigger > 0)
-                    categories = listOf(allCat) + cats
+                    categories = listOf(allCat, recentCat) + cats
                     movieItems = items
                 }
                 CatalogKind.SERIES -> {
                     val (cats, items) = repo.series(forceRefresh = reloadTrigger > 0)
-                    categories = listOf(allCat) + cats
+                    categories = listOf(allCat, recentCat) + cats
                     seriesItems = items
                 }
                 CatalogKind.FAVORITES -> {
@@ -980,20 +1044,61 @@ fun CatalogScreen(
         loading = false
     }
 
-    val filteredLiveItems = remember(liveItems, selectedCategory, searchQuery) {
-        val byCat = if (selectedCategory == "ALL") liveItems else liveItems.filter { it.categoryId == selectedCategory }
+    LaunchedEffect(categories) {
+        if (categories.isNotEmpty() && selectedCategory != "ALL" && selectedCategory != "RECENT" && categories.none { it.id == selectedCategory }) {
+            selectedCategory = "ALL"
+            appState.store.setSelectedCategory(kindKey, "ALL")
+        }
+    }
+
+    val recentType = when (kind) {
+        CatalogKind.LIVE -> "live"
+        CatalogKind.MOVIES -> "movie"
+        CatalogKind.SERIES -> "series"
+        CatalogKind.FAVORITES -> "live"
+    }
+    val recentIds = remember(appState.store.stateVersion, favRefresh, recentType) {
+        appState.store.getRecentlyViewed(recentType)
+    }
+    val recentLiveItems = remember(liveItems, recentIds) {
+        val map = liveItems.associateBy { it.streamId }
+        recentIds.mapNotNull { map[it] }
+    }
+    val recentMovieItems = remember(movieItems, recentIds) {
+        val map = movieItems.associateBy { it.streamId }
+        recentIds.mapNotNull { map[it] }
+    }
+    val recentSeriesItems = remember(seriesItems, recentIds) {
+        val map = seriesItems.associateBy { it.seriesId }
+        recentIds.mapNotNull { map[it] }
+    }
+
+    val filteredLiveItems = remember(liveItems, selectedCategory, searchQuery, recentLiveItems) {
+        val byCat = when (selectedCategory) {
+            "ALL" -> liveItems
+            "RECENT" -> recentLiveItems
+            else -> liveItems.filter { it.categoryId == selectedCategory }
+        }
         val q = searchQuery.trim()
         if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
     }
 
-    val filteredMovieItems = remember(movieItems, selectedCategory, searchQuery) {
-        val byCat = if (selectedCategory == "ALL") movieItems else movieItems.filter { it.categoryId == selectedCategory }
+    val filteredMovieItems = remember(movieItems, selectedCategory, searchQuery, recentMovieItems) {
+        val byCat = when (selectedCategory) {
+            "ALL" -> movieItems
+            "RECENT" -> recentMovieItems
+            else -> movieItems.filter { it.categoryId == selectedCategory }
+        }
         val q = searchQuery.trim()
         if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
     }
 
-    val filteredSeriesItems = remember(seriesItems, selectedCategory, searchQuery) {
-        val byCat = if (selectedCategory == "ALL") seriesItems else seriesItems.filter { it.categoryId == selectedCategory }
+    val filteredSeriesItems = remember(seriesItems, selectedCategory, searchQuery, recentSeriesItems) {
+        val byCat = when (selectedCategory) {
+            "ALL" -> seriesItems
+            "RECENT" -> recentSeriesItems
+            else -> seriesItems.filter { it.categoryId == selectedCategory }
+        }
         val q = searchQuery.trim()
         if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
     }
@@ -1015,7 +1120,25 @@ fun CatalogScreen(
     AppScaffold(
         title = title,
         subtitle = categories.firstOrNull { it.id == selectedCategory }?.name,
-        onBack = onBack
+        onBack = onBack,
+        actions = {
+            IconButton(
+                onClick = {
+                    if (!appState.isRefreshing) {
+                        appState.refreshCurrentPlaylistAsync()
+                        reloadTrigger++
+                    }
+                },
+                enabled = !appState.isRefreshing,
+                modifier = Modifier.pointerHoverIcon(PointerIcon(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)))
+            ) {
+                if (appState.isRefreshing) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = GoldChampagne)
+                } else {
+                    Icon(Icons.Default.Refresh, contentDescription = "Actualizar catálogo", tint = GoldChampagne)
+                }
+            }
+        }
     ) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {
             // Barra de búsqueda rápida en tiempo real
@@ -1068,6 +1191,7 @@ fun CatalogScreen(
                                     )
                                     .tvClickable(RoundedCornerShape(10.dp)) {
                                         selectedCategory = cat.id
+                                        appState.store.setSelectedCategory(kindKey, cat.id)
                                     }
                                     .padding(horizontal = 12.dp, vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -1137,6 +1261,9 @@ fun CatalogScreen(
                             selected = selectedLive,
                             epg = epgList,
                             store = store,
+                            recentChannels = recentLiveItems,
+                            selectedCategory = selectedCategory,
+                            searchQuery = searchQuery,
                             onSelect = { ch ->
                                 selectedLive = ch
                                 scope.launch {
@@ -1144,6 +1271,8 @@ fun CatalogScreen(
                                 }
                             },
                             onPlay = { ch ->
+                                store.addRecentlyViewed("live", ch.streamId)
+                                favRefresh++
                                 val url = ch.directUrl?.takeIf { it.isNotBlank() }
                                     ?: repo.liveUrl(ch.streamId, "ts")
                                 onPlayStream(
@@ -1158,7 +1287,7 @@ fun CatalogScreen(
                         kind == CatalogKind.MOVIES -> {
                             val favVodIds = remember(favRefresh) { store.favorites("vod") }
                             if (filteredMovieItems.isEmpty()) {
-                                EmptySearchMessage(searchQuery)
+                                EmptySearchMessage(searchQuery, isRecent = selectedCategory == "RECENT")
                             } else {
                                 LazyVerticalGrid(
                                     columns = GridCells.Adaptive(156.dp),
@@ -1166,6 +1295,43 @@ fun CatalogScreen(
                                     horizontalArrangement = Arrangement.spacedBy(14.dp),
                                     verticalArrangement = Arrangement.spacedBy(14.dp)
                                 ) {
+                                    if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentMovieItems.isNotEmpty()) {
+                                        item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_movies") {
+                                            Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
+                                                    Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                                                    Spacer(Modifier.width(6.dp))
+                                                    Text(
+                                                        "Películas vistas recientemente",
+                                                        fontWeight = FontWeight.Bold,
+                                                        fontSize = 14.sp,
+                                                        color = GoldChampagne
+                                                    )
+                                                }
+                                                LazyRow(
+                                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                                    contentPadding = PaddingValues(vertical = 4.dp)
+                                                ) {
+                                                    items(recentMovieItems, key = { "rec_mov_${it.streamId}" }) { m ->
+                                                        Box(Modifier.width(130.dp)) {
+                                                            PosterCard(
+                                                                title = m.name ?: "Película",
+                                                                image = m.icon,
+                                                                subtitle = m.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                                                    ?: m.extension?.uppercase(),
+                                                                isFavorite = favVodIds.contains(m.streamId),
+                                                                onClick = {
+                                                                    store.addRecentlyViewed("movie", m.streamId)
+                                                                    favRefresh++
+                                                                    onOpenMovie(m)
+                                                                }
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     items(
                                         filteredMovieItems,
                                         key = { it.streamId }
@@ -1176,7 +1342,11 @@ fun CatalogScreen(
                                             subtitle = m.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
                                                 ?: m.extension?.uppercase(),
                                             isFavorite = favVodIds.contains(m.streamId),
-                                            onClick = { onOpenMovie(m) }
+                                            onClick = {
+                                                store.addRecentlyViewed("movie", m.streamId)
+                                                favRefresh++
+                                                onOpenMovie(m)
+                                            }
                                         )
                                     }
                                 }
@@ -1185,7 +1355,7 @@ fun CatalogScreen(
                         kind == CatalogKind.SERIES -> {
                             val favSeriesIds = remember(favRefresh) { store.favorites("series") }
                             if (filteredSeriesItems.isEmpty()) {
-                                EmptySearchMessage(searchQuery)
+                                EmptySearchMessage(searchQuery, isRecent = selectedCategory == "RECENT")
                             } else {
                                 LazyVerticalGrid(
                                     columns = GridCells.Adaptive(156.dp),
@@ -1193,6 +1363,43 @@ fun CatalogScreen(
                                     horizontalArrangement = Arrangement.spacedBy(14.dp),
                                     verticalArrangement = Arrangement.spacedBy(14.dp)
                                 ) {
+                                    if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentSeriesItems.isNotEmpty()) {
+                                        item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_series") {
+                                            Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
+                                                    Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                                                    Spacer(Modifier.width(6.dp))
+                                                    Text(
+                                                        "Series vistas recientemente",
+                                                        fontWeight = FontWeight.Bold,
+                                                        fontSize = 14.sp,
+                                                        color = GoldChampagne
+                                                    )
+                                                }
+                                                LazyRow(
+                                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                                    contentPadding = PaddingValues(vertical = 4.dp)
+                                                ) {
+                                                    items(recentSeriesItems, key = { "rec_ser_${it.seriesId}" }) { s ->
+                                                        Box(Modifier.width(130.dp)) {
+                                                            PosterCard(
+                                                                title = s.name ?: "Serie",
+                                                                image = s.cover,
+                                                                subtitle = s.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                                                    ?: s.genre,
+                                                                isFavorite = favSeriesIds.contains(s.seriesId),
+                                                                onClick = {
+                                                                    store.addRecentlyViewed("series", s.seriesId)
+                                                                    favRefresh++
+                                                                    onOpenSeries(s)
+                                                                }
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     items(
                                         filteredSeriesItems,
                                         key = { it.seriesId }
@@ -1203,7 +1410,11 @@ fun CatalogScreen(
                                             subtitle = s.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
                                                 ?: s.genre,
                                             isFavorite = favSeriesIds.contains(s.seriesId),
-                                            onClick = { onOpenSeries(s) }
+                                            onClick = {
+                                                store.addRecentlyViewed("series", s.seriesId)
+                                                favRefresh++
+                                                onOpenSeries(s)
+                                            }
                                         )
                                     }
                                 }
@@ -1229,12 +1440,22 @@ fun CatalogScreen(
                                 favVod = favVod,
                                 favSeries = favSeries,
                                 onPlayLive = { ch ->
+                                    store.addRecentlyViewed("live", ch.streamId)
+                                    favRefresh++
                                     val url = ch.directUrl?.takeIf { it.isNotBlank() }
                                         ?: repo.liveUrl(ch.streamId, "ts")
                                     onPlayStream(url, ch.name ?: "Canal", "Favorito · TV en directo", "live", "")
                                 },
-                                onOpenMovie = onOpenMovie,
-                                onOpenSeries = onOpenSeries
+                                onOpenMovie = { m ->
+                                    store.addRecentlyViewed("movie", m.streamId)
+                                    favRefresh++
+                                    onOpenMovie(m)
+                                },
+                                onOpenSeries = { s ->
+                                    store.addRecentlyViewed("series", s.seriesId)
+                                    favRefresh++
+                                    onOpenSeries(s)
+                                }
                             )
                         }
                     }
@@ -1245,13 +1466,13 @@ fun CatalogScreen(
 }
 
 @Composable
-private fun BoxScope.EmptySearchMessage(query: String) {
+private fun BoxScope.EmptySearchMessage(query: String, isRecent: Boolean = false) {
     Column(
         Modifier.align(Alignment.Center).padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Icon(
-            Icons.Default.SearchOff,
+            if (isRecent) Icons.Default.History else Icons.Default.SearchOff,
             contentDescription = null,
             tint = GoldAccent.copy(alpha = 0.65f),
             modifier = Modifier.size(44.dp)
@@ -1259,9 +1480,11 @@ private fun BoxScope.EmptySearchMessage(query: String) {
         Spacer(Modifier.height(10.dp))
         Text(
             if (query.isNotBlank()) "No se encontraron resultados para \"$query\""
+            else if (isRecent) "No has visto ningún contenido recientemente.\nLos contenidos que reproduzcas aparecerán aquí automáticamente."
             else "No hay elementos en esta categoría",
             color = TextPureWhite,
-            fontWeight = FontWeight.SemiBold
+            fontWeight = FontWeight.SemiBold,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center
         )
     }
 }
@@ -1272,6 +1495,9 @@ private fun LiveChannelsView(
     selected: LiveStream?,
     epg: List<EpgListing>,
     store: PlaylistStore,
+    recentChannels: List<LiveStream> = emptyList(),
+    selectedCategory: String = "ALL",
+    searchQuery: String = "",
     onSelect: (LiveStream) -> Unit,
     onPlay: (LiveStream) -> Unit
 ) {
@@ -1280,7 +1506,7 @@ private fun LiveChannelsView(
 
     if (channels.isEmpty()) {
         Box(Modifier.fillMaxSize()) {
-            EmptySearchMessage("")
+            EmptySearchMessage(searchQuery, isRecent = selectedCategory == "RECENT")
         }
         return
     }
@@ -1293,6 +1519,71 @@ private fun LiveChannelsView(
                 .padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentChannels.isNotEmpty()) {
+                item(key = "header_recent_live") {
+                    Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
+                            Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "Canales vistos recientemente",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = GoldChampagne
+                            )
+                        }
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            contentPadding = PaddingValues(vertical = 4.dp)
+                        ) {
+                            items(recentChannels, key = { "rec_live_${it.streamId}" }) { ch ->
+                                Row(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(BgCardSurface)
+                                        .border(1.dp, GoldAccent.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                                        .tvClickable(RoundedCornerShape(10.dp)) { onPlay(ch) }
+                                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    NetworkImage(
+                                        url = ch.icon,
+                                        contentDescription = ch.name,
+                                        contentScale = ContentScale.Fit,
+                                        modifier = Modifier
+                                            .size(32.dp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(BgDeepCharcoal)
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Column(Modifier.widthIn(max = 140.dp)) {
+                                        Text(
+                                            text = ch.name ?: "Canal",
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = TextPureWhite,
+                                            fontSize = 12.sp
+                                        )
+                                        Text(
+                                            text = "Visto reciente",
+                                            fontSize = 10.sp,
+                                            color = GoldChampagne
+                                        )
+                                    }
+                                    Spacer(Modifier.width(6.dp))
+                                    Icon(
+                                        imageVector = Icons.Default.PlayArrow,
+                                        contentDescription = null,
+                                        tint = GoldAccent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             items(channels, key = { it.streamId }) { ch ->
                 val isSel = selected?.streamId == ch.streamId
                 val isFav = favLiveIds.contains(ch.streamId)
@@ -1661,6 +1952,7 @@ fun MovieDetailScreen(
                     Button(
                         onClick = {
                             if (streamUrl.isNotBlank()) {
+                                store.addRecentlyViewed("movie", movie.streamId)
                                 onPlay(streamUrl, movie.name ?: "Película", resumeKey)
                             }
                         },
@@ -1813,6 +2105,7 @@ fun SeriesDetailScreen(
                             .clip(RoundedCornerShape(12.dp))
                             .background(BgCardSurface)
                             .tvClickable(RoundedCornerShape(12.dp)) {
+                                store.addRecentlyViewed("series", series.seriesId)
                                 val url = ep.directUrl?.takeIf { it.isNotBlank() }
                                     ?: repo.episodeUrl(ep.id, ext)
                                 onPlayEpisode(
@@ -1876,6 +2169,7 @@ fun SearchScreen(
 ) {
     val appState = LocalAppState.current
     val repo = remember { appState.repo() }
+    val store = remember { appState.store }
     var query by remember { mutableStateOf("") }
     var liveAll by remember { mutableStateOf<List<LiveStream>>(emptyList()) }
     var vodAll by remember { mutableStateOf<List<VodStream>>(emptyList()) }
@@ -1931,6 +2225,7 @@ fun SearchScreen(
                                         image = ch.icon,
                                         subtitle = "LIVE",
                                         onClick = {
+                                            store.addRecentlyViewed("live", ch.streamId)
                                             val url = ch.directUrl?.takeIf { it.isNotBlank() }
                                                 ?: repo.liveUrl(ch.streamId, "ts")
                                             onPlayLive(ch, url)
@@ -1954,7 +2249,10 @@ fun SearchScreen(
                                         title = m.name ?: "Película",
                                         image = m.icon,
                                         subtitle = m.rating,
-                                        onClick = { onOpenMovie(m) }
+                                        onClick = {
+                                            store.addRecentlyViewed("movie", m.streamId)
+                                            onOpenMovie(m)
+                                        }
                                     )
                                 }
                             }
@@ -1974,7 +2272,10 @@ fun SearchScreen(
                                         title = s.name ?: "Serie",
                                         image = s.cover,
                                         subtitle = s.rating,
-                                        onClick = { onOpenSeries(s) }
+                                        onClick = {
+                                            store.addRecentlyViewed("series", s.seriesId)
+                                            onOpenSeries(s)
+                                        }
                                     )
                                 }
                             }

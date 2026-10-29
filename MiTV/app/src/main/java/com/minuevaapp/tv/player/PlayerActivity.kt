@@ -80,6 +80,11 @@ class PlayerActivity : Activity() {
             finish()
             return
         }
+        val sType = intent.getStringExtra(EXTRA_STREAM_TYPE) ?: if (isLive) "live" else "movie"
+        val sId = intent.getStringExtra(EXTRA_STREAM_ID)
+        if (!sId.isNullOrBlank()) {
+            com.minuevaapp.tv.MiTVApp.instance.store.addRecentlyViewed(sType, sId)
+        }
         // Si la URL apunta explícitamente a un manifiesto .m3u8 (ej. TDTChannels), iniciamos con HLS
         // y mantenemos el fallback automático a ProgressiveMediaSource si fuese un flujo TS crudo.
         useHlsFallback = url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)
@@ -459,15 +464,30 @@ class PlayerActivity : Activity() {
         private const val EXTRA_URL = "url"
         private const val EXTRA_TITLE = "title"
         private const val EXTRA_LIVE = "live"
+        private const val EXTRA_STREAM_TYPE = "stream_type"
+        private const val EXTRA_STREAM_ID = "stream_id"
         private const val MAX_RECONNECT_ATTEMPTS = 5
         private const val RECONNECT_BASE_DELAY_MS = 2_500L
 
-        fun start(ctx: Context, url: String, title: String?, live: Boolean = false) {
+        fun start(
+            ctx: Context,
+            url: String,
+            title: String?,
+            live: Boolean = false,
+            streamType: String? = null,
+            streamId: String? = null
+        ) {
+            val resolvedType = streamType ?: if (live) "live" else "movie"
+            if (!streamId.isNullOrBlank()) {
+                com.minuevaapp.tv.MiTVApp.instance.store.addRecentlyViewed(resolvedType, streamId)
+            }
             ctx.startActivity(
                 Intent(ctx, PlayerActivity::class.java)
                     .putExtra(EXTRA_URL, url)
                     .putExtra(EXTRA_TITLE, title)
                     .putExtra(EXTRA_LIVE, live)
+                    .putExtra(EXTRA_STREAM_TYPE, resolvedType)
+                    .putExtra(EXTRA_STREAM_ID, streamId)
             )
         }
     }

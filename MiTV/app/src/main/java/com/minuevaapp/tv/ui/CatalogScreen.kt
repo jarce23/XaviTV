@@ -26,6 +26,9 @@ import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -149,7 +152,22 @@ fun CatalogScreen(
     var searchQuery by rememberSaveable(type) { mutableStateOf("") }
     var favs by remember(type) { mutableStateOf(app.store.favorites(type)) }
     var recentRefresh by remember { mutableIntStateOf(0) }
+    val storeRecentVersion by app.store.recentUpdates.collectAsState()
     val ctx = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(lifecycleOwner, type) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                recentRefresh++
+                favs = app.store.favorites(type)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     AppScaffold(
         title = title,
@@ -192,7 +210,7 @@ fun CatalogScreen(
                 }
             }
 
-            val recentIds = remember(recentRefresh, type) { app.store.getRecentlyViewed(type) }
+            val recentIds = remember(recentRefresh, storeRecentVersion, type) { app.store.getRecentlyViewed(type) }
             val recentItems = remember(items, recentIds) {
                 val map = items.associateBy { it.id }
                 recentIds.mapNotNull { map[it] }
@@ -350,7 +368,7 @@ fun CatalogScreen(
                                 onPlayRecent = { ch ->
                                     app.store.addRecentlyViewed(type, ch.id)
                                     recentRefresh++
-                                    PlayerActivity.start(ctx, repo.liveUrl(ch.id), ch.name, live = true)
+                                    PlayerActivity.start(ctx, repo.liveUrl(ch.id), ch.name, live = true, streamType = type, streamId = ch.id)
                                 },
                                 onToggleFav = { id ->
                                     app.store.toggleFavorite(type, id)
@@ -359,7 +377,7 @@ fun CatalogScreen(
                                 onPlay = { item ->
                                     app.store.addRecentlyViewed(type, item.id)
                                     recentRefresh++
-                                    PlayerActivity.start(ctx, repo.liveUrl(item.id), item.name, live = true)
+                                    PlayerActivity.start(ctx, repo.liveUrl(item.id), item.name, live = true, streamType = type, streamId = item.id)
                                 },
                                 modifier = Modifier.weight(1f).fillMaxWidth(),
                             )
