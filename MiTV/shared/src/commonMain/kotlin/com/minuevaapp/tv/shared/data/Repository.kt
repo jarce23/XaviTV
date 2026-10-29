@@ -47,6 +47,14 @@ data class M3uSyncOutcome(
     val usedLocalFallback: Boolean
 )
 
+data class RefreshResult(
+    val success: Boolean,
+    val liveCount: Int = 0,
+    val vodCount: Int = 0,
+    val seriesCount: Int = 0,
+    val error: String? = null
+)
+
 class PlaylistStore {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -158,6 +166,25 @@ class PlaylistStore {
 
     fun saveResumePosition(key: String, posMs: Long) {
         data.resumePositions[key] = posMs
+        persist()
+    }
+
+    fun getRecentlyViewed(type: String): List<String> =
+        data.recentlyViewed[type]?.toList().orEmpty()
+
+    fun addRecentlyViewed(type: String, id: String, maxItems: Int = 40) {
+        if (id.isBlank()) return
+        val list = data.recentlyViewed.getOrPut(type) { mutableListOf() }
+        list.remove(id)
+        list.add(0, id)
+        while (list.size > maxItems) {
+            list.removeAt(list.lastIndex)
+        }
+        persist()
+    }
+
+    fun clearRecentlyViewed(type: String) {
+        data.recentlyViewed.remove(type)
         persist()
     }
 
@@ -374,6 +401,44 @@ class XtreamRepository(
             val cats = callPlayerApi<List<Category>>("get_series_categories")
             val items = callPlayerApi<List<Series>>("get_series")
             (cats to items).also { seriesCache = it }
+        }
+    }
+
+    suspend fun refreshAllXtream(): RefreshResult = withContext(Dispatchers.IO) {
+        liveMutex.withLock { liveCache = null }
+        vodMutex.withLock { vodCache = null }
+        seriesMutex.withLock { seriesCache = null }
+
+        if (playlist.isM3u) {
+            return@withContext runCatching {
+                val outcome = syncM3uWithRemote()
+                RefreshResult(
+                    success = true,
+                    liveCount = outcome.catalog.liveStreams.size,
+                    vodCount = outcome.catalog.vodStreams.size,
+                    seriesCount = outcome.catalog.seriesList.size
+                )
+            }.getOrElse {
+                RefreshResult(success = false, error = sanitizeError(it, playlist))
+            }
+        }
+
+        try {
+            login()
+            val (_, liveItems) = live(forceRefresh = true)
+            val (_, vodItems) = vod(forceRefresh = true)
+            val (_, seriesItems) = series(forceRefresh = true)
+            RefreshResult(
+                success = true,
+                liveCount = liveItems.size,
+                vodCount = vodItems.size,
+                seriesCount = seriesItems.size
+            )
+        } catch (e: Throwable) {
+            RefreshResult(
+                success = false,
+                error = sanitizeError(e, playlist)
+            )
         }
     }
 

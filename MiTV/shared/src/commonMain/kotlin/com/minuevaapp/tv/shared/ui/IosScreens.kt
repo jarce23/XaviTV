@@ -5,9 +5,12 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -83,6 +86,66 @@ class SharedAppState {
 
     private val _catalogRefreshVersion = MutableStateFlow(0L)
     val catalogRefreshVersion: StateFlow<Long> = _catalogRefreshVersion.asStateFlow()
+
+    private val _isRefreshing = MutableStateFlow(false)
+    val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
+
+    private val _refreshFeedback = MutableStateFlow<String?>(null)
+    val refreshFeedback: StateFlow<String?> = _refreshFeedback.asStateFlow()
+
+    // Persistencia en memoria de la categoría activa por sección (TV, Películas, Series, Favoritos)
+    val selectedCategoryByKind: MutableMap<CatalogKind, String> = mutableMapOf(
+        CatalogKind.LIVE to "ALL",
+        CatalogKind.MOVIES to "ALL",
+        CatalogKind.SERIES to "ALL",
+        CatalogKind.FAVORITES to "ALL"
+    )
+
+    fun getSelectedCategory(kind: CatalogKind): String =
+        selectedCategoryByKind[kind] ?: "ALL"
+
+    fun setSelectedCategory(kind: CatalogKind, categoryId: String) {
+        selectedCategoryByKind[kind] = categoryId
+    }
+
+    // Persistencia en memoria de la posición de scroll por clave "${kind}_${categoryId}"
+    val scrollPositions: MutableMap<String, Pair<Int, Int>> = mutableMapOf()
+
+    fun getScrollPosition(kind: CatalogKind, categoryId: String): Pair<Int, Int> =
+        scrollPositions["${kind.name}_$categoryId"] ?: (0 to 0)
+
+    fun saveScrollPosition(kind: CatalogKind, categoryId: String, index: Int, offset: Int) {
+        if (index >= 0 && offset >= 0) {
+            scrollPositions["${kind.name}_$categoryId"] = index to offset
+        }
+    }
+
+    fun refreshActivePlaylist(targetPlaylist: Playlist = store.active(), onCompleted: ((Boolean, String) -> Unit)? = null) {
+        if (_isRefreshing.value) return
+        activeSyncJob?.cancel()
+        _isRefreshing.value = true
+        _refreshFeedback.value = "Actualizando catálogo de ${targetPlaylist.name}..."
+
+        backgroundScope.launch(Dispatchers.IO) {
+            val activeRepo = if (targetPlaylist == store.active()) repo() else createRepo(targetPlaylist)
+            val result = activeRepo.refreshAllXtream()
+            _isRefreshing.value = false
+            _catalogRefreshVersion.value += 1L
+            val feedback = if (result.success) {
+                if (targetPlaylist.isM3u) {
+                    "Lista M3U actualizada (${result.liveCount} canales)"
+                } else {
+                    "Lista actualizada (${result.liveCount} TV, ${result.vodCount} Películas, ${result.seriesCount} Series)"
+                }
+            } else {
+                result.error ?: "Error al actualizar la lista"
+            }
+            _refreshFeedback.value = feedback
+            withContext(Dispatchers.Main) {
+                onCompleted?.invoke(result.success, feedback)
+            }
+        }
+    }
 
     private val cacheMutex = Mutex()
     private val imageCache: MutableMap<String, CachedImageEntry> = linkedMapOf()
@@ -370,13 +433,20 @@ fun IosXaviTVApp() {
                             )
                         )
                     },
-                    onOpenMovie = { navigate(IosScreen.MovieDetail(it)) },
-                    onOpenSeries = { navigate(IosScreen.SeriesDetail(it)) }
+                    onOpenMovie = { movie ->
+                        appState.store.addRecentlyViewed("vod", movie.streamId)
+                        navigate(IosScreen.MovieDetail(movie))
+                    },
+                    onOpenSeries = { series ->
+                        appState.store.addRecentlyViewed("series", series.seriesId)
+                        navigate(IosScreen.SeriesDetail(series))
+                    }
                 )
                 is IosScreen.MovieDetail -> IosMovieDetailScreen(
                     movie = current.movie,
                     onBack = { popBack() },
                     onPlay = { url, title, resumeKey ->
+                        appState.store.addRecentlyViewed("vod", current.movie.streamId)
                         navigate(
                             IosScreen.Player(
                                 url = url,
@@ -392,6 +462,7 @@ fun IosXaviTVApp() {
                     series = current.series,
                     onBack = { popBack() },
                     onPlayEpisode = { url, title, subtitle, resumeKey ->
+                        appState.store.addRecentlyViewed("series", current.series.seriesId)
                         navigate(
                             IosScreen.Player(
                                 url = url,
@@ -406,6 +477,7 @@ fun IosXaviTVApp() {
                 is IosScreen.Search -> IosSearchScreen(
                     onBack = { popBack() },
                     onPlayLive = { ch, url ->
+                        appState.store.addRecentlyViewed("live", ch.streamId)
                         navigate(
                             IosScreen.Player(
                                 url = url,
@@ -415,8 +487,14 @@ fun IosXaviTVApp() {
                             )
                         )
                     },
-                    onOpenMovie = { navigate(IosScreen.MovieDetail(it)) },
-                    onOpenSeries = { navigate(IosScreen.SeriesDetail(it)) }
+                    onOpenMovie = { movie ->
+                        appState.store.addRecentlyViewed("vod", movie.streamId)
+                        navigate(IosScreen.MovieDetail(movie))
+                    },
+                    onOpenSeries = { series ->
+                        appState.store.addRecentlyViewed("series", series.seriesId)
+                        navigate(IosScreen.SeriesDetail(series))
+                    }
                 )
                 is IosScreen.Player -> NativeVideoPlayer(
                     url = current.url,
@@ -890,6 +968,16 @@ fun IosPlaylistsScreen(onConnected: () -> Unit) {
                 )
             }
             IconButton(
+                onClick = { appState.refreshActivePlaylist(pl) },
+                enabled = !appState.isRefreshing.value
+            ) {
+                Icon(
+                    Icons.Default.Refresh,
+                    contentDescription = "Actualizar lista",
+                    tint = GoldChampagne
+                )
+            }
+            IconButton(
                 onClick = {
                     if (editingOriginal?.name == pl.name) resetFormFields()
                     store.remove(pl)
@@ -1091,11 +1179,62 @@ fun IosPlaylistsScreen(onConnected: () -> Unit) {
         }
     }
 
+    val isRefreshing by appState.isRefreshing.collectAsState()
+    val refreshFeedback by appState.refreshFeedback.collectAsState()
+
     IosAppScaffold(
         title = "XaviTV · iOS / iPadOS",
-        subtitle = "Gestión de listas Xtream Codes y M3U"
+        subtitle = "Gestión de listas Xtream Codes y M3U",
+        actions = {
+            IconButton(
+                onClick = { appState.refreshActivePlaylist() },
+                enabled = !isRefreshing
+            ) {
+                if (isRefreshing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = GoldAccent,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "Actualizar lista activa",
+                        tint = GoldChampagne
+                    )
+                }
+            }
+        }
     ) {
-        BoxWithConstraints(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            if (refreshFeedback != null) {
+                Surface(
+                    color = BgCardSurface,
+                    border = BorderStroke(1.dp, GoldAccent),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (isRefreshing) {
+                            CircularProgressIndicator(Modifier.size(16.dp), color = GoldAccent, strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                        }
+                        Text(
+                            text = refreshFeedback ?: "",
+                            fontSize = 12.sp,
+                            color = GoldChampagne,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+            BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
             val isTablet = maxWidth >= 700.dp
             if (isTablet) {
                 // Diseño de doble panel (Dual-Pane) para iPad y pantallas horizontales grandes
@@ -1156,6 +1295,7 @@ fun IosPlaylistsScreen(onConnected: () -> Unit) {
         }
     }
 }
+}
 
 // ─── 2. PANTALLA PRINCIPAL (Responsive iPhone & iPad Multi-Columna) ───
 @Composable
@@ -1180,10 +1320,31 @@ fun IosHomeScreen(
         }
     }
 
+    val isRefreshing by appState.isRefreshing.collectAsState()
+    val refreshFeedback by appState.refreshFeedback.collectAsState()
+
     IosAppScaffold(
         title = "XaviTV",
         subtitle = homeSubtitle,
         actions = {
+            IconButton(
+                onClick = { appState.refreshActivePlaylist(active) },
+                enabled = !isRefreshing
+            ) {
+                if (isRefreshing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = GoldAccent,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "Actualizar lista",
+                        tint = GoldChampagne
+                    )
+                }
+            }
             if (active.isM3u) {
                 IconButton(onClick = { appState.startBackgroundM3uSync(active) }) {
                     Icon(
@@ -1205,7 +1366,35 @@ fun IosHomeScreen(
             }
         }
     ) {
-        BoxWithConstraints(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            if (refreshFeedback != null) {
+                Surface(
+                    color = BgCardSurface,
+                    border = BorderStroke(1.dp, GoldAccent),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (isRefreshing) {
+                            CircularProgressIndicator(Modifier.size(16.dp), color = GoldAccent, strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                        }
+                        Text(
+                            text = refreshFeedback ?: "",
+                            fontSize = 12.sp,
+                            color = GoldChampagne,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+            BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
             val isTablet = maxWidth >= 700.dp
             if (isTablet) {
                 // Diseño expandido para iPad: 3 grandes bloques en paralelo + fila de accesos rápidos
@@ -1283,6 +1472,24 @@ fun IosHomeScreen(
                             Spacer(Modifier.width(8.dp))
                             Text("Gestionar Listas", fontWeight = FontWeight.Bold)
                         }
+                        OutlinedButton(
+                            onClick = { appState.refreshActivePlaylist(active) },
+                            border = BorderStroke(1.dp, GoldAccent),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldChampagne),
+                            modifier = Modifier.weight(1f).height(54.dp),
+                            enabled = !isRefreshing
+                        ) {
+                            if (isRefreshing) {
+                                CircularProgressIndicator(Modifier.size(18.dp), color = GoldAccent, strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Actualizando...", fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(Icons.Default.Refresh, contentDescription = null, tint = GoldAccent)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Actualizar lista", fontWeight = FontWeight.Bold)
+                            }
+                        }
                     }
                 }
             } else {
@@ -1319,6 +1526,26 @@ fun IosHomeScreen(
                         )
                     }
                     item {
+                        OutlinedButton(
+                            onClick = { appState.refreshActivePlaylist(active) },
+                            border = BorderStroke(1.dp, GoldAccent),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldChampagne),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
+                            enabled = !isRefreshing
+                        ) {
+                            if (isRefreshing) {
+                                CircularProgressIndicator(Modifier.size(18.dp), color = GoldAccent, strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Actualizando catálogo...", fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(Icons.Default.Refresh, contentDescription = null, tint = GoldAccent)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Actualizar lista Xtream / M3U", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                    item {
                         Row(
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -1349,6 +1576,7 @@ fun IosHomeScreen(
                     }
                 }
             }
+        }
         }
     }
 }
@@ -1479,6 +1707,55 @@ private fun IosHomeCard(
     }
 }
 
+@Composable
+private fun RecentLiveChannelCard(
+    ch: LiveStream,
+    onPlay: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .width(200.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(BgCardSurface)
+            .border(1.dp, GoldAccent.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+            .clickable(onClick = onPlay)
+            .padding(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        IosNetworkImage(
+            url = ch.icon,
+            contentDescription = ch.name,
+            contentScale = ContentScale.Fit,
+            maxDimension = 96,
+            modifier = Modifier
+                .size(36.dp)
+                .clip(RoundedCornerShape(8.dp))
+        )
+        Spacer(Modifier.width(8.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = ch.name ?: "Canal",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = TextPureWhite,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "Visto reciente",
+                fontSize = 10.sp,
+                color = GoldChampagne
+            )
+        }
+        Icon(
+            Icons.Default.PlayArrow,
+            contentDescription = null,
+            tint = GoldAccent,
+            modifier = Modifier.size(18.dp)
+        )
+    }
+}
+
 // ─── 3. CATÁLOGO RESPONSIVE (Doble Panel y Grids Multi-Columna en iPad) ─
 @Composable
 fun IosCatalogScreen(
@@ -1493,9 +1770,10 @@ fun IosCatalogScreen(
     val store = remember { appState.store }
     val catalogVersion by appState.catalogRefreshVersion.collectAsState()
     val syncState by appState.m3uSyncState.collectAsState()
+    val isRefreshing by appState.isRefreshing.collectAsState()
 
     var categories by remember { mutableStateOf<List<Category>>(emptyList()) }
-    var selectedCategory by remember { mutableStateOf("ALL") }
+    var selectedCategory by remember(kind) { mutableStateOf(appState.getSelectedCategory(kind)) }
     var searchQuery by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -1520,11 +1798,12 @@ fun IosCatalogScreen(
         }
         error = null
         val allCat = Category("ALL", "Todos")
+        val recentCat = Category("RECENT", "⭐ Vistos recientemente")
         runCatching {
             when (kind) {
                 CatalogKind.LIVE -> {
                     val (cats, items) = repo.live()
-                    categories = listOf(allCat) + cats
+                    categories = listOf(allCat, recentCat) + cats
                     liveItems = items
                     if (selectedLiveChannel == null || items.none { it.streamId == selectedLiveChannel?.streamId }) {
                         selectedLiveChannel = items.firstOrNull()
@@ -1534,12 +1813,12 @@ fun IosCatalogScreen(
                 }
                 CatalogKind.MOVIES -> {
                     val (cats, items) = repo.vod()
-                    categories = listOf(allCat) + cats
+                    categories = listOf(allCat, recentCat) + cats
                     movieItems = items
                 }
                 CatalogKind.SERIES -> {
                     val (cats, items) = repo.series()
-                    categories = listOf(allCat) + cats
+                    categories = listOf(allCat, recentCat) + cats
                     seriesItems = items
                 }
                 CatalogKind.FAVORITES -> {
@@ -1556,20 +1835,56 @@ fun IosCatalogScreen(
         loading = false
     }
 
-    val filteredLive = remember(liveItems, selectedCategory, searchQuery) {
-        val byCat = if (selectedCategory == "ALL") liveItems else liveItems.filter { it.categoryId == selectedCategory }
-        val q = searchQuery.trim()
-        if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
+    LaunchedEffect(categories) {
+        if (categories.isNotEmpty() && categories.none { it.id == selectedCategory }) {
+            selectedCategory = "ALL"
+            appState.setSelectedCategory(kind, "ALL")
+        }
     }
-    val filteredMovies = remember(movieItems, selectedCategory, searchQuery) {
-        val byCat = if (selectedCategory == "ALL") movieItems else movieItems.filter { it.categoryId == selectedCategory }
-        val q = searchQuery.trim()
-        if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
+
+    val recentLiveIds = remember(favRefresh, catalogVersion) { store.getRecentlyViewed("live") }
+    val recentVodIds = remember(favRefresh, catalogVersion) { store.getRecentlyViewed("vod") }
+    val recentSeriesIds = remember(favRefresh, catalogVersion) { store.getRecentlyViewed("series") }
+
+    val recentLiveList = remember(liveItems, recentLiveIds) {
+        val map = liveItems.associateBy { it.streamId }
+        recentLiveIds.mapNotNull { map[it] }
     }
-    val filteredSeries = remember(seriesItems, selectedCategory, searchQuery) {
-        val byCat = if (selectedCategory == "ALL") seriesItems else seriesItems.filter { it.categoryId == selectedCategory }
+    val recentMovieList = remember(movieItems, recentVodIds) {
+        val map = movieItems.associateBy { it.streamId }
+        recentVodIds.mapNotNull { map[it] }
+    }
+    val recentSeriesList = remember(seriesItems, recentSeriesIds) {
+        val map = seriesItems.associateBy { it.seriesId }
+        recentSeriesIds.mapNotNull { map[it] }
+    }
+
+    val filteredLive = remember(liveItems, selectedCategory, searchQuery, recentLiveList) {
+        val base = when (selectedCategory) {
+            "ALL" -> liveItems
+            "RECENT" -> recentLiveList
+            else -> liveItems.filter { it.categoryId == selectedCategory }
+        }
         val q = searchQuery.trim()
-        if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
+        if (q.isEmpty()) base else base.filter { it.name?.contains(q, ignoreCase = true) == true }
+    }
+    val filteredMovies = remember(movieItems, selectedCategory, searchQuery, recentMovieList) {
+        val base = when (selectedCategory) {
+            "ALL" -> movieItems
+            "RECENT" -> recentMovieList
+            else -> movieItems.filter { it.categoryId == selectedCategory }
+        }
+        val q = searchQuery.trim()
+        if (q.isEmpty()) base else base.filter { it.name?.contains(q, ignoreCase = true) == true }
+    }
+    val filteredSeries = remember(seriesItems, selectedCategory, searchQuery, recentSeriesList) {
+        val base = when (selectedCategory) {
+            "ALL" -> seriesItems
+            "RECENT" -> recentSeriesList
+            else -> seriesItems.filter { it.categoryId == selectedCategory }
+        }
+        val q = searchQuery.trim()
+        if (q.isEmpty()) base else base.filter { it.name?.contains(q, ignoreCase = true) == true }
     }
 
     val title = when (kind) {
@@ -1596,6 +1911,8 @@ fun IosCatalogScreen(
                 )
                 .clickable {
                     selectedLiveChannel = ch
+                    store.addRecentlyViewed("live", ch.streamId)
+                    favRefresh++
                     val url = ch.directUrl?.takeIf { it.isNotBlank() }
                         ?: repo.liveUrl(ch.streamId, "m3u8")
                     onPlayStream(url, ch.name ?: "Canal", "TV en directo", true, "")
@@ -1661,6 +1978,24 @@ fun IosCatalogScreen(
         subtitle = catalogSubtitle,
         onBack = onBack,
         actions = {
+            IconButton(
+                onClick = { appState.refreshActivePlaylist() },
+                enabled = !isRefreshing
+            ) {
+                if (isRefreshing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = GoldAccent,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "Actualizar lista",
+                        tint = GoldChampagne
+                    )
+                }
+            }
             if (repo.playlist.isM3u) {
                 IconButton(onClick = { appState.startBackgroundM3uSync(repo.playlist) }) {
                     Icon(
@@ -1716,7 +2051,10 @@ fun IosCatalogScreen(
                                         if (sel) GoldAccent else BetisGreenLeaf.copy(alpha = 0.4f),
                                         RoundedCornerShape(10.dp)
                                     )
-                                    .clickable { selectedCategory = cat.id }
+                                    .clickable {
+                                        selectedCategory = cat.id
+                                        appState.setSelectedCategory(kind, cat.id)
+                                    }
                                     .padding(horizontal = 14.dp, vertical = 8.dp)
                             ) {
                                 Text(
@@ -1754,7 +2092,10 @@ fun IosCatalogScreen(
                                             color = if (sel) GoldAccent else Color.Transparent,
                                             shape = RoundedCornerShape(10.dp)
                                         )
-                                        .clickable { selectedCategory = cat.id }
+                                        .clickable {
+                                            selectedCategory = cat.id
+                                            appState.setSelectedCategory(kind, cat.id)
+                                        }
                                         .padding(horizontal = 12.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
@@ -1771,7 +2112,7 @@ fun IosCatalogScreen(
                         }
                     }
 
-                    // Panel derecho de contenido con Grids adaptativos
+                    // Panel derecho de contenido con Grids adaptativos y restauración precisa de scroll
                     Box(Modifier.weight(1f).fillMaxHeight()) {
                         when {
                             loading -> CircularProgressIndicator(Modifier.align(Alignment.Center), color = GoldAccent)
@@ -1785,20 +2126,81 @@ fun IosCatalogScreen(
                                 if (isTablet) {
                                     // En iPad: Cuadrícula (Grid) multi-columna de canales + panel inspector en pantallas anchas
                                     Row(Modifier.fillMaxSize()) {
-                                        LazyVerticalGrid(
-                                            columns = GridCells.Adaptive(minSize = 240.dp),
-                                            contentPadding = PaddingValues(16.dp),
-                                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                                            modifier = Modifier.weight(1f).fillMaxHeight()
-                                        ) {
-                                            items(filteredLive, key = { it.streamId }) { ch ->
-                                                LiveChannelCard(
-                                                    ch = ch,
-                                                    isFav = favLive.contains(ch.streamId),
-                                                    isSelected = selectedLiveChannel?.streamId == ch.streamId,
-                                                    isTablet = true
-                                                )
+                                        key(kind, selectedCategory) {
+                                            val savedScroll = remember { appState.getScrollPosition(kind, selectedCategory) }
+                                            val gridState = rememberLazyGridState(
+                                                initialFirstVisibleItemIndex = savedScroll.first,
+                                                initialFirstVisibleItemScrollOffset = savedScroll.second
+                                            )
+                                            LaunchedEffect(gridState) {
+                                                snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                                    .collect { (idx, off) ->
+                                                        appState.saveScrollPosition(kind, selectedCategory, idx, off)
+                                                    }
+                                            }
+                                            LazyVerticalGrid(
+                                                state = gridState,
+                                                columns = GridCells.Adaptive(minSize = 240.dp),
+                                                contentPadding = PaddingValues(16.dp),
+                                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                                                modifier = Modifier.weight(1f).fillMaxHeight()
+                                            ) {
+                                                if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentLiveList.isNotEmpty()) {
+                                                    item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_live_tab") {
+                                                        Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                                                            Row(
+                                                                verticalAlignment = Alignment.CenterVertically,
+                                                                modifier = Modifier.padding(bottom = 6.dp)
+                                                            ) {
+                                                                Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                                                                Spacer(Modifier.width(6.dp))
+                                                                Text("Canales vistos recientemente", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = GoldChampagne)
+                                                            }
+                                                            LazyRow(
+                                                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                                                contentPadding = PaddingValues(vertical = 4.dp)
+                                                            ) {
+                                                                items(recentLiveList, key = { "rec_tab_live_${it.streamId}" }) { ch ->
+                                                                    RecentLiveChannelCard(
+                                                                        ch = ch,
+                                                                        onPlay = {
+                                                                            store.addRecentlyViewed("live", ch.streamId)
+                                                                            favRefresh++
+                                                                            val url = ch.directUrl?.takeIf { it.isNotBlank() }
+                                                                                ?: repo.liveUrl(ch.streamId, "m3u8")
+                                                                            onPlayStream(url, ch.name ?: "Canal", "TV en directo", true, "")
+                                                                        }
+                                                                    )
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if (selectedCategory == "RECENT" && filteredLive.isEmpty()) {
+                                                    item(span = { GridItemSpan(maxLineSpan) }, key = "empty_recent_live_tab") {
+                                                        Box(
+                                                            Modifier.fillMaxWidth().padding(40.dp),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Text(
+                                                                "No has reproducido ningún canal recientemente.\nLos canales que veas aparecerán aquí automáticamente.",
+                                                                color = TextSilverGray,
+                                                                fontSize = 14.sp,
+                                                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                                            )
+                                                        }
+                                                    }
+                                                } else {
+                                                    items(filteredLive, key = { it.streamId }) { ch ->
+                                                        LiveChannelCard(
+                                                            ch = ch,
+                                                            isFav = favLive.contains(ch.streamId),
+                                                            isSelected = selectedLiveChannel?.streamId == ch.streamId,
+                                                            isTablet = true
+                                                        )
+                                                    }
+                                                }
                                             }
                                         }
 
@@ -1846,6 +2248,8 @@ fun IosCatalogScreen(
                                                     Spacer(Modifier.height(6.dp))
                                                     Button(
                                                         onClick = {
+                                                            store.addRecentlyViewed("live", ch.streamId)
+                                                            favRefresh++
                                                             onPlayStream(
                                                                 streamUrl,
                                                                 ch.name ?: "Canal",
@@ -1867,6 +2271,8 @@ fun IosCatalogScreen(
                                                     }
                                                     OutlinedButton(
                                                         onClick = {
+                                                            store.addRecentlyViewed("live", ch.streamId)
+                                                            favRefresh++
                                                             openStreamInExternalApp(streamUrl, ch.name ?: "Canal")
                                                         },
                                                         border = BorderStroke(1.dp, GoldAccent),
@@ -1886,78 +2292,285 @@ fun IosCatalogScreen(
                                         }
                                     }
                                 } else {
-                                    // En iPhone: Lista vertical ágil
-                                    LazyColumn(
-                                        contentPadding = PaddingValues(14.dp),
-                                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        items(filteredLive, key = { it.streamId }) { ch ->
-                                            LiveChannelCard(
-                                                ch = ch,
-                                                isFav = favLive.contains(ch.streamId),
-                                                isSelected = false,
-                                                isTablet = false
-                                            )
+                                    // En iPhone: Lista vertical ágil con recuperación de scroll por categoría
+                                    key(kind, selectedCategory) {
+                                        val savedScroll = remember { appState.getScrollPosition(kind, selectedCategory) }
+                                        val listState = rememberLazyListState(
+                                            initialFirstVisibleItemIndex = savedScroll.first,
+                                            initialFirstVisibleItemScrollOffset = savedScroll.second
+                                        )
+                                        LaunchedEffect(listState) {
+                                            snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+                                                .collect { (idx, off) ->
+                                                    appState.saveScrollPosition(kind, selectedCategory, idx, off)
+                                                }
+                                        }
+                                        LazyColumn(
+                                            state = listState,
+                                            contentPadding = PaddingValues(14.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentLiveList.isNotEmpty()) {
+                                                item(key = "header_recent_live") {
+                                                    Column(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                                                        Row(
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp)
+                                                        ) {
+                                                            Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                                                            Spacer(Modifier.width(6.dp))
+                                                            Text("Vistos recientemente", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = GoldChampagne)
+                                                        }
+                                                        LazyRow(
+                                                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                                            contentPadding = PaddingValues(horizontal = 2.dp, vertical = 4.dp)
+                                                        ) {
+                                                            items(recentLiveList, key = { "rec_live_${it.streamId}" }) { ch ->
+                                                                RecentLiveChannelCard(
+                                                                    ch = ch,
+                                                                    onPlay = {
+                                                                        store.addRecentlyViewed("live", ch.streamId)
+                                                                        favRefresh++
+                                                                        val url = ch.directUrl?.takeIf { it.isNotBlank() }
+                                                                            ?: repo.liveUrl(ch.streamId, "m3u8")
+                                                                        onPlayStream(url, ch.name ?: "Canal", "TV en directo", true, "")
+                                                                    }
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if (selectedCategory == "RECENT" && filteredLive.isEmpty()) {
+                                                item(key = "empty_recent_live") {
+                                                    Box(
+                                                        Modifier.fillMaxWidth().padding(40.dp),
+                                                        contentAlignment = Alignment.Center
+                                                    ) {
+                                                        Text(
+                                                            "No has reproducido ningún canal recientemente.\nLos canales que veas aparecerán aquí automáticamente.",
+                                                            color = TextSilverGray,
+                                                            fontSize = 14.sp,
+                                                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                                        )
+                                                    }
+                                                }
+                                            } else {
+                                                items(filteredLive, key = { it.streamId }) { ch ->
+                                                    LiveChannelCard(
+                                                        ch = ch,
+                                                        isFav = favLive.contains(ch.streamId),
+                                                        isSelected = false,
+                                                        isTablet = false
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                             kind == CatalogKind.MOVIES -> {
                                 val favVod = remember(favRefresh) { store.favorites("vod") }
-                                LazyVerticalGrid(
-                                    columns = GridCells.Adaptive(if (isTablet) 155.dp else 125.dp),
-                                    contentPadding = PaddingValues(14.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    items(filteredMovies, key = { it.streamId }) { m ->
-                                        IosPosterCard(
-                                            title = m.name,
-                                            image = m.icon,
-                                            subtitle = m.rating,
-                                            isFavorite = favVod.contains(m.streamId),
-                                            modifier = Modifier.fillMaxWidth(),
-                                            onClick = { onOpenMovie(m) }
-                                        )
+                                key(kind, selectedCategory) {
+                                    val savedScroll = remember { appState.getScrollPosition(kind, selectedCategory) }
+                                    val gridState = rememberLazyGridState(
+                                        initialFirstVisibleItemIndex = savedScroll.first,
+                                        initialFirstVisibleItemScrollOffset = savedScroll.second
+                                    )
+                                    LaunchedEffect(gridState) {
+                                        snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                            .collect { (idx, off) ->
+                                                appState.saveScrollPosition(kind, selectedCategory, idx, off)
+                                            }
+                                    }
+                                    LazyVerticalGrid(
+                                        state = gridState,
+                                        columns = GridCells.Adaptive(if (isTablet) 155.dp else 125.dp),
+                                        contentPadding = PaddingValues(14.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentMovieList.isNotEmpty()) {
+                                            item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_movies") {
+                                                Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                                                    Row(
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        modifier = Modifier.padding(bottom = 6.dp)
+                                                    ) {
+                                                        Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                                                        Spacer(Modifier.width(6.dp))
+                                                        Text("Películas vistas recientemente", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = GoldChampagne)
+                                                    }
+                                                    LazyRow(
+                                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                                        contentPadding = PaddingValues(vertical = 4.dp)
+                                                    ) {
+                                                        items(recentMovieList, key = { "rec_vod_row_${it.streamId}" }) { m ->
+                                                            IosPosterCard(
+                                                                title = m.name,
+                                                                image = m.icon,
+                                                                subtitle = m.rating,
+                                                                modifier = Modifier.width(115.dp),
+                                                                onClick = {
+                                                                    store.addRecentlyViewed("vod", m.streamId)
+                                                                    favRefresh++
+                                                                    onOpenMovie(m)
+                                                                }
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (selectedCategory == "RECENT" && filteredMovies.isEmpty()) {
+                                            item(span = { GridItemSpan(maxLineSpan) }, key = "empty_recent_movies") {
+                                                Box(
+                                                    Modifier.fillMaxWidth().padding(40.dp),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Text(
+                                                        "No has reproducido ninguna película recientemente.\nLas películas que veas aparecerán aquí automáticamente.",
+                                                        color = TextSilverGray,
+                                                        fontSize = 14.sp,
+                                                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                                    )
+                                                }
+                                            }
+                                        } else {
+                                            items(filteredMovies, key = { it.streamId }) { m ->
+                                                IosPosterCard(
+                                                    title = m.name,
+                                                    image = m.icon,
+                                                    subtitle = m.rating,
+                                                    isFavorite = favVod.contains(m.streamId),
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    onClick = {
+                                                        store.addRecentlyViewed("vod", m.streamId)
+                                                        favRefresh++
+                                                        onOpenMovie(m)
+                                                    }
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
                             kind == CatalogKind.SERIES -> {
                                 val favSeries = remember(favRefresh) { store.favorites("series") }
-                                LazyVerticalGrid(
-                                    columns = GridCells.Adaptive(if (isTablet) 155.dp else 125.dp),
-                                    contentPadding = PaddingValues(14.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    items(filteredSeries, key = { it.seriesId }) { s ->
-                                        IosPosterCard(
-                                            title = s.name,
-                                            image = s.cover,
-                                            subtitle = s.rating,
-                                            isFavorite = favSeries.contains(s.seriesId),
-                                            modifier = Modifier.fillMaxWidth(),
-                                            onClick = { onOpenSeries(s) }
-                                        )
+                                key(kind, selectedCategory) {
+                                    val savedScroll = remember { appState.getScrollPosition(kind, selectedCategory) }
+                                    val gridState = rememberLazyGridState(
+                                        initialFirstVisibleItemIndex = savedScroll.first,
+                                        initialFirstVisibleItemScrollOffset = savedScroll.second
+                                    )
+                                    LaunchedEffect(gridState) {
+                                        snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                            .collect { (idx, off) ->
+                                                appState.saveScrollPosition(kind, selectedCategory, idx, off)
+                                            }
+                                    }
+                                    LazyVerticalGrid(
+                                        state = gridState,
+                                        columns = GridCells.Adaptive(if (isTablet) 155.dp else 125.dp),
+                                        contentPadding = PaddingValues(14.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentSeriesList.isNotEmpty()) {
+                                            item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_series") {
+                                                Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                                                    Row(
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        modifier = Modifier.padding(bottom = 6.dp)
+                                                    ) {
+                                                        Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                                                        Spacer(Modifier.width(6.dp))
+                                                        Text("Series vistas recientemente", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = GoldChampagne)
+                                                    }
+                                                    LazyRow(
+                                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                                        contentPadding = PaddingValues(vertical = 4.dp)
+                                                    ) {
+                                                        items(recentSeriesList, key = { "rec_ser_row_${it.seriesId}" }) { s ->
+                                                            IosPosterCard(
+                                                                title = s.name,
+                                                                image = s.cover,
+                                                                subtitle = s.rating,
+                                                                modifier = Modifier.width(115.dp),
+                                                                onClick = {
+                                                                    store.addRecentlyViewed("series", s.seriesId)
+                                                                    favRefresh++
+                                                                    onOpenSeries(s)
+                                                                }
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (selectedCategory == "RECENT" && filteredSeries.isEmpty()) {
+                                            item(span = { GridItemSpan(maxLineSpan) }, key = "empty_recent_series") {
+                                                Box(
+                                                    Modifier.fillMaxWidth().padding(40.dp),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Text(
+                                                        "No has reproducido ninguna serie recientemente.\nLas series que veas aparecerán aquí automáticamente.",
+                                                        color = TextSilverGray,
+                                                        fontSize = 14.sp,
+                                                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                                    )
+                                                }
+                                            }
+                                        } else {
+                                            items(filteredSeries, key = { it.seriesId }) { s ->
+                                                IosPosterCard(
+                                                    title = s.name,
+                                                    image = s.cover,
+                                                    subtitle = s.rating,
+                                                    isFavorite = favSeries.contains(s.seriesId),
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    onClick = {
+                                                        store.addRecentlyViewed("series", s.seriesId)
+                                                        favRefresh++
+                                                        onOpenSeries(s)
+                                                    }
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
                             kind == CatalogKind.FAVORITES -> {
                                 val favLiveIds = remember(favRefresh) { store.favorites("live") }
                                 val favLiveList = filteredLive.filter { favLiveIds.contains(it.streamId) }
-                                LazyVerticalGrid(
-                                    columns = GridCells.Adaptive(if (isTablet) 240.dp else 160.dp),
-                                    contentPadding = PaddingValues(14.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    items(favLiveList, key = { it.streamId }) { ch ->
-                                        LiveChannelCard(
-                                            ch = ch,
-                                            isFav = true,
-                                            isSelected = false,
-                                            isTablet = isTablet
-                                        )
+                                key(kind, selectedCategory) {
+                                    val savedScroll = remember { appState.getScrollPosition(kind, selectedCategory) }
+                                    val gridState = rememberLazyGridState(
+                                        initialFirstVisibleItemIndex = savedScroll.first,
+                                        initialFirstVisibleItemScrollOffset = savedScroll.second
+                                    )
+                                    LaunchedEffect(gridState) {
+                                        snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                            .collect { (idx, off) ->
+                                                appState.saveScrollPosition(kind, selectedCategory, idx, off)
+                                            }
+                                    }
+                                    LazyVerticalGrid(
+                                        state = gridState,
+                                        columns = GridCells.Adaptive(if (isTablet) 240.dp else 160.dp),
+                                        contentPadding = PaddingValues(14.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        items(favLiveList, key = { it.streamId }) { ch ->
+                                            LiveChannelCard(
+                                                ch = ch,
+                                                isFav = true,
+                                                isSelected = false,
+                                                isTablet = isTablet
+                                            )
+                                        }
                                     }
                                 }
                             }

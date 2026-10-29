@@ -34,7 +34,8 @@ data class StoredAppState(
     var defaultTdtSeeded: Boolean = false,
     var playlists: MutableList<Playlist> = mutableListOf(),
     var favorites: MutableMap<String, MutableSet<String>> = mutableMapOf(),
-    var resumePositions: MutableMap<String, Long> = mutableMapOf()
+    var resumePositions: MutableMap<String, Long> = mutableMapOf(),
+    var recentlyViewed: MutableMap<String, MutableList<String>> = mutableMapOf()
 )
 
 @Serializable

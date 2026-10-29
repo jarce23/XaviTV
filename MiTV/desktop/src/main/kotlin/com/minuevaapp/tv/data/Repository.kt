@@ -26,6 +26,7 @@ private data class DesktopStorageData(
     var playlists: MutableList<Playlist> = mutableListOf(),
     var favorites: MutableMap<String, MutableSet<String>> = mutableMapOf(),
     var resumePositions: MutableMap<String, Long> = mutableMapOf(),
+    var recentlyViewed: MutableMap<String, MutableList<String>> = mutableMapOf(),
 )
 
 /**
@@ -217,6 +218,28 @@ class PlaylistStore {
     @Synchronized
     fun saveResumePosition(url: String, posMs: Long) {
         data.resumePositions[url] = posMs
+        persistAsync()
+    }
+
+    @Synchronized
+    fun getRecentlyViewed(type: String): List<String> =
+        data.recentlyViewed[type]?.toList().orEmpty()
+
+    @Synchronized
+    fun addRecentlyViewed(type: String, id: String, maxItems: Int = 40) {
+        if (id.isBlank()) return
+        val list = data.recentlyViewed.getOrPut(type) { mutableListOf() }
+        list.remove(id)
+        list.add(0, id)
+        while (list.size > maxItems) {
+            list.removeAt(list.lastIndex)
+        }
+        persistAsync()
+    }
+
+    @Synchronized
+    fun clearRecentlyViewed(type: String) {
+        data.recentlyViewed.remove(type)
         persistAsync()
     }
 
