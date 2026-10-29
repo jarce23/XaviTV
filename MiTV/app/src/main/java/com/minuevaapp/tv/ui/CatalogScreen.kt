@@ -250,7 +250,7 @@ fun CatalogScreen(
                                         .height(18.dp)
                                         .clip(RoundedCornerShape(2.dp))
                                         .background(GoldLight)
-                                Bray)
+                                )
                                 Spacer(Modifier.width(8.dp))
                             }
                             Text(
