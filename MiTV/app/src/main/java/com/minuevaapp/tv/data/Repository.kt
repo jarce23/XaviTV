@@ -13,6 +13,14 @@ import okhttp3.OkHttpClient
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 
+data class RefreshResult(
+    val success: Boolean,
+    val liveCount: Int = 0,
+    val vodCount: Int = 0,
+    val seriesCount: Int = 0,
+    val error: String? = null
+)
+
 /**
  * Guarda listas (playlists Xtream o M3U) y favoritos en SharedPreferences.
  * En el primer arranque (o si la base de datos local queda vacía), inyecta y guarda
@@ -121,6 +129,51 @@ class PlaylistStore(context: Context) {
         val updated = favorites(type).toMutableSet()
         if (!updated.add(id)) updated.remove(id)
         prefs.edit().putStringSet("fav_$type", updated).apply()
+    }
+
+    fun getRecentlyViewed(type: String): List<String> {
+        val json = prefs.getString("recent_$type", null) ?: return emptyList()
+        return runCatching {
+            val listType = object : TypeToken<List<String>>() {}.type
+            gson.fromJson<List<String>>(json, listType).orEmpty()
+        }.getOrDefault(emptyList())
+    }
+
+    fun addRecentlyViewed(type: String, id: String, maxItems: Int = 40) {
+        if (id.isBlank()) return
+        val list = getRecentlyViewed(type).toMutableList()
+        list.remove(id)
+        list.add(0, id)
+        while (list.size > maxItems) {
+            list.removeAt(list.lastIndex)
+        }
+        prefs.edit().putString("recent_$type", gson.toJson(list)).apply()
+    }
+
+    fun clearRecentlyViewed(type: String) {
+        prefs.edit().remove("recent_$type").apply()
+    }
+
+    fun getSelectedCategory(type: String): String =
+        prefs.getString("selected_cat_$type", "__all") ?: "__all"
+
+    fun setSelectedCategory(type: String, categoryId: String) {
+        prefs.edit().putString("selected_cat_$type", categoryId).apply()
+    }
+
+    fun getScrollPosition(key: String): Pair<Int, Int> {
+        val idx = prefs.getInt("scroll_idx_$key", 0)
+        val off = prefs.getInt("scroll_off_$key", 0)
+        return idx to off
+    }
+
+    fun saveScrollPosition(key: String, index: Int, offset: Int) {
+        if (index >= 0 && offset >= 0) {
+            prefs.edit()
+                .putInt("scroll_idx_$key", index)
+                .putInt("scroll_off_$key", offset)
+                .apply()
+        }
     }
 
     companion object {
@@ -243,6 +296,44 @@ class XtreamRepository(
             withContext(Dispatchers.IO) {
                 (api.seriesCategories(u, p) to api.series(u, p)).also { seriesCache = it }
             }
+        }
+    }
+
+    suspend fun refreshAllXtream(): RefreshResult = withContext(Dispatchers.IO) {
+        liveMutex.withLock { liveCache = null }
+        vodMutex.withLock { vodCache = null }
+        seriesMutex.withLock { seriesCache = null }
+
+        if (playlist.isM3u) {
+            return@withContext runCatching {
+                val catalog = ensureM3uLoaded(forceRefresh = true)
+                RefreshResult(
+                    success = true,
+                    liveCount = catalog.liveStreams.size,
+                    vodCount = catalog.vodStreams.size,
+                    seriesCount = catalog.seriesList.size
+                )
+            }.getOrElse {
+                RefreshResult(success = false, error = sanitizeError(it, playlist))
+            }
+        }
+
+        try {
+            login()
+            val (_, liveItems) = live(forceRefresh = true)
+            val (_, vodItems) = vod(forceRefresh = true)
+            val (_, seriesItems) = series(forceRefresh = true)
+            RefreshResult(
+                success = true,
+                liveCount = liveItems.size,
+                vodCount = vodItems.size,
+                seriesCount = seriesItems.size
+            )
+        } catch (e: Throwable) {
+            RefreshResult(
+                success = false,
+                error = sanitizeError(e, playlist)
+            )
         }
     }
 

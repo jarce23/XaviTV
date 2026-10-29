@@ -1,5 +1,6 @@
 package com.minuevaapp.tv.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,6 +24,7 @@ import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tv
@@ -77,9 +79,33 @@ fun PlaylistsScreen(onReady: () -> Unit) {
     var m3uName by rememberSaveable { mutableStateOf("") }
     var m3uUrl by rememberSaveable { mutableStateOf("") }
 
+    var isRefreshingList by remember { mutableStateOf(false) }
+    var refreshStatus by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    val handleRefreshPlaylist: (Playlist) -> Unit = { p ->
+        if (!isRefreshingList) {
+            isRefreshingList = true
+            refreshStatus = "Actualizando catálogo de ${p.name}..."
+            scope.launch {
+                val targetRepo = if (p.name == app.store.active().name && app.repo != null) {
+                    app.repo!!
+                } else {
+                    XtreamRepository(p, app.okHttpClient)
+                }
+                val res = targetRepo.refreshAllXtream()
+                isRefreshingList = false
+                refreshStatus = if (res.success) {
+                    if (p.isM3u) "Lista M3U actualizada (${res.liveCount} canales)"
+                    else "Lista actualizada (${res.liveCount} TV, ${res.vodCount} Películas, ${res.seriesCount} Series)"
+                } else {
+                    res.error ?: "Error al actualizar la lista"
+                }
+            }
+        }
+    }
 
     // Garantiza que al abrir la pantalla siempre esté sincronizada la lista inyectada por defecto
     LaunchedEffect(Unit) {
@@ -142,7 +168,38 @@ fun PlaylistsScreen(onReady: () -> Unit) {
         }
     }
 
-    AppScaffold("XaviTV  ·  Acceso y listas IPTV") { pad ->
+    AppScaffold(
+        title = "XaviTV  ·  Acceso y listas IPTV",
+        actions = {
+            IconButton(
+                onClick = {
+                    val activePl = app.store.active()
+                    if (!isRefreshingList) {
+                        isRefreshingList = true
+                        refreshStatus = "Actualizando catálogo de ${activePl.name}..."
+                        scope.launch {
+                            val activeRepo = app.repo ?: XtreamRepository(activePl, app.okHttpClient)
+                            val res = activeRepo.refreshAllXtream()
+                            isRefreshingList = false
+                            refreshStatus = if (res.success) {
+                                if (activePl.isM3u) "Lista M3U actualizada (${res.liveCount} canales)"
+                                else "Lista actualizada (${res.liveCount} TV, ${res.vodCount} Películas, ${res.seriesCount} Series)"
+                            } else {
+                                res.error ?: "Error al actualizar la lista"
+                            }
+                        }
+                    }
+                },
+                enabled = !isRefreshingList
+            ) {
+                if (isRefreshingList) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = GoldLight)
+                } else {
+                    Icon(Icons.Default.Refresh, contentDescription = "Actualizar lista activa", tint = GoldLight)
+                }
+            }
+        }
+    ) { pad ->
         BoxWithConstraints(
             Modifier
                 .padding(pad)
@@ -160,6 +217,32 @@ fun PlaylistsScreen(onReady: () -> Unit) {
         ) {
             val isWide = maxWidth >= 640.dp
             Column(Modifier.fillMaxSize()) {
+                if (refreshStatus != null) {
+                    Surface(
+                        color = DarkSurface,
+                        border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.5f)),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (isRefreshingList) {
+                                CircularProgressIndicator(Modifier.size(16.dp), color = GoldLight, strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = GoldLight, modifier = Modifier.size(18.dp))
+                            }
+                            Text(
+                                text = refreshStatus ?: "",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = GoldLight,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                }
                 // Cabecera con el logo oficial de XaviTV en verde y dorado
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -257,6 +340,7 @@ fun PlaylistsScreen(onReady: () -> Unit) {
                             busy = busy,
                             onSelect = ::connect,
                             onEdit = ::startEditing,
+                            onRefresh = handleRefreshPlaylist,
                             onDelete = { p ->
                                 if (editingPlaylist?.name == p.name) clearFormFields()
                                 app.store.remove(p)
@@ -312,6 +396,7 @@ fun PlaylistsScreen(onReady: () -> Unit) {
                                         enabled = !busy,
                                         onSelect = { connect(p) },
                                         onEdit = { startEditing(p) },
+                                        onRefresh = { handleRefreshPlaylist(p) },
                                         onDelete = {
                                             if (editingPlaylist?.name == p.name) clearFormFields()
                                             app.store.remove(p)
@@ -362,6 +447,7 @@ private fun SavedPlaylistsColumn(
     busy: Boolean,
     onSelect: (Playlist) -> Unit,
     onEdit: (Playlist) -> Unit,
+    onRefresh: (Playlist) -> Unit,
     onDelete: (Playlist) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -387,6 +473,7 @@ private fun SavedPlaylistsColumn(
                     enabled = !busy,
                     onSelect = { onSelect(p) },
                     onEdit = { onEdit(p) },
+                    onRefresh = { onRefresh(p) },
                     onDelete = { onDelete(p) },
                 )
             }
@@ -402,6 +489,7 @@ private fun PlaylistRowItem(
     enabled: Boolean,
     onSelect: () -> Unit,
     onEdit: () -> Unit,
+    onRefresh: () -> Unit,
     onDelete: () -> Unit,
 ) {
     val shape = RoundedCornerShape(12.dp)
@@ -478,6 +566,13 @@ private fun PlaylistRowItem(
             Icon(
                 imageVector = Icons.Default.Edit,
                 contentDescription = "Editar lista",
+                tint = GoldLight,
+            )
+        }
+        IconButton(onClick = onRefresh, enabled = enabled) {
+            Icon(
+                imageVector = Icons.Default.Refresh,
+                contentDescription = "Actualizar lista",
                 tint = GoldLight,
             )
         }
@@ -735,11 +830,41 @@ private fun PlaylistTypeTab(
 @Composable
 fun HomeScreen(onOpen: (String) -> Unit, onSearch: () -> Unit, onPlaylists: () -> Unit) {
     val repo = MiTVApp.instance.repo ?: return
-    val account = rememberLoad(repo) { repo.login().userInfo }
+    var isRefreshing by remember { mutableStateOf(false) }
+    var refreshFeedback by remember { mutableStateOf<String?>(null) }
+    var refreshKey by remember { mutableIntStateOf(0) }
+    val scope = rememberCoroutineScope()
+    val account = rememberLoad(repo, refreshKey) { repo.login().userInfo }
 
     AppScaffold(
         title = "XaviTV  ·  ${repo.playlist.name}",
         actions = {
+            IconButton(
+                onClick = {
+                    if (!isRefreshing) {
+                        isRefreshing = true
+                        refreshFeedback = "Actualizando catálogo de ${repo.playlist.name}..."
+                        scope.launch {
+                            val res = repo.refreshAllXtream()
+                            isRefreshing = false
+                            refreshKey++
+                            refreshFeedback = if (res.success) {
+                                if (repo.playlist.isM3u) "Lista M3U actualizada (${res.liveCount} canales)"
+                                else "Lista actualizada (${res.liveCount} TV, ${res.vodCount} Películas, ${res.seriesCount} Series)"
+                            } else {
+                                res.error ?: "Error al actualizar la lista"
+                            }
+                        }
+                    }
+                },
+                enabled = !isRefreshing
+            ) {
+                if (isRefreshing) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = GoldLight)
+                } else {
+                    Icon(Icons.Default.Refresh, contentDescription = "Actualizar lista", tint = GoldLight)
+                }
+            }
             IconButton(onClick = onSearch) {
                 Icon(Icons.Default.Search, contentDescription = "Buscar", tint = GoldLight)
             }
@@ -764,6 +889,33 @@ fun HomeScreen(onOpen: (String) -> Unit, onSearch: () -> Unit, onPlaylists: () -
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            if (refreshFeedback != null) {
+                Surface(
+                    color = DarkSurface,
+                    border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.padding(bottom = 16.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (isRefreshing) {
+                            CircularProgressIndicator(Modifier.size(16.dp), color = GoldLight, strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = GoldLight, modifier = Modifier.size(18.dp))
+                        }
+                        Text(
+                            text = refreshFeedback ?: "",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = GoldLight,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(22.dp)) {
                 HomeTile(
                     title = "TV en directo",
@@ -784,7 +936,45 @@ fun HomeScreen(onOpen: (String) -> Unit, onSearch: () -> Unit, onPlaylists: () -
                     modifier = Modifier.weight(1f),
                 ) { onOpen("series") }
             }
-            Spacer(Modifier.height(32.dp))
+            Spacer(Modifier.height(20.dp))
+            Button(
+                onClick = {
+                    if (!isRefreshing) {
+                        isRefreshing = true
+                        refreshFeedback = "Actualizando catálogo de ${repo.playlist.name}..."
+                        scope.launch {
+                            val res = repo.refreshAllXtream()
+                            isRefreshing = false
+                            refreshKey++
+                            refreshFeedback = if (res.success) {
+                                if (repo.playlist.isM3u) "Lista M3U actualizada (${res.liveCount} canales)"
+                                else "Lista actualizada (${res.liveCount} TV, ${res.vodCount} Películas, ${res.seriesCount} Series)"
+                            } else {
+                                res.error ?: "Error al actualizar la lista"
+                            }
+                        }
+                    }
+                },
+                enabled = !isRefreshing,
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = BetisGreenDark,
+                    contentColor = GoldLight
+                ),
+                border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.55f)),
+                modifier = Modifier.height(44.dp)
+            ) {
+                if (isRefreshing) {
+                    CircularProgressIndicator(Modifier.size(16.dp), color = GoldLight, strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Actualizando catálogo…", fontWeight = FontWeight.Bold)
+                } else {
+                    Icon(Icons.Default.Refresh, contentDescription = null, tint = GoldLight)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Actualizar lista Xtream / M3U", fontWeight = FontWeight.Bold)
+                }
+            }
+            Spacer(Modifier.height(18.dp))
             (account as? Load.Ok)?.data?.let { u ->
                 Row(
                     modifier = Modifier
