@@ -94,6 +94,17 @@ fun PlaylistsScreen(onConnected: () -> Unit) {
     }
 
     fun connectAndSave(p: Playlist, originalToUpdate: Playlist? = null, clearFormOnSuccess: Boolean = false) {
+        // Guardado síncrono inmediato en disco (~/.xavitv/store.json) al pulsar el botón
+        if (originalToUpdate != null) {
+            store.update(originalToUpdate, p)
+        } else {
+            store.add(p)
+        }
+        store.activeName = p.name
+        appState.invalidateRepo()
+        saved = store.all()
+        activeName = store.activeName
+
         loading = true
         error = null
         scope.launch {
@@ -108,11 +119,6 @@ fun PlaylistsScreen(onConnected: () -> Unit) {
                     error = "Cuenta no activa (${resp.userInfo?.status ?: "Sin autorización"})"
                     loading = false
                 } else {
-                    if (originalToUpdate != null) {
-                        store.update(originalToUpdate, p)
-                    } else {
-                        store.add(p)
-                    }
                     store.activeName = p.name
                     appState.invalidateRepo()
                     saved = store.all()

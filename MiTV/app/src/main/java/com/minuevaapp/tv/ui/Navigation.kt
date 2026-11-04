@@ -2,6 +2,7 @@ package com.minuevaapp.tv.ui
 
 import android.net.Uri
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -29,7 +30,17 @@ object Routes {
 @Composable
 fun AppNavigation() {
     val nav = rememberNavController()
-    val start = if (MiTVApp.instance.repo != null) Routes.HOME else Routes.PLAYLISTS
+    // Las listas ya se han leído síncronamente de disco en MiTVApp.onCreate (PlaylistStore.init).
+    // Si existe una lista activa guardada, se entra directamente al Home sin mostrar el formulario.
+    val start = remember {
+        val app = MiTVApp.instance
+        if (app.repo == null) {
+            runCatching { app.store.active() }.getOrNull()?.let {
+                app.repo = com.minuevaapp.tv.data.XtreamRepository(it, app.okHttpClient)
+            }
+        }
+        if (app.repo != null) Routes.HOME else Routes.PLAYLISTS
+    }
 
     NavHost(navController = nav, startDestination = start) {
         composable(Routes.PLAYLISTS) {

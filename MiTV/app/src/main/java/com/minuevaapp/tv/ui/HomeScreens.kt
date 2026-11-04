@@ -155,6 +155,10 @@ fun PlaylistsScreen(onReady: () -> Unit) {
                 if (r.userInfo?.auth != "1") {
                     throw IllegalStateException("Credenciales o lista no válidas (${r.userInfo?.status ?: "sin respuesta"})")
                 }
+                // Persistencia síncrona (commit) de la lista y de la lista activa antes de navegar
+                if (app.store.all().none { it.name.equals(p.name, ignoreCase = true) }) {
+                    app.store.add(p)
+                }
                 app.store.activeName = p.name
                 app.repo = repo
                 onReady()

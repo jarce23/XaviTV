@@ -87,23 +87,87 @@ fun registerVlcToggleOverlayHandler(handler: () -> Unit) {
 }
 
 private const val PREFS_STATE_KEY = "xavitv_ios_local_state_v1"
+private const val PREFS_STATE_DATA_KEY = "xavitv_ios_local_state_data_v2"
 private const val PREFS_M3U_FALLBACK_PREFIX = "xavitv_ios_m3u_cache_"
 
 // Búfer ultrarreducido (0.45 segundos) para zapping instantáneo en canales en directo con AVPlayer
 private const val IOS_LIVE_FORWARD_BUFFER_SECONDS = 0.45
 private const val IOS_VOD_FORWARD_BUFFER_SECONDS = 2.0
 
+private fun ByteArray.toNSData(): NSData = memScoped {
+    if (isEmpty()) return NSData()
+    usePinned { pinned ->
+        NSData.create(bytes = pinned.addressOf(0), length = size.toULong())
+    }
+}
+
+private fun NSData.toByteArray(): ByteArray {
+    val len = length.toInt()
+    if (len <= 0) return ByteArray(0)
+    val ptr = bytes ?: return ByteArray(0)
+    return ptr.readBytes(len)
+}
+
 actual object PlatformStorage {
+    private val documentsDir: String? by lazy {
+        val paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, true)
+        (paths.firstOrNull() as? String)?.takeIf { it.isNotBlank() }
+    }
+
+    private val cachesDir: String? by lazy {
+        val paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, true)
+        (paths.firstOrNull() as? String)?.takeIf { it.isNotBlank() } ?: documentsDir
+    }
+
+    private fun stateFilePath(): String? = documentsDir?.let { "$it/xavitv_ios_state.json" }
+    private fun stateBackupFilePath(): String? = documentsDir?.let { "$it/xavitv_ios_state.json.bak" }
+
+    private fun m3uCacheFilePath(cacheKey: String): String? {
+        val safeKey = cacheKey.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        return cachesDir?.let { "$it/xavitv_m3u_$safeKey.m3u" }
+    }
+
+    private fun readUtf8File(path: String?): String? {
+        if (path.isNullOrBlank()) return null
+        return runCatching {
+            val data = NSData.dataWithContentsOfFile(path) ?: return@runCatching null
+            data.toByteArray().decodeToString().takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    private fun writeUtf8File(path: String?, content: String) {
+        if (path.isNullOrBlank() || content.isBlank()) return
+        runCatching {
+            content.encodeToByteArray().toNSData().writeToFile(path, atomically = true)
+        }
+    }
+
     actual fun loadStateJson(): String? {
-        return NSUserDefaults.standardUserDefaults.stringForKey(PREFS_STATE_KEY)
+        readUtf8File(stateFilePath())?.let { return it }
+        readUtf8File(stateBackupFilePath())?.let { return it }
+        runCatching {
+            val data = NSUserDefaults.standardUserDefaults.dataForKey(PREFS_STATE_DATA_KEY)
+            data?.toByteArray()?.decodeToString()?.takeIf { it.isNotBlank() }
+        }.getOrNull()?.let { return it }
+        return runCatching {
+            NSUserDefaults.standardUserDefaults.stringForKey(PREFS_STATE_KEY)?.takeIf { it.isNotBlank() }
+        }.getOrNull()
     }
 
     actual fun saveStateJson(json: String) {
-        NSUserDefaults.standardUserDefaults.setObject(json, forKey = PREFS_STATE_KEY)
-        NSUserDefaults.standardUserDefaults.synchronize()
+        if (json.isBlank()) return
+        writeUtf8File(stateFilePath(), json)
+        writeUtf8File(stateBackupFilePath(), json)
+        runCatching {
+            val nsData = json.encodeToByteArray().toNSData()
+            NSUserDefaults.standardUserDefaults.setObject(nsData, forKey = PREFS_STATE_DATA_KEY)
+            NSUserDefaults.standardUserDefaults.setObject(json, forKey = PREFS_STATE_KEY)
+            NSUserDefaults.standardUserDefaults.synchronize()
+        }
     }
 
     actual fun loadCachedM3u(cacheKey: String): String? {
+        readUtf8File(m3uCacheFilePath(cacheKey))?.let { return it }
         return runCatching {
             NSUserDefaults.standardUserDefaults.stringForKey(PREFS_M3U_FALLBACK_PREFIX + cacheKey)
         }.getOrNull()
@@ -111,12 +175,11 @@ actual object PlatformStorage {
 
     actual fun saveCachedM3u(cacheKey: String, content: String) {
         if (content.isBlank()) return
+        // Se guarda en el directorio de caché en disco (no en NSUserDefaults, cuyo límite de 4 MB
+        // en iOS bloqueaba la sincronización de las listas guardadas por el usuario).
+        writeUtf8File(m3uCacheFilePath(cacheKey), content)
         runCatching {
-            NSUserDefaults.standardUserDefaults.setObject(
-                content,
-                forKey = PREFS_M3U_FALLBACK_PREFIX + cacheKey
-            )
-            NSUserDefaults.standardUserDefaults.synchronize()
+            NSUserDefaults.standardUserDefaults.removeObjectForKey(PREFS_M3U_FALLBACK_PREFIX + cacheKey)
         }
     }
 }

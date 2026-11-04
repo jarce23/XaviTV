@@ -866,6 +866,16 @@ fun IosPlaylistsScreen(onConnected: () -> Unit) {
     fun connectAndSave(p: Playlist, originalToUpdate: Playlist? = null, clearFormOnSuccess: Boolean = false) {
         loading = true
         error = null
+        // Guardado síncrono inmediato en disco antes de validar red para evitar pérdida de credenciales
+        if (originalToUpdate != null) {
+            store.update(originalToUpdate, p)
+        } else {
+            store.add(p)
+        }
+        store.activeName = p.name
+        saved = store.all()
+        activeName = store.activeName
+
         scope.launch {
             runCatching {
                 appState.createRepo(p).login()
@@ -877,11 +887,7 @@ fun IosPlaylistsScreen(onConnected: () -> Unit) {
                     error = "Cuenta no activa (${resp.userInfo?.status ?: "Sin autorización"})"
                     loading = false
                 } else {
-                    if (originalToUpdate != null) {
-                        store.update(originalToUpdate, p)
-                    } else {
-                        store.add(p)
-                    }
+                    store.update(p, p)
                     store.activeName = p.name
                     appState.invalidateRepo()
                     saved = store.all()

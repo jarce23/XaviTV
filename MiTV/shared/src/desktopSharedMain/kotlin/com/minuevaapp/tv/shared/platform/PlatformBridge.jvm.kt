@@ -51,6 +51,10 @@ actual object PlatformStorage {
         File(baseDir, "xavitv_shared_state.json")
     }
 
+    private val storageBackupFile: File by lazy {
+        File(baseDir, "xavitv_shared_state.json.bak")
+    }
+
     private val m3uCacheDir: File by lazy {
         File(baseDir, "m3u_cache").apply {
             if (!exists()) mkdirs()
@@ -64,16 +68,35 @@ actual object PlatformStorage {
 
     actual fun loadStateJson(): String? {
         return try {
-            if (storageFile.exists()) storageFile.readText(Charsets.UTF_8) else null
+            when {
+                storageFile.exists() && storageFile.length() > 0L ->
+                    storageFile.readText(Charsets.UTF_8).takeIf { it.isNotBlank() }
+                storageBackupFile.exists() && storageBackupFile.length() > 0L ->
+                    storageBackupFile.readText(Charsets.UTF_8).takeIf { it.isNotBlank() }
+                else -> null
+            }
         } catch (_: Exception) {
-            null
+            try {
+                if (storageBackupFile.exists()) storageBackupFile.readText(Charsets.UTF_8) else null
+            } catch (_: Exception) {
+                null
+            }
         }
     }
 
     actual fun saveStateJson(json: String) {
+        if (json.isBlank()) return
         try {
-            storageFile.writeText(json, Charsets.UTF_8)
+            val tmpFile = File(baseDir, "xavitv_shared_state.json.tmp")
+            tmpFile.writeText(json, Charsets.UTF_8)
+            tmpFile.copyTo(storageFile, overwrite = true)
+            tmpFile.copyTo(storageBackupFile, overwrite = true)
+            tmpFile.delete()
         } catch (_: Exception) {
+            try {
+                storageFile.writeText(json, Charsets.UTF_8)
+            } catch (_: Exception) {
+            }
         }
     }
 

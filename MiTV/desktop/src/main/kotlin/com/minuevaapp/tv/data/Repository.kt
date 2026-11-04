@@ -28,7 +28,7 @@ private data class DesktopStorageData(
     var resumePositions: MutableMap<String, Long> = mutableMapOf(),
     var recentlyViewed: MutableMap<String, MutableList<String>> = mutableMapOf(),
     var selectedCategories: MutableMap<String, String> = mutableMapOf(),
-    var scrollPositions: MutableMap<String, Pair<Int, Int>> = mutableMapOf(),
+    var scrollPositions: MutableMap<String, List<Int>> = mutableMapOf(),
 )
 
 data class RefreshResult(
@@ -41,18 +41,20 @@ data class RefreshResult(
 
 /**
  * Almacenamiento local para Windows Desktop (~/.xavitv/store.json).
- * Optimizado para Arranque Instantáneo:
- * - No bloquea el hilo principal de UI durante la creación de la ventana.
- * - Inicia en memoria inmediatamente con la lista por defecto (TDTChannels) disponible.
- * - Carga y persiste el archivo JSON de forma asíncrona en segundo plano (Dispatchers.IO).
+ * - Lee el archivo JSON de forma SÍNCRONA en el constructor (es un archivo pequeño), de modo que
+ *   antes de decidir la primera pantalla ya están en memoria las listas y la lista activa guardadas.
+ * - Toda modificación de listas/credenciales se escribe inmediatamente en disco (persistSync)
+ *   mediante escritura atómica (archivo temporal + reemplazo) y copia de seguridad store.json.bak.
+ * - Si el JSON no se puede leer, NUNCA se sobrescribe: se intenta la copia de seguridad y se
+ *   conserva el archivo original como store.json.corrupt.
  */
 class PlaylistStore {
     private val gson by lazy { Gson() }
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val storeDir by lazy { File(System.getProperty("user.home"), ".xavitv").apply { mkdirs() } }
     private val storeFile by lazy { File(storeDir, "store.json") }
+    private val backupFile by lazy { File(storeDir, "store.json.bak") }
 
-    // Estado inicial inmediato en RAM para que la primera pantalla renderice en 0ms sin esperar a disco
     private var data: DesktopStorageData = DesktopStorageData(
         activeName = defaultTdtPlaylist.name,
         defaultTdtSeeded = true,
@@ -62,7 +64,11 @@ class PlaylistStore {
     @Volatile
     private var diskLoaded = false
 
-    // Contador observable por Compose para recomponer suavemente tras completar la lectura en Dispatchers.IO
+    /** Si el archivo existía pero era ilegible, se bloquea la escritura para no machacarlo. */
+    @Volatile
+    private var writeBlocked = false
+
+    // Contador observable por Compose para recomponer tras cambios en el almacenamiento
     var stateVersion by mutableIntStateOf(0)
         private set
 
@@ -70,56 +76,108 @@ class PlaylistStore {
         stateVersion++
     }
 
-    /**
-     * Inicializa el almacenamiento desde disco en segundo plano (Dispatchers.IO)
-     * sin bloquear el renderizado inicial de la ventana de Compose.
-     */
-    suspend fun initializeAsync() = withContext(Dispatchers.IO) {
-        if (diskLoaded) return@withContext
-        val loaded = if (storeFile.exists()) {
-            runCatching {
-                gson.fromJson(storeFile.readText(StandardCharsets.UTF_8), DesktopStorageData::class.java)
-            }.getOrNull()
-        } else {
-            null
+    init {
+        loadFromDiskSync()
+    }
+
+    private fun parseStore(file: File): DesktopStorageData? {
+        if (!file.exists() || file.length() == 0L) return null
+        return runCatching {
+            gson.fromJson(file.readText(StandardCharsets.UTF_8), DesktopStorageData::class.java)
+        }.getOrNull()?.let { normalize(it) }
+    }
+
+    /** Gson puede dejar a null colecciones ausentes en JSON antiguos: se normalizan aquí. */
+    @Suppress("SENSELESS_COMPARISON", "UNNECESSARY_SAFE_CALL")
+    private fun normalize(d: DesktopStorageData): DesktopStorageData = DesktopStorageData(
+        activeName = d.activeName,
+        defaultTdtSeeded = d.defaultTdtSeeded,
+        playlists = (d.playlists ?: mutableListOf()).filter { it != null && !it.name.isNullOrBlank() }.toMutableList(),
+        favorites = d.favorites ?: mutableMapOf(),
+        resumePositions = d.resumePositions ?: mutableMapOf(),
+        recentlyViewed = d.recentlyViewed ?: mutableMapOf(),
+        selectedCategories = d.selectedCategories ?: mutableMapOf(),
+        scrollPositions = d.scrollPositions ?: mutableMapOf(),
+    )
+
+    /** Lectura síncrona del disco. Se llama en el constructor, antes de mostrar ninguna pantalla. */
+    @Synchronized
+    private fun loadFromDiskSync() {
+        if (diskLoaded) return
+        val fileExists = storeFile.exists() && storeFile.length() > 0L
+        val loaded = parseStore(storeFile) ?: parseStore(backupFile)
+
+        if (loaded == null && fileExists) {
+            // Archivo ilegible: lo conservamos y no permitimos que se sobrescriba con datos vacíos
+            runCatching { storeFile.copyTo(File(storeDir, "store.json.corrupt"), overwrite = true) }
+            writeBlocked = !backupFile.exists()
         }
 
         var needsPersist = false
-        synchronized(this@PlaylistStore) {
-            if (loaded != null) {
-                data = loaded
-            }
-            if (data.playlists.isEmpty() || !data.defaultTdtSeeded) {
-                val hasTdt = data.playlists.any {
-                    it.effectiveM3uUrl.equals(DEFAULT_TDT_URL, ignoreCase = true) ||
-                        it.name.equals(defaultTdtPlaylist.name, ignoreCase = true)
-                }
-                if (!hasTdt) {
-                    data.playlists.add(0, defaultTdtPlaylist)
-                }
-                data.defaultTdtSeeded = true
-                needsPersist = true
-            }
-            if (data.activeName.isNullOrBlank() || data.playlists.none { it.name == data.activeName }) {
-                data.activeName = data.playlists.first().name
-                needsPersist = true
-            }
-            diskLoaded = true
+        if (loaded != null) {
+            data = loaded
         }
+        if (data.playlists.isEmpty() || !data.defaultTdtSeeded) {
+            val hasTdt = data.playlists.any {
+                it.effectiveM3uUrl.equals(DEFAULT_TDT_URL, ignoreCase = true) ||
+                    it.name.equals(defaultTdtPlaylist.name, ignoreCase = true)
+            }
+            if (!hasTdt) {
+                data.playlists.add(0, defaultTdtPlaylist)
+            }
+            data.defaultTdtSeeded = true
+            needsPersist = true
+        }
+        if (data.activeName.isNullOrBlank() || data.playlists.none { it.name == data.activeName }) {
+            val preferred = data.playlists.lastOrNull { !it.name.equals(defaultTdtPlaylist.name, ignoreCase = true) }
+                ?: data.playlists.first()
+            data.activeName = preferred.name
+            needsPersist = true
+        }
+        diskLoaded = true
 
-        if (needsPersist || !storeFile.exists()) {
+        if ((needsPersist || !storeFile.exists()) && !writeBlocked) {
             persistSync()
         }
+    }
+
+    /**
+     * Compatibilidad con el arranque anterior: la carga ya se hizo síncronamente en el constructor,
+     * aquí solo se notifica a Compose.
+     */
+    suspend fun initializeAsync() = withContext(Dispatchers.IO) {
+        loadFromDiskSync()
         notifyStateChanged()
     }
+
+    /** Indica si hay listas del usuario guardadas (además de la TDT por defecto). */
+    @Synchronized
+    fun hasUserPlaylists(): Boolean =
+        data.playlists.any { !it.name.equals(defaultTdtPlaylist.name, ignoreCase = true) }
 
     @Synchronized
     private fun snapshotJson(): String = gson.toJson(data)
 
+    /** Escritura inmediata y atómica en disco (tmp + reemplazo) con copia de seguridad. */
+    @Synchronized
     private fun persistSync() {
+        if (!diskLoaded) return
         runCatching {
             val json = snapshotJson()
-            storeFile.writeText(json, StandardCharsets.UTF_8)
+            val tmp = File(storeDir, "store.json.tmp")
+            tmp.writeText(json, StandardCharsets.UTF_8)
+            runCatching {
+                java.nio.file.Files.move(
+                    tmp.toPath(),
+                    storeFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE
+                )
+            }.getOrElse {
+                java.nio.file.Files.move(tmp.toPath(), storeFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            }
+            backupFile.writeText(json, StandardCharsets.UTF_8)
+            writeBlocked = false
         }
     }
 
@@ -140,11 +198,11 @@ class PlaylistStore {
                 data.playlists.add(0, defaultTdtPlaylist)
             }
             data.defaultTdtSeeded = true
-            if (diskLoaded) persistAsync()
+            persistSync()
         }
         if (data.activeName.isNullOrBlank() || data.playlists.none { it.name == data.activeName }) {
             data.activeName = data.playlists.first().name
-            if (diskLoaded) persistAsync()
+            persistSync()
         }
         return data.playlists.toList()
     }
@@ -158,7 +216,7 @@ class PlaylistStore {
         data.playlists.add(p)
         data.activeName = p.name
         notifyStateChanged()
-        persistAsync()
+        persistSync()
     }
 
     @Synchronized
@@ -179,7 +237,7 @@ class PlaylistStore {
             data.activeName = updated.name
         }
         notifyStateChanged()
-        persistAsync()
+        persistSync()
     }
 
     @Synchronized
@@ -191,7 +249,7 @@ class PlaylistStore {
             data.activeName = data.playlists.first().name
         }
         notifyStateChanged()
-        persistAsync()
+        persistSync()
     }
 
     var activeName: String?
@@ -199,7 +257,7 @@ class PlaylistStore {
         @Synchronized set(v) {
             data.activeName = v
             notifyStateChanged()
-            persistAsync()
+            persistSync()
         }
 
     @Synchronized
@@ -207,7 +265,7 @@ class PlaylistStore {
         val list = ensureDefaultPlaylistInjected()
         return list.firstOrNull { it.name == data.activeName } ?: list.first().also {
             data.activeName = it.name
-            if (diskLoaded) persistAsync()
+            persistSync()
         }
     }
 
@@ -219,7 +277,7 @@ class PlaylistStore {
     fun toggleFavorite(type: String, id: String) {
         val set = data.favorites.getOrPut(type) { mutableSetOf() }
         if (!set.add(id)) set.remove(id)
-        persistAsync()
+        persistSync()
     }
 
     @Synchronized
@@ -243,12 +301,12 @@ class PlaylistStore {
 
     @Synchronized
     fun getScrollPosition(key: String): Pair<Int, Int> =
-        data.scrollPositions[key] ?: (0 to 0)
+        data.scrollPositions[key]?.takeIf { it.size >= 2 }?.let { it[0] to it[1] } ?: (0 to 0)
 
     @Synchronized
     fun saveScrollPosition(key: String, index: Int, offset: Int) {
         if (index >= 0 && offset >= 0) {
-            data.scrollPositions[key] = index to offset
+            data.scrollPositions[key] = listOf(index, offset)
             persistAsync()
         }
     }

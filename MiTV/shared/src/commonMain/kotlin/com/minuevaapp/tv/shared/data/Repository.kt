@@ -62,6 +62,7 @@ class PlaylistStore {
         encodeDefaults = true
     }
 
+    private var writeBlocked: Boolean = false
     private var data: StoredAppState = loadState()
 
     init {
@@ -71,18 +72,25 @@ class PlaylistStore {
     private fun loadState(): StoredAppState {
         val raw = PlatformStorage.loadStateJson()
         if (raw.isNullOrBlank()) return StoredAppState()
-        return runCatching {
+        val parsed = runCatching {
             json.decodeFromString<StoredAppState>(raw)
-        }.getOrDefault(StoredAppState())
+        }.getOrNull()
+        if (parsed == null) {
+            writeBlocked = true
+            return StoredAppState()
+        }
+        return parsed
     }
 
     private fun persist() {
+        if (writeBlocked) return
         runCatching {
             PlatformStorage.saveStateJson(json.encodeToString(data))
         }
     }
 
     fun ensureDefaultPlaylistInjected(): List<Playlist> {
+        var changed = false
         if (data.playlists.isEmpty() || !data.defaultTdtSeeded) {
             val hasTdt = data.playlists.any {
                 it.effectiveM3uUrl.equals(DEFAULT_TDT_URL, ignoreCase = true) ||
@@ -92,10 +100,15 @@ class PlaylistStore {
                 data.playlists.add(0, defaultTdtPlaylist)
             }
             data.defaultTdtSeeded = true
-            persist()
+            changed = true
         }
         if (data.activeName.isNullOrBlank() || data.playlists.none { it.name == data.activeName }) {
-            data.activeName = data.playlists.first().name
+            val preferred = data.playlists.lastOrNull { !it.name.equals(defaultTdtPlaylist.name, ignoreCase = true) }
+                ?: data.playlists.first()
+            data.activeName = preferred.name
+            changed = true
+        }
+        if (changed) {
             persist()
         }
         return data.playlists.toList()
@@ -104,6 +117,7 @@ class PlaylistStore {
     fun all(): List<Playlist> = ensureDefaultPlaylistInjected()
 
     fun add(p: Playlist) {
+        writeBlocked = false
         data.playlists.removeAll { it.name.equals(p.name, ignoreCase = true) }
         data.playlists.add(p)
         data.activeName = p.name
@@ -111,6 +125,7 @@ class PlaylistStore {
     }
 
     fun update(original: Playlist, updated: Playlist) {
+        writeBlocked = false
         val idx = data.playlists.indexOfFirst {
             it.name.equals(original.name, ignoreCase = true) && it.playlistType == original.playlistType
         }
@@ -129,11 +144,14 @@ class PlaylistStore {
     }
 
     fun remove(p: Playlist) {
+        writeBlocked = false
         data.playlists.removeAll { it.name == p.name && it.playlistType == p.playlistType }
         if (data.playlists.isEmpty()) {
             ensureDefaultPlaylistInjected()
         } else if (data.activeName == p.name) {
-            data.activeName = data.playlists.first().name
+            val preferred = data.playlists.lastOrNull { !it.name.equals(defaultTdtPlaylist.name, ignoreCase = true) }
+                ?: data.playlists.first()
+            data.activeName = preferred.name
         }
         persist()
     }
@@ -141,16 +159,21 @@ class PlaylistStore {
     var activeName: String?
         get() = data.activeName
         set(v) {
+            writeBlocked = false
             data.activeName = v
             persist()
         }
 
     fun active(): Playlist {
         val list = ensureDefaultPlaylistInjected()
-        return list.firstOrNull { it.name == data.activeName } ?: list.first().also {
-            data.activeName = it.name
+        val preferred = list.firstOrNull { it.name == data.activeName }
+            ?: list.lastOrNull { !it.name.equals(defaultTdtPlaylist.name, ignoreCase = true) }
+            ?: list.first()
+        if (data.activeName != preferred.name) {
+            data.activeName = preferred.name
             persist()
         }
+        return preferred
     }
 
     fun favorites(type: String): Set<String> =

@@ -33,24 +33,47 @@ class PlaylistStore(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences("playlists", Context.MODE_PRIVATE)
     private val gson = Gson()
 
+    /** Copia en memoria de las listas leídas de disco (se rellena síncronamente en el init). */
+    @Volatile
+    private var cachedList: List<Playlist>? = null
+
     init {
+        // Lectura SÍNCRONA de las listas guardadas antes de que la UI decida qué pantalla mostrar.
         ensureDefaultPlaylistInjected()
     }
 
-    private fun readRawList(): List<Playlist> {
-        val json = prefs.getString("list", null) ?: return emptyList()
+    /**
+     * Lee las listas de disco. Devuelve null si existe un JSON guardado pero no se puede interpretar
+     * (para no sobrescribirlo jamás con una lista vacía), o una lista vacía si nunca se guardó nada.
+     * Se usa Array<Playlist> en lugar de TypeToken para que R8/ProGuard no rompa la deserialización.
+     */
+    private fun readRawListOrNull(): List<Playlist>? {
+        val json = prefs.getString(KEY_LIST, null) ?: prefs.getString(KEY_LIST_BACKUP, null) ?: return emptyList()
         return runCatching {
-            val type = object : TypeToken<List<Playlist>>() {}.type
-            gson.fromJson<List<Playlist>>(json, type).orEmpty()
-        }.getOrDefault(emptyList())
+            gson.fromJson(json, Array<Playlist>::class.java)
+                ?.filter { !it.name.isNullOrBlank() }
+                .orEmpty()
+        }.getOrNull() ?: runCatching {
+            val backup = prefs.getString(KEY_LIST_BACKUP, null) ?: return@runCatching null
+            gson.fromJson(backup, Array<Playlist>::class.java)?.filter { !it.name.isNullOrBlank() }
+        }.getOrNull()
     }
+
+    private fun readRawList(): List<Playlist> = cachedList ?: (readRawListOrNull() ?: emptyList())
 
     /**
      * Garantiza que en el primer arranque (o si no hay listas guardadas) se inserte
      * automáticamente la lista M3U por defecto de TDTChannels en almacenamiento local.
+     * Nunca elimina ni sobrescribe listas del usuario ya guardadas.
      */
+    @Synchronized
     fun ensureDefaultPlaylistInjected(): List<Playlist> {
-        val current = readRawList().toMutableList()
+        val fromDisk = cachedList ?: readRawListOrNull()
+        if (fromDisk == null) {
+            // JSON corrupto/ilegible: no tocar el disco; usar la lista por defecto solo en memoria.
+            return listOf(defaultTdtPlaylist).also { cachedList = it }
+        }
+        val current = fromDisk.toMutableList()
         val alreadySeeded = prefs.getBoolean(KEY_DEFAULT_TDT_SEEDED, false)
 
         if (current.isEmpty() || !alreadySeeded) {
@@ -61,30 +84,46 @@ class PlaylistStore(context: Context) {
             if (!hasTdt) {
                 current.add(0, defaultTdtPlaylist)
             }
-            prefs.edit()
-                .putString("list", gson.toJson(current))
-                .putBoolean(KEY_DEFAULT_TDT_SEEDED, true)
-                .apply()
+            save(current)
+            prefs.edit().putBoolean(KEY_DEFAULT_TDT_SEEDED, true).commit()
         }
+        cachedList = current.toList()
 
-        if (activeName.isNullOrBlank() || current.none { it.name == activeName }) {
-            activeName = current.first().name
+        val savedActive = prefs.getString(KEY_ACTIVE, null)
+        if (savedActive.isNullOrBlank() || current.none { it.name == savedActive }) {
+            // Prioriza la última lista añadida por el usuario frente a la de TDT por defecto
+            val preferred = current.lastOrNull { !it.name.equals(defaultTdtPlaylist.name, ignoreCase = true) }
+                ?: current.first()
+            activeName = preferred.name
         }
-        return current
+        return current.toList()
     }
 
     fun all(): List<Playlist> = ensureDefaultPlaylistInjected()
 
+    /** Indica si el usuario tiene guardada al menos una lista propia (Xtream o M3U) además de la TDT. */
+    fun hasUserPlaylists(): Boolean =
+        all().any { !it.name.equals(defaultTdtPlaylist.name, ignoreCase = true) }
+
+    /** Guarda las listas de forma síncrona en disco (commit) y mantiene una copia de seguridad. */
+    @Synchronized
     fun save(list: List<Playlist>) {
-        prefs.edit().putString("list", gson.toJson(list)).apply()
+        val json = gson.toJson(list)
+        prefs.edit()
+            .putString(KEY_LIST, json)
+            .putString(KEY_LIST_BACKUP, json)
+            .commit()
+        cachedList = list.toList()
     }
 
+    @Synchronized
     fun add(p: Playlist) {
         val updated = readRawList().filterNot { it.name.equals(p.name, ignoreCase = true) } + p
         save(updated)
         activeName = p.name
     }
 
+    @Synchronized
     fun update(original: Playlist, updated: Playlist) {
         val current = readRawList().toMutableList()
         val idx = current.indexOfFirst {
@@ -105,6 +144,7 @@ class PlaylistStore(context: Context) {
         }
     }
 
+    @Synchronized
     fun remove(p: Playlist) {
         val remaining = readRawList().filterNot { it.name == p.name && it.playlistType == p.playlistType }
         save(remaining)
@@ -116,8 +156,10 @@ class PlaylistStore(context: Context) {
     }
 
     var activeName: String?
-        get() = prefs.getString("active", null)
-        set(v) = prefs.edit().putString("active", v).apply()
+        get() = prefs.getString(KEY_ACTIVE, null)
+        set(v) {
+            prefs.edit().putString(KEY_ACTIVE, v).commit()
+        }
 
     fun active(): Playlist {
         val list = ensureDefaultPlaylistInjected()
@@ -131,7 +173,7 @@ class PlaylistStore(context: Context) {
     fun toggleFavorite(type: String, id: String) {
         val updated = favorites(type).toMutableSet()
         if (!updated.add(id)) updated.remove(id)
-        prefs.edit().putStringSet("fav_$type", updated).apply()
+        prefs.edit().putStringSet("fav_$type", updated).commit()
     }
 
     private val _recentUpdates = MutableStateFlow(0)
@@ -140,8 +182,7 @@ class PlaylistStore(context: Context) {
     fun getRecentlyViewed(type: String): List<String> {
         val json = prefs.getString("recent_$type", null) ?: return emptyList()
         return runCatching {
-            val listType = object : TypeToken<List<String>>() {}.type
-            gson.fromJson<List<String>>(json, listType).orEmpty()
+            gson.fromJson(json, Array<String>::class.java)?.toList().orEmpty()
         }.getOrDefault(emptyList())
     }
 
@@ -186,6 +227,9 @@ class PlaylistStore(context: Context) {
 
     companion object {
         private const val KEY_DEFAULT_TDT_SEEDED = "default_tdt_seeded_v1"
+        private const val KEY_LIST = "list"
+        private const val KEY_LIST_BACKUP = "list_backup"
+        private const val KEY_ACTIVE = "active"
         const val DEFAULT_TDT_URL = "https://www.tdtchannels.com/lists/tvradio.m3u"
 
         val defaultTdtPlaylist = Playlist(
