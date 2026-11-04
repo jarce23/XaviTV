@@ -154,7 +154,8 @@ data class VodData(
 @Serializable
 data class SeriesInfoResponse(
     val info: SeriesDetails? = null,
-    val episodes: JsonElement? = null
+    val episodes: JsonElement? = null,
+    val seasons: JsonElement? = null
 )
 
 @Serializable
@@ -170,7 +171,7 @@ data class SeriesDetails(
 
 @Serializable
 data class Episode(
-    val id: String,
+    val id: String = "",
     @SerialName("episode_num") val episodeNum: String? = null,
     val title: String? = null,
     @SerialName("container_extension") val extension: String? = null,

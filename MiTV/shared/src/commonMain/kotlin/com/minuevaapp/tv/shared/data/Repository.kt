@@ -18,7 +18,10 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
@@ -588,6 +591,102 @@ class XtreamRepository(
         }
     }
 
+    private fun JsonObject.optString(vararg keys: String): String? {
+        for (k in keys) {
+            val el = this[k]
+            if (el is JsonPrimitive && el !is JsonNull) {
+                val s = el.contentOrNull
+                if (!s.isNullOrBlank()) return s
+            }
+        }
+        return null
+    }
+
+    private fun parseVodInfoObject(infoEl: JsonElement?): VodInfo {
+        if (infoEl !is JsonObject) return VodInfo()
+        runCatching { json.decodeFromJsonElement<VodInfo>(infoEl) }.getOrNull()?.let { return it }
+        return VodInfo(
+            name = infoEl.optString("name", "title"),
+            plot = infoEl.optString("plot", "description"),
+            cast = infoEl.optString("cast", "actors"),
+            director = infoEl.optString("director"),
+            genre = infoEl.optString("genre"),
+            releaseDate = infoEl.optString("releasedate", "releaseDate"),
+            rating = infoEl.optString("rating"),
+            duration = infoEl.optString("duration"),
+            image = infoEl.optString("movie_image", "cover_big", "cover")
+        )
+    }
+
+    private fun parseVodDataObject(movieDataEl: JsonElement?, fallbackId: String): VodData {
+        if (movieDataEl is JsonObject) {
+            runCatching { json.decodeFromJsonElement<VodData>(movieDataEl) }.getOrNull()?.let { return it }
+            return VodData(
+                streamId = movieDataEl.optString("stream_id") ?: fallbackId,
+                name = movieDataEl.optString("name"),
+                extension = movieDataEl.optString("container_extension") ?: "mp4"
+            )
+        }
+        return VodData(streamId = fallbackId, name = null, extension = "mp4")
+    }
+
+    private fun parseSeriesDetailsObject(infoEl: JsonElement?): SeriesDetails {
+        if (infoEl !is JsonObject) return SeriesDetails()
+        runCatching { json.decodeFromJsonElement<SeriesDetails>(infoEl) }.getOrNull()?.let { return it }
+        return SeriesDetails(
+            name = infoEl.optString("name", "title"),
+            cover = infoEl.optString("cover", "cover_big"),
+            plot = infoEl.optString("plot", "description"),
+            cast = infoEl.optString("cast"),
+            genre = infoEl.optString("genre"),
+            rating = infoEl.optString("rating"),
+            releaseDate = infoEl.optString("releaseDate", "releasedate")
+        )
+    }
+
+    private fun parseEpisodeInfoObject(infoEl: JsonElement?): EpisodeInfo? {
+        if (infoEl !is JsonObject) return null
+        runCatching { json.decodeFromJsonElement<EpisodeInfo>(infoEl) }.getOrNull()?.let { return it }
+        return EpisodeInfo(
+            plot = infoEl.optString("plot", "overview"),
+            duration = infoEl.optString("duration"),
+            image = infoEl.optString("movie_image", "cover_big", "cover")
+        )
+    }
+
+    private fun parseSingleEpisode(epEl: JsonElement?, fallbackSeason: String? = null): Episode? {
+        if (epEl !is JsonObject) return null
+        val id = epEl.optString("id", "stream_id") ?: return null
+        return Episode(
+            id = id,
+            episodeNum = epEl.optString("episode_num", "episode"),
+            title = epEl.optString("title", "name"),
+            extension = epEl.optString("container_extension") ?: "mp4",
+            season = epEl.optString("season") ?: fallbackSeason,
+            info = parseEpisodeInfoObject(epEl["info"]),
+            directUrl = epEl.optString("direct_source")
+        )
+    }
+
+    private fun parseSeasonEpisodesElement(seasonEl: JsonElement?, fallbackSeason: String? = null): List<Episode> {
+        if (seasonEl == null || seasonEl is JsonNull) return emptyList()
+        val result = mutableListOf<Episode>()
+        when (seasonEl) {
+            is JsonArray -> {
+                seasonEl.forEach { item ->
+                    parseSingleEpisode(item, fallbackSeason)?.let { result.add(it) }
+                }
+            }
+            is JsonObject -> {
+                seasonEl.entries.forEach { (_, value) ->
+                    parseSingleEpisode(value, fallbackSeason)?.let { result.add(it) }
+                }
+            }
+            else -> Unit
+        }
+        return result
+    }
+
     suspend fun vodInfo(id: String): VodInfoResponse {
         if (playlist.isM3u) {
             val catalog = ensureM3uLoaded()
@@ -596,7 +695,13 @@ class XtreamRepository(
                 movieData = VodData(streamId = id, name = "Película", extension = "mp4")
             )
         }
-        return callPlayerApi("get_vod_info", mapOf("vod_id" to id))
+        val rootEl = runCatching {
+            callPlayerApi<JsonElement>("get_vod_info", mapOf("vod_id" to id))
+        }.getOrNull()
+        val rootObj = rootEl as? JsonObject
+        val parsedInfo = parseVodInfoObject(rootObj?.get("info"))
+        val parsedMovieData = parseVodDataObject(rootObj?.get("movie_data"), id)
+        return VodInfoResponse(info = parsedInfo, movieData = parsedMovieData)
     }
 
     suspend fun seriesInfo(id: String): Pair<SeriesDetails?, Map<String, List<Episode>>> {
@@ -604,26 +709,51 @@ class XtreamRepository(
             val catalog = ensureM3uLoaded()
             return catalog.seriesDetails[id] ?: (null to emptyMap())
         }
-        val r = callPlayerApi<SeriesInfoResponse>("get_series_info", mapOf("series_id" to id))
+        val rootEl = runCatching {
+            callPlayerApi<JsonElement>("get_series_info", mapOf("series_id" to id))
+        }.getOrNull()
+        val rootObj = rootEl as? JsonObject
+        val parsedDetails = parseSeriesDetailsObject(rootObj?.get("info"))
         val map = linkedMapOf<String, List<Episode>>()
-        val el: JsonElement? = r.episodes
+        val el: JsonElement? = rootObj?.get("episodes")
         if (el is JsonObject) {
             el.entries
                 .sortedBy { it.key.toIntOrNull() ?: 0 }
                 .forEach { (season, arr) ->
-                    map[season] = runCatching {
-                        json.decodeFromJsonElement<List<Episode>>(arr)
-                    }.getOrDefault(emptyList())
+                    val eps = parseSeasonEpisodesElement(arr, season)
+                    if (eps.isNotEmpty()) {
+                        map[season] = eps
+                    }
                 }
         } else if (el is JsonArray) {
             el.forEach { seasonArr ->
-                val eps = runCatching {
-                    json.decodeFromJsonElement<List<Episode>>(seasonArr)
-                }.getOrDefault(emptyList())
-                eps.firstOrNull()?.let { map[it.season ?: "${map.size + 1}"] = eps }
+                when (seasonArr) {
+                    is JsonArray -> {
+                        val eps = parseSeasonEpisodesElement(seasonArr, null)
+                        eps.firstOrNull()?.let { ep ->
+                            val sKey = ep.season ?: "${map.size + 1}"
+                            map[sKey] = eps
+                        }
+                    }
+                    is JsonObject -> {
+                        val singleEp = parseSingleEpisode(seasonArr, null)
+                        if (singleEp != null) {
+                            val sKey = singleEp.season ?: "1"
+                            val list = map.getOrPut(sKey) { emptyList() }
+                            map[sKey] = list + singleEp
+                        } else {
+                            val eps = parseSeasonEpisodesElement(seasonArr, null)
+                            eps.firstOrNull()?.let { ep ->
+                                val sKey = ep.season ?: "${map.size + 1}"
+                                map[sKey] = eps
+                            }
+                        }
+                    }
+                    else -> Unit
+                }
             }
         }
-        return r.info to map
+        return parsedDetails to map
     }
 
     suspend fun shortEpg(streamId: String): List<EpgListing> {

@@ -87,12 +87,12 @@ data class Series(
 )
 
 data class VodInfoResponse(
-    val info: VodInfo?,
-    @SerializedName("movie_data") val movieData: VodData?,
+    val info: VodInfo? = null,
+    @SerializedName("movie_data") val movieData: VodData? = null,
 )
 
 data class VodInfo(
-    val name: String?,
+    val name: String? = null,
     val plot: String? = null,
     val cast: String? = null,
     val director: String? = null,
@@ -107,18 +107,19 @@ data class VodInfo(
 )
 
 data class VodData(
-    @SerializedName("stream_id") val streamId: String?,
-    val name: String?,
-    @SerializedName("container_extension") val extension: String?,
+    @SerializedName("stream_id") val streamId: String? = null,
+    val name: String? = null,
+    @SerializedName("container_extension") val extension: String? = null,
 )
 
 data class SeriesInfoResponse(
-    val info: SeriesDetails?,
-    val episodes: JsonElement?,
+    val info: SeriesDetails? = null,
+    val episodes: JsonElement? = null,
+    val seasons: JsonElement? = null,
 )
 
 data class SeriesDetails(
-    val name: String?,
+    val name: String? = null,
     val cover: String? = null,
     val plot: String? = null,
     val cast: String? = null,
@@ -128,9 +129,9 @@ data class SeriesDetails(
 )
 
 data class Episode(
-    val id: String,
-    @SerializedName("episode_num") val episodeNum: String?,
-    val title: String?,
+    val id: String = "",
+    @SerializedName("episode_num") val episodeNum: String? = null,
+    val title: String? = null,
     @SerializedName("container_extension") val extension: String? = null,
     val season: String? = null,
     val info: EpisodeInfo? = null,

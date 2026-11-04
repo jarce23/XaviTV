@@ -1,5 +1,6 @@
 package com.minuevaapp.tv.data
 
+import com.google.gson.JsonElement
 import retrofit2.http.GET
 import retrofit2.http.Query
 
@@ -23,7 +24,7 @@ interface XtreamApi {
     @GET("player_api.php?action=get_vod_info")
     suspend fun vodInfo(
         @Query("username") u: String, @Query("password") p: String, @Query("vod_id") id: String,
-    ): VodInfoResponse
+    ): JsonElement
 
     @GET("player_api.php?action=get_series_categories")
     suspend fun seriesCategories(@Query("username") u: String, @Query("password") p: String): List<Category>
@@ -34,7 +35,7 @@ interface XtreamApi {
     @GET("player_api.php?action=get_series_info")
     suspend fun seriesInfo(
         @Query("username") u: String, @Query("password") p: String, @Query("series_id") id: String,
-    ): SeriesInfoResponse
+    ): JsonElement
 
     @GET("player_api.php?action=get_short_epg")
     suspend fun shortEpg(
