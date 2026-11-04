@@ -87,26 +87,11 @@ fun registerVlcToggleOverlayHandler(handler: () -> Unit) {
 }
 
 private const val PREFS_STATE_KEY = "xavitv_ios_local_state_v1"
-private const val PREFS_STATE_DATA_KEY = "xavitv_ios_local_state_data_v2"
 private const val PREFS_M3U_FALLBACK_PREFIX = "xavitv_ios_m3u_cache_"
 
 // Búfer ultrarreducido (0.45 segundos) para zapping instantáneo en canales en directo con AVPlayer
 private const val IOS_LIVE_FORWARD_BUFFER_SECONDS = 0.45
 private const val IOS_VOD_FORWARD_BUFFER_SECONDS = 2.0
-
-private fun ByteArray.toNSData(): NSData = memScoped {
-    if (isEmpty()) return NSData()
-    usePinned { pinned ->
-        NSData.create(bytes = pinned.addressOf(0), length = size.toULong())
-    }
-}
-
-private fun NSData.toByteArray(): ByteArray {
-    val len = length.toInt()
-    if (len <= 0) return ByteArray(0)
-    val ptr = bytes ?: return ByteArray(0)
-    return ptr.readBytes(len)
-}
 
 actual object PlatformStorage {
     private val documentsDir: String? by lazy {
@@ -130,25 +115,30 @@ actual object PlatformStorage {
     private fun readUtf8File(path: String?): String? {
         if (path.isNullOrBlank()) return null
         return runCatching {
-            val data = NSData.dataWithContentsOfFile(path) ?: return@runCatching null
-            data.toByteArray().decodeToString().takeIf { it.isNotBlank() }
+            NSString.stringWithContentsOfFile(
+                path = path,
+                encoding = NSUTF8StringEncoding,
+                error = null
+            )?.takeIf { it.isNotBlank() }
         }.getOrNull()
     }
 
     private fun writeUtf8File(path: String?, content: String) {
         if (path.isNullOrBlank() || content.isBlank()) return
         runCatching {
-            content.encodeToByteArray().toNSData().writeToFile(path, atomically = true)
+            val nsString = NSString.create(string = content)
+            nsString.writeToFile(
+                path = path,
+                atomically = true,
+                encoding = NSUTF8StringEncoding,
+                error = null
+            )
         }
     }
 
     actual fun loadStateJson(): String? {
         readUtf8File(stateFilePath())?.let { return it }
         readUtf8File(stateBackupFilePath())?.let { return it }
-        runCatching {
-            val data = NSUserDefaults.standardUserDefaults.dataForKey(PREFS_STATE_DATA_KEY)
-            data?.toByteArray()?.decodeToString()?.takeIf { it.isNotBlank() }
-        }.getOrNull()?.let { return it }
         return runCatching {
             NSUserDefaults.standardUserDefaults.stringForKey(PREFS_STATE_KEY)?.takeIf { it.isNotBlank() }
         }.getOrNull()
@@ -159,8 +149,6 @@ actual object PlatformStorage {
         writeUtf8File(stateFilePath(), json)
         writeUtf8File(stateBackupFilePath(), json)
         runCatching {
-            val nsData = json.encodeToByteArray().toNSData()
-            NSUserDefaults.standardUserDefaults.setObject(nsData, forKey = PREFS_STATE_DATA_KEY)
             NSUserDefaults.standardUserDefaults.setObject(json, forKey = PREFS_STATE_KEY)
             NSUserDefaults.standardUserDefaults.synchronize()
         }
