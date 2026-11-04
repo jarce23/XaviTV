@@ -159,3 +159,30 @@ data class EpgListing(
     @SerializedName("start_timestamp") val startTs: String?,
     @SerializedName("stop_timestamp") val stopTs: String?,
 )
+
+data class PlaybackProgress(
+    @SerializedName("positionMs") val positionMs: Long = 0L,
+    @SerializedName("durationMs") val durationMs: Long = 0L,
+    @SerializedName("updatedAt") val updatedAt: Long = 0L,
+) {
+    val progressFraction: Float
+        get() = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
+
+    val isCompleted: Boolean
+        get() = progressFraction >= 0.95f
+
+    val resumePositionMs: Long
+        get() = when {
+            isCompleted -> 0L
+            durationMs > 0L -> if (progressFraction in 0.02f..0.9499f) positionMs else 0L
+            positionMs > 5_000L -> positionMs
+            else -> 0L
+        }
+}
+
+data class PlaybackProgressEntry(
+    @SerializedName("id") val id: String = "",
+    @SerializedName("positionMs") val positionMs: Long = 0L,
+    @SerializedName("durationMs") val durationMs: Long = 0L,
+    @SerializedName("updatedAt") val updatedAt: Long = 0L,
+)

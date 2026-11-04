@@ -64,12 +64,27 @@ class PlayerActivity : Activity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var reconnectRunnable: Runnable? = null
+    private var progressSaveRunnable: Runnable? = null
     private var reconnectAttempts = 0
 
     private val prefs by lazy { applicationContext.getSharedPreferences("resume", MODE_PRIVATE) }
     private val url by lazy { intent.getStringExtra(EXTRA_URL).orEmpty() }
     private val streamTitle by lazy { intent.getStringExtra(EXTRA_TITLE).orEmpty() }
     private val isLive by lazy { intent.getBooleanExtra(EXTRA_LIVE, false) }
+    private val streamType by lazy { intent.getStringExtra(EXTRA_STREAM_TYPE) ?: if (isLive) "live" else "movie" }
+    private val streamId by lazy { intent.getStringExtra(EXTRA_STREAM_ID) }
+    private val episodeId by lazy { intent.getStringExtra(EXTRA_EPISODE_ID) }
+
+    private val progressKey: String by lazy {
+        val sid = streamId?.takeIf { it.isNotBlank() }
+        val eid = episodeId?.takeIf { it.isNotBlank() }
+        when {
+            eid != null && sid != null -> "series:$sid:ep:$eid"
+            eid != null -> "episode:$eid"
+            sid != null -> "$streamType:$sid"
+            else -> url
+        }
+    }
 
     private var forceSoftwareDecoder = false
     private var useHlsFallback = false
@@ -80,10 +95,9 @@ class PlayerActivity : Activity() {
             finish()
             return
         }
-        val sType = intent.getStringExtra(EXTRA_STREAM_TYPE) ?: if (isLive) "live" else "movie"
-        val sId = intent.getStringExtra(EXTRA_STREAM_ID)
+        val sId = streamId
         if (!sId.isNullOrBlank()) {
-            com.minuevaapp.tv.MiTVApp.instance.store.addRecentlyViewed(sType, sId)
+            com.minuevaapp.tv.MiTVApp.instance.store.addRecentlyViewed(streamType, sId)
         }
         // Si la URL apunta explícitamente a un manifiesto .m3u8 (ej. TDTChannels), iniciamos con HLS
         // y mantenemos el fallback automático a ProgressiveMediaSource si fuese un flujo TS crudo.
@@ -184,7 +198,17 @@ class PlayerActivity : Activity() {
         )
         setContentView(root)
 
-        initPlayer(startPositionMs = if (isLive) 0L else prefs.getLong(url, 0L))
+        val initialPosMs = if (isLive) {
+            0L
+        } else {
+            val savedProg = com.minuevaapp.tv.MiTVApp.instance.store.getPlaybackProgress(progressKey)
+            when {
+                savedProg != null -> savedProg.resumePositionMs
+                else -> prefs.getLong(url, 0L)
+            }
+        }
+        initPlayer(startPositionMs = initialPosMs)
+        startPeriodicProgressSaver()
         playerView.requestFocus()
     }
 
@@ -351,8 +375,22 @@ class PlayerActivity : Activity() {
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_READY) {
                             reconnectAttempts = 0
-                        } else if (playbackState == Player.STATE_ENDED && isLive) {
-                            scheduleReconnect(0L, "Corte de emisión")
+                        } else if (playbackState == Player.STATE_ENDED) {
+                            if (isLive) {
+                                scheduleReconnect(0L, "Corte de emisión")
+                            } else {
+                                val dur = p.duration.takeIf { it > 0L && it != C.TIME_UNSET } ?: 0L
+                                if (dur > 0L) {
+                                    com.minuevaapp.tv.MiTVApp.instance.store.savePlaybackProgress(progressKey, dur, dur)
+                                    prefs.edit().putLong(url, 0L).commit()
+                                }
+                            }
+                        }
+                    }
+
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        if (!isPlaying && !isLive) {
+                            saveResumePosition()
                         }
                     }
 
@@ -437,23 +475,58 @@ class PlayerActivity : Activity() {
             name.contains(".sw.")
     }
 
+    private fun startPeriodicProgressSaver() {
+        stopPeriodicProgressSaver()
+        if (isLive) return
+        val task = object : Runnable {
+            override fun run() {
+                if (!isFinishing && !isDestroyed) {
+                    val p = player
+                    if (p != null && p.isPlaying) {
+                        saveResumePosition()
+                    }
+                    mainHandler.postDelayed(this, 6_000L)
+                }
+            }
+        }
+        progressSaveRunnable = task
+        mainHandler.postDelayed(task, 6_000L)
+    }
+
+    private fun stopPeriodicProgressSaver() {
+        progressSaveRunnable?.let { mainHandler.removeCallbacks(it) }
+        progressSaveRunnable = null
+    }
+
     private fun saveResumePosition() {
         player?.let { p ->
             if (!isLive && url.isNotBlank()) {
-                val nearEnd = p.duration > 0 && p.currentPosition > p.duration - 30_000
-                prefs.edit().putLong(url, if (nearEnd) 0L else p.currentPosition).apply()
+                val pos = p.currentPosition.coerceAtLeast(0L)
+                val dur = p.duration.takeIf { it > 0L && it != C.TIME_UNSET } ?: 0L
+                if (pos > 0L || dur > 0L) {
+                    com.minuevaapp.tv.MiTVApp.instance.store.savePlaybackProgress(progressKey, pos, dur)
+                }
+                val nearEnd = dur > 0L && (pos.toFloat() / dur.toFloat()) >= 0.95f
+                prefs.edit().putLong(url, if (nearEnd) 0L else pos).commit()
             }
         }
+    }
+
+    override fun onPause() {
+        saveResumePosition()
+        super.onPause()
     }
 
     override fun onStop() {
         super.onStop()
         cancelPendingReconnect()
+        stopPeriodicProgressSaver()
         saveResumePosition()
         player?.pause()
     }
 
     override fun onDestroy() {
+        stopPeriodicProgressSaver()
         saveResumePosition()
         playerView.player = null
         releasePlayer()
@@ -466,6 +539,7 @@ class PlayerActivity : Activity() {
         private const val EXTRA_LIVE = "live"
         private const val EXTRA_STREAM_TYPE = "stream_type"
         private const val EXTRA_STREAM_ID = "stream_id"
+        private const val EXTRA_EPISODE_ID = "episode_id"
         private const val MAX_RECONNECT_ATTEMPTS = 5
         private const val RECONNECT_BASE_DELAY_MS = 2_500L
 
@@ -475,7 +549,8 @@ class PlayerActivity : Activity() {
             title: String?,
             live: Boolean = false,
             streamType: String? = null,
-            streamId: String? = null
+            streamId: String? = null,
+            episodeId: String? = null,
         ) {
             val resolvedType = streamType ?: if (live) "live" else "movie"
             if (!streamId.isNullOrBlank()) {
@@ -488,6 +563,7 @@ class PlayerActivity : Activity() {
                     .putExtra(EXTRA_LIVE, live)
                     .putExtra(EXTRA_STREAM_TYPE, resolvedType)
                     .putExtra(EXTRA_STREAM_ID, streamId)
+                    .putExtra(EXTRA_EPISODE_ID, episodeId)
             )
         }
     }

@@ -496,9 +496,12 @@ fun PosterCard(
     image: String?,
     subtitle: String? = null,
     isFavorite: Boolean = false,
+    progress: Float = 0f,
     onClick: () -> Unit,
 ) {
     val cardShape = RoundedCornerShape(12.dp)
+    val clampedProgress = progress.coerceIn(0f, 1f)
+    val showProgress = clampedProgress > 0.01f
     Column(
         Modifier
             .width(150.dp)
@@ -554,7 +557,12 @@ fun PosterCard(
                 Box(
                     Modifier
                         .align(Alignment.BottomStart)
-                        .padding(6.dp)
+                        .padding(
+                            start = 6.dp,
+                            end = 6.dp,
+                            top = 6.dp,
+                            bottom = if (showProgress) 9.dp else 6.dp,
+                        )
                         .background(BetisGreenDark.copy(alpha = 0.90f), RoundedCornerShape(6.dp))
                         .border(0.8.dp, GoldPrimary.copy(alpha = 0.55f), RoundedCornerShape(6.dp))
                         .padding(horizontal = 6.dp, vertical = 2.dp)
@@ -566,6 +574,22 @@ fun PosterCard(
                         style = MaterialTheme.typography.labelSmall,
                         color = GoldLight,
                         fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+            if (showProgress) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .align(Alignment.BottomCenter)
+                        .background(Color.Black.copy(alpha = 0.68f))
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth(clampedProgress)
+                            .fillMaxHeight()
+                            .background(GoldLight)
                     )
                 }
             }

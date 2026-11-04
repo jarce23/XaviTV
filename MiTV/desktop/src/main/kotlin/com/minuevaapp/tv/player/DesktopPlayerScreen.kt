@@ -215,6 +215,9 @@ fun DesktopPlayerScreen(
             vlcComponentRef.value?.mediaPlayer()?.controls()?.pause()
         }
         isPlaying = false
+        if (!isLive && resumeKey.isNotEmpty() && currentPosMs > 0L) {
+            appState.store.savePlaybackProgress(resumeKey, currentPosMs, totalDurationMs)
+        }
     }
 
     fun launchExternalPlayer() {
@@ -258,10 +261,12 @@ fun DesktopPlayerScreen(
         }
     }
 
-    // Guardado periódico de progreso VOD y actualización de resolución en segundo plano
+    // Guardado periódico de progreso VOD (cada 5 segundos) y actualización de resolución en segundo plano
     LaunchedEffect(Unit) {
+        var tickCount = 0
         while (true) {
             delay(1000)
+            tickCount++
             val mp = vlcComponentRef.value?.mediaPlayer()
             if (mp != null) {
                 val playingNow = withContext(Dispatchers.IO) {
@@ -286,8 +291,8 @@ fun DesktopPlayerScreen(
                             videoResolutionText = "${dim.width}×${dim.height}"
                         }
                     }
-                    if (!isLive && resumeKey.isNotEmpty() && cur > 5_000L) {
-                        appState.store.saveResumePosition(resumeKey, cur)
+                    if (!isLive && resumeKey.isNotEmpty() && cur > 2_000L && tickCount % 5 == 0) {
+                        appState.store.savePlaybackProgress(resumeKey, cur, totalDurationMs)
                     }
                 }
             }
@@ -385,8 +390,10 @@ fun DesktopPlayerScreen(
 
                                     if (!isLive && !seekApplied && resumeKey.isNotEmpty()) {
                                         seekApplied = true
-                                        val savedPos = appState.store.getResumePosition(resumeKey)
-                                        if (savedPos > 5_000L) {
+                                        val savedProg = appState.store.getPlaybackProgress(resumeKey)
+                                        val savedPos = savedProg?.resumePositionMs
+                                            ?: appState.store.getResumePosition(resumeKey)
+                                        if (savedPos > 0L) {
                                             runCatching { mediaPlayer.controls().setTime(savedPos) }
                                         }
                                     }
@@ -394,6 +401,15 @@ fun DesktopPlayerScreen(
 
                                 override fun paused(mediaPlayer: MediaPlayer) {
                                     isPlaying = false
+                                    if (!isLive && resumeKey.isNotEmpty() && currentPosMs > 0L) {
+                                        appState.store.savePlaybackProgress(resumeKey, currentPosMs, totalDurationMs)
+                                    }
+                                }
+
+                                override fun finished(mediaPlayer: MediaPlayer) {
+                                    if (!isLive && resumeKey.isNotEmpty() && totalDurationMs > 0L) {
+                                        appState.store.savePlaybackProgress(resumeKey, totalDurationMs, totalDurationMs)
+                                    }
                                 }
 
                                 override fun videoOutput(mediaPlayer: MediaPlayer, newCount: Int) {
@@ -497,8 +513,8 @@ fun DesktopPlayerScreen(
             val comp = vlcComponentRef.value
             vlcComponentRef.value = null
             if (comp != null) {
-                if (!isLive && resumeKey.isNotEmpty() && currentPosMs > 5_000L) {
-                    appState.store.saveResumePosition(resumeKey, currentPosMs)
+                if (!isLive && resumeKey.isNotEmpty() && currentPosMs > 0L) {
+                    appState.store.savePlaybackProgress(resumeKey, currentPosMs, totalDurationMs)
                 }
                 Thread {
                     runCatching {

@@ -209,6 +209,7 @@ actual fun NativeVideoPlayer(
     resumeKey: String,
     initialPositionMs: Long,
     onSavePosition: (Long) -> Unit,
+    onSaveProgress: (positionMs: Long, durationMs: Long) -> Unit,
     onClose: () -> Unit
 ) {
     Box(

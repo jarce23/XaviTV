@@ -153,6 +153,7 @@ fun CatalogScreen(
     var favs by remember(type) { mutableStateOf(app.store.favorites(type)) }
     var recentRefresh by remember { mutableIntStateOf(0) }
     val storeRecentVersion by app.store.recentUpdates.collectAsState()
+    val progressMap by app.store.playbackProgressFlow.collectAsState()
     val ctx = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
@@ -420,12 +421,17 @@ fun CatalogScreen(
                                             ) {
                                                 items(recentItems, key = { "rec_row_${it.id}" }) { item ->
                                                     val badge = item.extra?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                                    val itemProg = remember(item.id, type, progressMap, recentRefresh) {
+                                                        val key = if (type == "movie") "movie:${item.id}" else "series_cover:${item.id}"
+                                                        app.store.getPlaybackProgress(key)?.progressFraction ?: 0f
+                                                    }
                                                     Box(Modifier.width(115.dp)) {
                                                         PosterCard(
                                                             title = item.name,
                                                             image = item.image,
                                                             subtitle = badge,
                                                             isFavorite = item.id in favs,
+                                                            progress = itemProg,
                                                         ) {
                                                             app.store.addRecentlyViewed(type, item.id)
                                                             recentRefresh++
@@ -439,11 +445,16 @@ fun CatalogScreen(
                                 }
                                 items(shown, key = { it.id }) { item ->
                                     val badge = item.extra?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                    val itemProg = remember(item.id, type, progressMap, recentRefresh) {
+                                        val key = if (type == "movie") "movie:${item.id}" else "series_cover:${item.id}"
+                                        app.store.getPlaybackProgress(key)?.progressFraction ?: 0f
+                                    }
                                     PosterCard(
                                         title = item.name,
                                         image = item.image,
                                         subtitle = badge,
                                         isFavorite = item.id in favs,
+                                        progress = itemProg,
                                     ) {
                                         app.store.addRecentlyViewed(type, item.id)
                                         recentRefresh++

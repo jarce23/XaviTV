@@ -496,21 +496,38 @@ fun IosXaviTVApp() {
                         navigate(IosScreen.SeriesDetail(series))
                     }
                 )
-                is IosScreen.Player -> NativeVideoPlayer(
-                    url = current.url,
-                    title = current.title,
-                    subtitle = current.subtitle,
-                    isLive = current.isLive,
-                    resumeKey = current.resumeKey,
-                    initialPositionMs = if (current.isLive || current.resumeKey.isEmpty()) 0L
-                    else appState.store.getResumePosition(current.resumeKey),
-                    onSavePosition = { posMs ->
-                        if (!current.isLive && current.resumeKey.isNotEmpty() && posMs > 5_000L) {
-                            appState.store.saveResumePosition(current.resumeKey, posMs)
+                is IosScreen.Player -> {
+                    val savedProg = remember(current.resumeKey) {
+                        if (current.isLive || current.resumeKey.isEmpty()) null
+                        else appState.store.getPlaybackProgress(current.resumeKey)
+                    }
+                    val startPosMs = remember(current.resumeKey) {
+                        when {
+                            current.isLive || current.resumeKey.isEmpty() -> 0L
+                            savedProg != null -> savedProg.resumePositionMs
+                            else -> appState.store.getResumePosition(current.resumeKey)
                         }
-                    },
-                    onClose = { popBack() }
-                )
+                    }
+                    NativeVideoPlayer(
+                        url = current.url,
+                        title = current.title,
+                        subtitle = current.subtitle,
+                        isLive = current.isLive,
+                        resumeKey = current.resumeKey,
+                        initialPositionMs = startPosMs,
+                        onSavePosition = { posMs ->
+                            if (!current.isLive && current.resumeKey.isNotEmpty() && posMs > 5_000L) {
+                                appState.store.saveResumePosition(current.resumeKey, posMs)
+                            }
+                        },
+                        onSaveProgress = { posMs, durMs ->
+                            if (!current.isLive && current.resumeKey.isNotEmpty() && posMs > 2_000L) {
+                                appState.store.savePlaybackProgress(current.resumeKey, posMs, durMs)
+                            }
+                        },
+                        onClose = { popBack() }
+                    )
+                }
             }
         }
     }
@@ -732,10 +749,12 @@ fun IosPosterCard(
     image: String?,
     subtitle: String? = null,
     isFavorite: Boolean = false,
+    progress: Float = 0f,
     modifier: Modifier = Modifier.width(138.dp),
     onClick: () -> Unit
 ) {
     val shape = RoundedCornerShape(12.dp)
+    val clampedProgress = progress.coerceIn(0f, 1f)
     Column(
         modifier
             .clip(shape)
@@ -781,7 +800,7 @@ fun IosPosterCard(
                 Box(
                     Modifier
                         .align(Alignment.BottomStart)
-                        .padding(6.dp)
+                        .padding(start = 6.dp, end = 6.dp, bottom = if (clampedProgress > 0.01f) 10.dp else 6.dp)
                         .background(BetisGreenDark.copy(alpha = 0.92f), RoundedCornerShape(6.dp))
                         .border(0.8.dp, GoldPrimary.copy(alpha = 0.6f), RoundedCornerShape(6.dp))
                         .padding(horizontal = 6.dp, vertical = 2.dp)
@@ -793,6 +812,22 @@ fun IosPosterCard(
                         fontSize = 10.sp,
                         color = GoldLight,
                         fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+            if (clampedProgress > 0.01f) {
+                Box(
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .background(Color.Black.copy(alpha = 0.65f))
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth(clampedProgress)
+                            .fillMaxHeight()
+                            .background(GoldAccent)
                     )
                 }
             }
@@ -1777,6 +1812,7 @@ fun IosCatalogScreen(
     val catalogVersion by appState.catalogRefreshVersion.collectAsState()
     val syncState by appState.m3uSyncState.collectAsState()
     val isRefreshing by appState.isRefreshing.collectAsState()
+    val progressMap by store.playbackProgressFlow.collectAsState()
 
     var categories by remember { mutableStateOf<List<Category>>(emptyList()) }
     var selectedCategory by remember(kind) { mutableStateOf(appState.getSelectedCategory(kind)) }
@@ -2416,6 +2452,7 @@ fun IosCatalogScreen(
                                                                 title = m.name,
                                                                 image = m.icon,
                                                                 subtitle = m.rating,
+                                                                progress = progressMap["vod:${m.streamId}"]?.progressFraction ?: 0f,
                                                                 modifier = Modifier.width(115.dp),
                                                                 onClick = {
                                                                     store.addRecentlyViewed("vod", m.streamId)
@@ -2449,6 +2486,7 @@ fun IosCatalogScreen(
                                                     image = m.icon,
                                                     subtitle = m.rating,
                                                     isFavorite = favVod.contains(m.streamId),
+                                                    progress = progressMap["vod:${m.streamId}"]?.progressFraction ?: 0f,
                                                     modifier = Modifier.fillMaxWidth(),
                                                     onClick = {
                                                         store.addRecentlyViewed("vod", m.streamId)
@@ -2502,6 +2540,7 @@ fun IosCatalogScreen(
                                                                 title = s.name,
                                                                 image = s.cover,
                                                                 subtitle = s.rating,
+                                                                progress = progressMap["series_cover:${s.seriesId}"]?.progressFraction ?: 0f,
                                                                 modifier = Modifier.width(115.dp),
                                                                 onClick = {
                                                                     store.addRecentlyViewed("series", s.seriesId)
@@ -2535,6 +2574,7 @@ fun IosCatalogScreen(
                                                     image = s.cover,
                                                     subtitle = s.rating,
                                                     isFavorite = favSeries.contains(s.seriesId),
+                                                    progress = progressMap["series_cover:${s.seriesId}"]?.progressFraction ?: 0f,
                                                     modifier = Modifier.fillMaxWidth(),
                                                     onClick = {
                                                         store.addRecentlyViewed("series", s.seriesId)
@@ -2597,6 +2637,7 @@ fun IosMovieDetailScreen(
     val appState = LocalSharedAppState.current
     val repo = remember { appState.repo() }
     val store = remember { appState.store }
+    val progressMap by store.playbackProgressFlow.collectAsState()
     var info by remember { mutableStateOf<VodInfoResponse?>(null) }
 
     LaunchedEffect(movie.streamId) {
@@ -2606,6 +2647,9 @@ fun IosMovieDetailScreen(
     val ext = info?.movieData?.extension ?: movie.extension ?: "mp4"
     val streamUrl = movie.directUrl?.takeIf { it.isNotBlank() } ?: repo.movieUrl(movie.streamId, ext)
     val resumeKey = "vod:${movie.streamId}"
+    val movieProg = progressMap[resumeKey]
+    val progFraction = movieProg?.progressFraction ?: 0f
+    val resumeMs = movieProg?.resumePositionMs ?: 0L
 
     IosAppScaffold(title = movie.name ?: "Película", onBack = onBack) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -2617,16 +2661,36 @@ fun IosMovieDetailScreen(
                         .padding(24.dp),
                     horizontalArrangement = Arrangement.spacedBy(24.dp)
                 ) {
-                    IosNetworkImage(
-                        url = info?.info?.image ?: movie.icon,
-                        contentDescription = movie.name,
-                        contentScale = ContentScale.Crop,
-                        maxDimension = 360,
-                        modifier = Modifier
+                    Box(
+                        Modifier
                             .width(240.dp)
                             .aspectRatio(2f / 3f)
                             .clip(RoundedCornerShape(16.dp))
-                    )
+                    ) {
+                        IosNetworkImage(
+                            url = info?.info?.image ?: movie.icon,
+                            contentDescription = movie.name,
+                            contentScale = ContentScale.Crop,
+                            maxDimension = 360,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        if (progFraction > 0.01f) {
+                            Box(
+                                Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .fillMaxWidth()
+                                    .height(4.dp)
+                                    .background(Color.Black.copy(alpha = 0.65f))
+                            ) {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth(progFraction.coerceIn(0f, 1f))
+                                        .fillMaxHeight()
+                                        .background(GoldAccent)
+                                )
+                            }
+                        }
+                    }
                     Column(
                         Modifier
                             .weight(1f)
@@ -2656,7 +2720,26 @@ fun IosMovieDetailScreen(
                             ) {
                                 Icon(Icons.Default.PlayArrow, contentDescription = null)
                                 Spacer(Modifier.width(6.dp))
-                                Text("Reproducir con AVPlayer (PiP)", fontWeight = FontWeight.ExtraBold)
+                                Text(
+                                    if (resumeMs > 0L) "Continuar (${resumeMs / 60000} min)" else "Reproducir con AVPlayer (PiP)",
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+                            if (resumeMs > 0L) {
+                                OutlinedButton(
+                                    onClick = {
+                                        store.savePlaybackProgress(resumeKey, 0L, movieProg?.durationMs ?: 0L)
+                                        onPlay(streamUrl, movie.name ?: "Película", resumeKey)
+                                    },
+                                    border = BorderStroke(1.dp, GoldAccent),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldChampagne),
+                                    modifier = Modifier.height(48.dp)
+                                ) {
+                                    Icon(Icons.Default.Refresh, contentDescription = null, tint = GoldAccent)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Desde el principio")
+                                }
                             }
                             OutlinedButton(
                                 onClick = { store.toggleFavorite("vod", movie.streamId) },
@@ -2686,6 +2769,22 @@ fun IosMovieDetailScreen(
                         fontWeight = FontWeight.ExtraBold,
                         color = TextPureWhite
                     )
+                    if (progFraction > 0.01f) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(Color.Black.copy(alpha = 0.65f))
+                        ) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth(progFraction.coerceIn(0f, 1f))
+                                    .fillMaxHeight()
+                                    .background(GoldAccent)
+                            )
+                        }
+                    }
                     Text(
                         info?.info?.plot ?: "Sin sinopsis disponible.",
                         fontSize = 14.sp,
@@ -2699,7 +2798,26 @@ fun IosMovieDetailScreen(
                     ) {
                         Icon(Icons.Default.PlayArrow, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
-                        Text("Reproducir con AVPlayer", fontWeight = FontWeight.ExtraBold)
+                        Text(
+                            if (resumeMs > 0L) "Continuar (${resumeMs / 60000} min)" else "Reproducir con AVPlayer",
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+                    if (resumeMs > 0L) {
+                        OutlinedButton(
+                            onClick = {
+                                store.savePlaybackProgress(resumeKey, 0L, movieProg?.durationMs ?: 0L)
+                                onPlay(streamUrl, movie.name ?: "Película", resumeKey)
+                            },
+                            border = BorderStroke(1.dp, GoldAccent),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldChampagne),
+                            modifier = Modifier.fillMaxWidth().height(46.dp)
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = null, tint = GoldAccent)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Desde el principio")
+                        }
                     }
                     OutlinedButton(
                         onClick = { store.toggleFavorite("vod", movie.streamId) },
@@ -2726,6 +2844,8 @@ fun IosSeriesDetailScreen(
 ) {
     val appState = LocalSharedAppState.current
     val repo = remember { appState.repo() }
+    val store = remember { appState.store }
+    val progressMap by store.playbackProgressFlow.collectAsState()
     var episodesBySeason by remember { mutableStateOf<Map<String, List<Episode>>>(emptyMap()) }
     var selectedSeason by remember { mutableStateOf<String?>(null) }
 
@@ -2771,7 +2891,11 @@ fun IosSeriesDetailScreen(
                     items(episodes, key = { it.id }) { ep ->
                         val ext = ep.extension ?: "mp4"
                         val url = ep.directUrl?.takeIf { it.isNotBlank() } ?: repo.episodeUrl(ep.id, ext)
-                        Row(
+                        val resumeKey = "series:${series.seriesId}:ep:${ep.id}"
+                        val epProg = progressMap["series:${ep.id}"]?.progressFraction
+                            ?: progressMap[resumeKey]?.progressFraction
+                            ?: 0f
+                        Column(
                             Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
@@ -2782,21 +2906,41 @@ fun IosSeriesDetailScreen(
                                         url,
                                         "${series.name} · T${selectedSeason}E${ep.episodeNum ?: ""}",
                                         ep.title ?: "",
-                                        "series:${ep.id}"
+                                        resumeKey
                                     )
                                 }
-                                .padding(14.dp),
-                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = GoldAccent)
-                            Spacer(Modifier.width(10.dp))
-                            Text(
-                                "${ep.episodeNum ?: "-"}. ${ep.title ?: "Episodio"}",
-                                color = TextPureWhite,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.PlayArrow, contentDescription = null, tint = GoldAccent)
+                                Spacer(Modifier.width(10.dp))
+                                Text(
+                                    "${ep.episodeNum ?: "-"}. ${ep.title ?: "Episodio"}",
+                                    color = TextPureWhite,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (epProg > 0.01f) {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .height(4.dp)
+                                        .background(Color.Black.copy(alpha = 0.65f))
+                                ) {
+                                    Box(
+                                        Modifier
+                                            .fillMaxWidth(epProg.coerceIn(0f, 1f))
+                                            .fillMaxHeight()
+                                            .background(GoldAccent)
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -2814,6 +2958,8 @@ fun IosSearchScreen(
 ) {
     val appState = LocalSharedAppState.current
     val repo = remember { appState.repo() }
+    val store = remember { appState.store }
+    val progressMap by store.playbackProgressFlow.collectAsState()
     val catalogVersion by appState.catalogRefreshVersion.collectAsState()
     var query by remember { mutableStateOf("") }
     var liveAll by remember { mutableStateOf<List<LiveStream>>(emptyList()) }
@@ -2878,6 +3024,7 @@ fun IosSearchScreen(
                                     title = m.name,
                                     image = m.icon,
                                     subtitle = m.rating,
+                                    progress = progressMap["vod:${m.streamId}"]?.progressFraction ?: 0f,
                                     onClick = { onOpenMovie(m) }
                                 )
                             }
@@ -2894,6 +3041,7 @@ fun IosSearchScreen(
                                     title = s.name,
                                     image = s.cover,
                                     subtitle = s.rating,
+                                    progress = progressMap["series_cover:${s.seriesId}"]?.progressFraction ?: 0f,
                                     onClick = { onOpenSeries(s) }
                                 )
                             }

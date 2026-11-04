@@ -4,7 +4,6 @@ import android.content.Context
 import android.util.Base64
 import com.google.gson.Gson
 import com.google.gson.JsonElement
-import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -225,11 +224,162 @@ class PlaylistStore(context: Context) {
         }
     }
 
+    private val progressMap: MutableMap<String, PlaybackProgress> = readPlaybackProgressFromDisk().toMutableMap()
+    private val _playbackProgressFlow = MutableStateFlow<Map<String, PlaybackProgress>>(progressMap.toMap())
+    val playbackProgressFlow: StateFlow<Map<String, PlaybackProgress>> = _playbackProgressFlow.asStateFlow()
+
+    private fun readPlaybackProgressFromDisk(): Map<String, PlaybackProgress> {
+        val json = prefs.getString(KEY_PLAYBACK_PROGRESS, null) ?: return emptyMap()
+        return runCatching {
+            val entries = gson.fromJson(json, Array<PlaybackProgressEntry>::class.java).orEmpty()
+            entries.filter { it.id.isNotBlank() }.associate { entry ->
+                entry.id to PlaybackProgress(
+                    positionMs = entry.positionMs,
+                    durationMs = entry.durationMs,
+                    updatedAt = entry.updatedAt,
+                )
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    @Synchronized
+    private fun persistPlaybackProgressSync() {
+        val entries = progressMap.entries.map { (k, v) ->
+            PlaybackProgressEntry(
+                id = k,
+                positionMs = v.positionMs,
+                durationMs = v.durationMs,
+                updatedAt = v.updatedAt,
+            )
+        }.toTypedArray()
+        prefs.edit().putString(KEY_PLAYBACK_PROGRESS, gson.toJson(entries)).commit()
+        _playbackProgressFlow.value = progressMap.toMap()
+        _recentUpdates.value++
+    }
+
+    @Synchronized
+    fun savePlaybackProgress(id: String, positionMs: Long, durationMs: Long) {
+        val cleanId = id.trim()
+        if (cleanId.isEmpty() || positionMs < 0L) return
+
+        // Si ambos son 0L, significa reseteo explícito ("Desde el principio")
+        if (positionMs == 0L && durationMs == 0L) {
+            removeProgressKeys(cleanId)
+            persistPlaybackProgressSync()
+            return
+        }
+
+        val existing = getPlaybackProgress(cleanId)
+        val effectiveDuration = when {
+            durationMs > 0L -> durationMs
+            existing != null && existing.durationMs > 0L -> existing.durationMs
+            else -> 0L
+        }
+        if (effectiveDuration <= 0L && positionMs <= 0L) return
+
+        val rawFraction = if (effectiveDuration > 0L) {
+            (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+
+        // Si ya estaba completado y apenas empieza a reproducirse (< 3s), no machacar la barra llena todavía
+        if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
+            return
+        }
+
+        // Si supera el 95% (>= 0.95f), se marca como completado manteniendo la barra llena (positionMs = durationMs)
+        // y PlaybackProgress.resumePositionMs devolverá 0L en futuras reproducciones.
+        val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
+        val progress = PlaybackProgress(
+            positionMs = finalPos,
+            durationMs = effectiveDuration,
+            updatedAt = System.currentTimeMillis(),
+        )
+
+        storeProgressUnderAliases(cleanId, progress)
+        persistPlaybackProgressSync()
+    }
+
+    private fun removeProgressKeys(cleanId: String) {
+        progressMap.remove(cleanId)
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val epId = cleanId.substringAfter(":ep:")
+            progressMap.remove("episode:$epId")
+            progressMap.remove("series:$epId")
+            progressMap.remove(epId)
+        } else if (cleanId.contains(':')) {
+            val raw = cleanId.substringAfterLast(':')
+            progressMap.remove("movie:$raw")
+            progressMap.remove("vod:$raw")
+            progressMap.remove("episode:$raw")
+            progressMap.remove("series:$raw")
+            progressMap.remove(raw)
+        } else {
+            progressMap.remove("movie:$cleanId")
+            progressMap.remove("vod:$cleanId")
+            progressMap.remove("episode:$cleanId")
+            progressMap.remove("series:$cleanId")
+        }
+    }
+
+    private fun storeProgressUnderAliases(cleanId: String, progress: PlaybackProgress) {
+        progressMap[cleanId] = progress
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val seriesId = cleanId.substringAfter("series:").substringBefore(":ep:")
+            val epId = cleanId.substringAfter(":ep:")
+            if (epId.isNotBlank()) {
+                progressMap["episode:$epId"] = progress
+                progressMap["series:$epId"] = progress
+                progressMap[epId] = progress
+            }
+            if (seriesId.isNotBlank()) {
+                progressMap["series_cover:$seriesId"] = progress
+            }
+        } else if (cleanId.startsWith("movie:") || cleanId.startsWith("vod:")) {
+            val raw = cleanId.substringAfter(':')
+            if (raw.isNotBlank()) {
+                progressMap["movie:$raw"] = progress
+                progressMap["vod:$raw"] = progress
+                progressMap[raw] = progress
+            }
+        } else if (cleanId.startsWith("episode:") || cleanId.startsWith("series:")) {
+            val raw = cleanId.substringAfter(':')
+            if (raw.isNotBlank()) {
+                progressMap["episode:$raw"] = progress
+                progressMap["series:$raw"] = progress
+                progressMap[raw] = progress
+            }
+        } else {
+            progressMap["movie:$cleanId"] = progress
+            progressMap["vod:$cleanId"] = progress
+        }
+    }
+
+    @Synchronized
+    fun getPlaybackProgress(id: String): PlaybackProgress? {
+        val cleanId = id.trim()
+        if (cleanId.isEmpty()) return null
+        progressMap[cleanId]?.let { return it }
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val epId = cleanId.substringAfter(":ep:")
+            return progressMap["episode:$epId"] ?: progressMap["series:$epId"] ?: progressMap[epId]
+        }
+        val raw = cleanId.substringAfterLast(':')
+        return progressMap["movie:$cleanId"]
+            ?: progressMap["vod:$cleanId"]
+            ?: progressMap["episode:$cleanId"]
+            ?: progressMap["series:$cleanId"]
+            ?: progressMap["series_cover:$cleanId"]
+            ?: progressMap[raw]
+    }
+
     companion object {
         private const val KEY_DEFAULT_TDT_SEEDED = "default_tdt_seeded_v1"
         private const val KEY_LIST = "list"
         private const val KEY_LIST_BACKUP = "list_backup"
         private const val KEY_ACTIVE = "active"
+        private const val KEY_PLAYBACK_PROGRESS = "playback_progress_v1"
         const val DEFAULT_TDT_URL = "https://www.tdtchannels.com/lists/tvradio.m3u"
 
         val defaultTdtPlaylist = Playlist(

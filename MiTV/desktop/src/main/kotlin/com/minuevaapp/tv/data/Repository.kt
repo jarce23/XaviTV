@@ -9,6 +9,9 @@ import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -29,6 +32,7 @@ private data class DesktopStorageData(
     var recentlyViewed: MutableMap<String, MutableList<String>> = mutableMapOf(),
     var selectedCategories: MutableMap<String, String> = mutableMapOf(),
     var scrollPositions: MutableMap<String, List<Int>> = mutableMapOf(),
+    var playbackProgress: MutableMap<String, PlaybackProgress> = mutableMapOf(),
 )
 
 data class RefreshResult(
@@ -72,12 +76,17 @@ class PlaylistStore {
     var stateVersion by mutableIntStateOf(0)
         private set
 
+    private val _playbackProgressFlow = MutableStateFlow<Map<String, PlaybackProgress>>(emptyMap())
+    val playbackProgressFlow: StateFlow<Map<String, PlaybackProgress>> = _playbackProgressFlow.asStateFlow()
+
     private fun notifyStateChanged() {
         stateVersion++
+        _playbackProgressFlow.value = data.playbackProgress.toMap()
     }
 
     init {
         loadFromDiskSync()
+        _playbackProgressFlow.value = data.playbackProgress.toMap()
     }
 
     private fun parseStore(file: File): DesktopStorageData? {
@@ -98,6 +107,7 @@ class PlaylistStore {
         recentlyViewed = d.recentlyViewed ?: mutableMapOf(),
         selectedCategories = d.selectedCategories ?: mutableMapOf(),
         scrollPositions = d.scrollPositions ?: mutableMapOf(),
+        playbackProgress = d.playbackProgress ?: mutableMapOf(),
     )
 
     /** Lectura síncrona del disco. Se llama en el constructor, antes de mostrar ninguna pantalla. */
@@ -281,12 +291,132 @@ class PlaylistStore {
     }
 
     @Synchronized
-    fun getResumePosition(url: String): Long = data.resumePositions[url] ?: 0L
+    fun getResumePosition(url: String): Long {
+        getPlaybackProgress(url)?.let { return it.resumePositionMs }
+        return data.resumePositions[url] ?: 0L
+    }
 
     @Synchronized
     fun saveResumePosition(url: String, posMs: Long) {
         data.resumePositions[url] = posMs
-        persistAsync()
+        val existingDur = getPlaybackProgress(url)?.durationMs ?: 0L
+        savePlaybackProgress(url, posMs, existingDur)
+    }
+
+    @Synchronized
+    fun savePlaybackProgress(id: String, positionMs: Long, durationMs: Long) {
+        val cleanId = id.trim()
+        if (cleanId.isEmpty() || positionMs < 0L) return
+
+        if (positionMs == 0L && durationMs == 0L) {
+            removeProgressKeys(cleanId)
+            data.resumePositions.remove(cleanId)
+            notifyStateChanged()
+            persistSync()
+            return
+        }
+
+        val existing = getPlaybackProgress(cleanId)
+        val effectiveDuration = when {
+            durationMs > 0L -> durationMs
+            existing != null && existing.durationMs > 0L -> existing.durationMs
+            else -> 0L
+        }
+        if (effectiveDuration <= 0L && positionMs <= 0L) return
+
+        val rawFraction = if (effectiveDuration > 0L) {
+            (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+
+        if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
+            return
+        }
+
+        val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
+        val progress = PlaybackProgress(
+            positionMs = finalPos,
+            durationMs = effectiveDuration,
+            updatedAt = System.currentTimeMillis(),
+        )
+        storeProgressUnderAliases(cleanId, progress)
+        data.resumePositions[cleanId] = progress.resumePositionMs
+        notifyStateChanged()
+        persistSync()
+    }
+
+    private fun removeProgressKeys(cleanId: String) {
+        data.playbackProgress.remove(cleanId)
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val epId = cleanId.substringAfter(":ep:")
+            data.playbackProgress.remove("episode:$epId")
+            data.playbackProgress.remove("series:$epId")
+            data.playbackProgress.remove(epId)
+        } else if (cleanId.contains(':')) {
+            val raw = cleanId.substringAfterLast(':')
+            data.playbackProgress.remove("movie:$raw")
+            data.playbackProgress.remove("vod:$raw")
+            data.playbackProgress.remove("episode:$raw")
+            data.playbackProgress.remove("series:$raw")
+            data.playbackProgress.remove(raw)
+        } else {
+            data.playbackProgress.remove("movie:$cleanId")
+            data.playbackProgress.remove("vod:$cleanId")
+            data.playbackProgress.remove("episode:$cleanId")
+            data.playbackProgress.remove("series:$cleanId")
+        }
+    }
+
+    private fun storeProgressUnderAliases(cleanId: String, progress: PlaybackProgress) {
+        data.playbackProgress[cleanId] = progress
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val seriesId = cleanId.substringAfter("series:").substringBefore(":ep:")
+            val epId = cleanId.substringAfter(":ep:")
+            if (epId.isNotBlank()) {
+                data.playbackProgress["episode:$epId"] = progress
+                data.playbackProgress["series:$epId"] = progress
+                data.playbackProgress[epId] = progress
+            }
+            if (seriesId.isNotBlank()) {
+                data.playbackProgress["series_cover:$seriesId"] = progress
+            }
+        } else if (cleanId.startsWith("movie:") || cleanId.startsWith("vod:")) {
+            val raw = cleanId.substringAfter(':')
+            if (raw.isNotBlank()) {
+                data.playbackProgress["movie:$raw"] = progress
+                data.playbackProgress["vod:$raw"] = progress
+                data.playbackProgress[raw] = progress
+            }
+        } else if (cleanId.startsWith("episode:") || cleanId.startsWith("series:")) {
+            val raw = cleanId.substringAfter(':')
+            if (raw.isNotBlank()) {
+                data.playbackProgress["episode:$raw"] = progress
+                data.playbackProgress["series:$raw"] = progress
+                data.playbackProgress[raw] = progress
+            }
+        } else {
+            data.playbackProgress["movie:$cleanId"] = progress
+            data.playbackProgress["vod:$cleanId"] = progress
+        }
+    }
+
+    @Synchronized
+    fun getPlaybackProgress(id: String): PlaybackProgress? {
+        val cleanId = id.trim()
+        if (cleanId.isEmpty()) return null
+        data.playbackProgress[cleanId]?.let { return it }
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val epId = cleanId.substringAfter(":ep:")
+            return data.playbackProgress["episode:$epId"] ?: data.playbackProgress["series:$epId"] ?: data.playbackProgress[epId]
+        }
+        val raw = cleanId.substringAfterLast(':')
+        return data.playbackProgress["movie:$cleanId"]
+            ?: data.playbackProgress["vod:$cleanId"]
+            ?: data.playbackProgress["episode:$cleanId"]
+            ?: data.playbackProgress["series:$cleanId"]
+            ?: data.playbackProgress["series_cover:$cleanId"]
+            ?: data.playbackProgress[raw]
     }
 
     @Synchronized

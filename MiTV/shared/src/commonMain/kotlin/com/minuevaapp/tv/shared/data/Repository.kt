@@ -5,6 +5,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.statement.bodyAsText
+import io.ktor.util.date.getTimeMillis
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -65,8 +66,12 @@ class PlaylistStore {
     private var writeBlocked: Boolean = false
     private var data: StoredAppState = loadState()
 
+    private val _playbackProgressFlow = MutableStateFlow<Map<String, PlaybackProgress>>(data.playbackProgress.toMap())
+    val playbackProgressFlow: StateFlow<Map<String, PlaybackProgress>> = _playbackProgressFlow.asStateFlow()
+
     init {
         ensureDefaultPlaylistInjected()
+        _playbackProgressFlow.value = data.playbackProgress.toMap()
     }
 
     private fun loadState(): StoredAppState {
@@ -185,11 +190,129 @@ class PlaylistStore {
         persist()
     }
 
-    fun getResumePosition(key: String): Long = data.resumePositions[key] ?: 0L
+    fun getResumePosition(key: String): Long {
+        getPlaybackProgress(key)?.let { return it.resumePositionMs }
+        return data.resumePositions[key] ?: 0L
+    }
 
     fun saveResumePosition(key: String, posMs: Long) {
         data.resumePositions[key] = posMs
+        val existingDur = getPlaybackProgress(key)?.durationMs ?: 0L
+        savePlaybackProgress(key, posMs, existingDur)
+    }
+
+    fun savePlaybackProgress(id: String, positionMs: Long, durationMs: Long) {
+        val cleanId = id.trim()
+        if (cleanId.isEmpty() || positionMs < 0L) return
+
+        if (positionMs == 0L && durationMs == 0L) {
+            removeProgressKeys(cleanId)
+            data.resumePositions.remove(cleanId)
+            _playbackProgressFlow.value = data.playbackProgress.toMap()
+            persist()
+            return
+        }
+
+        val existing = getPlaybackProgress(cleanId)
+        val effectiveDuration = when {
+            durationMs > 0L -> durationMs
+            existing != null && existing.durationMs > 0L -> existing.durationMs
+            else -> 0L
+        }
+        if (effectiveDuration <= 0L && positionMs <= 0L) return
+
+        val rawFraction = if (effectiveDuration > 0L) {
+            (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+
+        if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
+            return
+        }
+
+        val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
+        val progress = PlaybackProgress(
+            positionMs = finalPos,
+            durationMs = effectiveDuration,
+            updatedAt = getTimeMillis()
+        )
+        storeProgressUnderAliases(cleanId, progress)
+        data.resumePositions[cleanId] = progress.resumePositionMs
+        _playbackProgressFlow.value = data.playbackProgress.toMap()
         persist()
+    }
+
+    private fun removeProgressKeys(cleanId: String) {
+        data.playbackProgress.remove(cleanId)
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val epId = cleanId.substringAfter(":ep:")
+            data.playbackProgress.remove("episode:$epId")
+            data.playbackProgress.remove("series:$epId")
+            data.playbackProgress.remove(epId)
+        } else if (cleanId.contains(':')) {
+            val raw = cleanId.substringAfterLast(':')
+            data.playbackProgress.remove("movie:$raw")
+            data.playbackProgress.remove("vod:$raw")
+            data.playbackProgress.remove("episode:$raw")
+            data.playbackProgress.remove("series:$raw")
+            data.playbackProgress.remove(raw)
+        } else {
+            data.playbackProgress.remove("movie:$cleanId")
+            data.playbackProgress.remove("vod:$cleanId")
+            data.playbackProgress.remove("episode:$cleanId")
+            data.playbackProgress.remove("series:$cleanId")
+        }
+    }
+
+    private fun storeProgressUnderAliases(cleanId: String, progress: PlaybackProgress) {
+        data.playbackProgress[cleanId] = progress
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val seriesId = cleanId.substringAfter("series:").substringBefore(":ep:")
+            val epId = cleanId.substringAfter(":ep:")
+            if (epId.isNotBlank()) {
+                data.playbackProgress["episode:$epId"] = progress
+                data.playbackProgress["series:$epId"] = progress
+                data.playbackProgress[epId] = progress
+            }
+            if (seriesId.isNotBlank()) {
+                data.playbackProgress["series_cover:$seriesId"] = progress
+            }
+        } else if (cleanId.startsWith("movie:") || cleanId.startsWith("vod:")) {
+            val raw = cleanId.substringAfter(':')
+            if (raw.isNotBlank()) {
+                data.playbackProgress["movie:$raw"] = progress
+                data.playbackProgress["vod:$raw"] = progress
+                data.playbackProgress[raw] = progress
+            }
+        } else if (cleanId.startsWith("episode:") || cleanId.startsWith("series:")) {
+            val raw = cleanId.substringAfter(':')
+            if (raw.isNotBlank()) {
+                data.playbackProgress["episode:$raw"] = progress
+                data.playbackProgress["series:$raw"] = progress
+                data.playbackProgress[raw] = progress
+            }
+        } else {
+            data.playbackProgress["movie:$cleanId"] = progress
+            data.playbackProgress["vod:$cleanId"] = progress
+        }
+    }
+
+    fun getPlaybackProgress(id: String): PlaybackProgress? {
+        val cleanId = id.trim()
+        if (cleanId.isEmpty()) return null
+        data.playbackProgress[cleanId]?.let { return it }
+        if (cleanId.startsWith("series:") && cleanId.contains(":ep:")) {
+            val epId = cleanId.substringAfter(":ep:")
+            return data.playbackProgress["episode:$epId"] ?: data.playbackProgress["series:$epId"] ?: data.playbackProgress[epId]
+        }
+        val raw = cleanId.substringAfterLast(':')
+        return data.playbackProgress["movie:$cleanId"]
+            ?: data.playbackProgress["vod:$cleanId"]
+            ?: data.playbackProgress["episode:$cleanId"]
+            ?: data.playbackProgress["series:$cleanId"]
+            ?: data.playbackProgress["series_cover:$cleanId"]
+            ?: data.playbackProgress[raw]
     }
 
     fun getRecentlyViewed(type: String): List<String> =

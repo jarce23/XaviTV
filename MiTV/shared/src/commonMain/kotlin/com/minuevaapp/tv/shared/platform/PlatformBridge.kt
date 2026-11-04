@@ -47,6 +47,7 @@ expect fun NativeVideoPlayer(
     resumeKey: String = "",
     initialPositionMs: Long = 0L,
     onSavePosition: (Long) -> Unit = {},
+    onSaveProgress: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
     onClose: () -> Unit
 )
 

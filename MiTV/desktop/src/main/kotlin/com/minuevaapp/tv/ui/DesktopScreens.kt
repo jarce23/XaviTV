@@ -988,6 +988,7 @@ fun CatalogScreen(
     val appState = LocalAppState.current
     val repo = remember(appState.store.stateVersion) { appState.repo() }
     val store = remember { appState.store }
+    val progressMap by store.playbackProgressFlow.collectAsState()
 
     val kindKey = when (kind) {
         CatalogKind.LIVE -> "live"
@@ -1319,6 +1320,9 @@ fun CatalogScreen(
                                                     contentPadding = PaddingValues(vertical = 4.dp)
                                                 ) {
                                                     items(recentMovieItems, key = { "rec_mov_${it.streamId}" }) { m ->
+                                                        val movProg = remember(m.streamId, progressMap) {
+                                                            store.getPlaybackProgress("vod:${m.streamId}")?.progressFraction ?: 0f
+                                                        }
                                                         Box(Modifier.width(130.dp)) {
                                                             PosterCard(
                                                                 title = m.name ?: "Película",
@@ -1326,6 +1330,7 @@ fun CatalogScreen(
                                                                 subtitle = m.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
                                                                     ?: m.extension?.uppercase(),
                                                                 isFavorite = favVodIds.contains(m.streamId),
+                                                                progress = movProg,
                                                                 onClick = {
                                                                     store.addRecentlyViewed("movie", m.streamId)
                                                                     favRefresh++
@@ -1342,12 +1347,16 @@ fun CatalogScreen(
                                         filteredMovieItems,
                                         key = { it.streamId }
                                     ) { m ->
+                                        val movProg = remember(m.streamId, progressMap) {
+                                            store.getPlaybackProgress("vod:${m.streamId}")?.progressFraction ?: 0f
+                                        }
                                         PosterCard(
                                             title = m.name ?: "Película",
                                             image = m.icon,
                                             subtitle = m.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
                                                 ?: m.extension?.uppercase(),
                                             isFavorite = favVodIds.contains(m.streamId),
+                                            progress = movProg,
                                             onClick = {
                                                 store.addRecentlyViewed("movie", m.streamId)
                                                 favRefresh++
@@ -1387,6 +1396,9 @@ fun CatalogScreen(
                                                     contentPadding = PaddingValues(vertical = 4.dp)
                                                 ) {
                                                     items(recentSeriesItems, key = { "rec_ser_${it.seriesId}" }) { s ->
+                                                        val serProg = remember(s.seriesId, progressMap) {
+                                                            store.getPlaybackProgress("series_cover:${s.seriesId}")?.progressFraction ?: 0f
+                                                        }
                                                         Box(Modifier.width(130.dp)) {
                                                             PosterCard(
                                                                 title = s.name ?: "Serie",
@@ -1394,6 +1406,7 @@ fun CatalogScreen(
                                                                 subtitle = s.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
                                                                     ?: s.genre,
                                                                 isFavorite = favSeriesIds.contains(s.seriesId),
+                                                                progress = serProg,
                                                                 onClick = {
                                                                     store.addRecentlyViewed("series", s.seriesId)
                                                                     favRefresh++
@@ -1410,12 +1423,16 @@ fun CatalogScreen(
                                         filteredSeriesItems,
                                         key = { it.seriesId }
                                     ) { s ->
+                                        val serProg = remember(s.seriesId, progressMap) {
+                                            store.getPlaybackProgress("series_cover:${s.seriesId}")?.progressFraction ?: 0f
+                                        }
                                         PosterCard(
                                             title = s.name ?: "Serie",
                                             image = s.cover,
                                             subtitle = s.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
                                                 ?: s.genre,
                                             isFavorite = favSeriesIds.contains(s.seriesId),
+                                            progress = serProg,
                                             onClick = {
                                                 store.addRecentlyViewed("series", s.seriesId)
                                                 favRefresh++
@@ -1797,6 +1814,9 @@ private fun FavoritesView(
     onOpenMovie: (VodStream) -> Unit,
     onOpenSeries: (Series) -> Unit
 ) {
+    val appState = LocalAppState.current
+    val store = remember { appState.store }
+    val progressMap by store.playbackProgressFlow.collectAsState()
     if (favLive.isEmpty() && favVod.isEmpty() && favSeries.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1847,11 +1867,15 @@ private fun FavoritesView(
                     Spacer(Modifier.height(10.dp))
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         items(favVod, key = { it.streamId }) { m ->
+                            val movProg = remember(m.streamId, progressMap) {
+                                store.getPlaybackProgress("vod:${m.streamId}")?.progressFraction ?: 0f
+                            }
                             PosterCard(
                                 title = m.name,
                                 image = m.icon,
                                 subtitle = m.rating,
                                 isFavorite = true,
+                                progress = movProg,
                                 onClick = { onOpenMovie(m) }
                             )
                         }
@@ -1864,11 +1888,15 @@ private fun FavoritesView(
                     Spacer(Modifier.height(10.dp))
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         items(favSeries, key = { it.seriesId }) { s ->
+                            val serProg = remember(s.seriesId, progressMap) {
+                                store.getPlaybackProgress("series_cover:${s.seriesId}")?.progressFraction ?: 0f
+                            }
                             PosterCard(
                                 title = s.name,
                                 image = s.cover,
                                 subtitle = s.rating,
                                 isFavorite = true,
+                                progress = serProg,
                                 onClick = { onOpenSeries(s) }
                             )
                         }
@@ -1889,10 +1917,13 @@ fun MovieDetailScreen(
     val appState = LocalAppState.current
     val repo = remember(appState.store.stateVersion) { appState.repo() }
     val store = remember { appState.store }
+    val progressMap by store.playbackProgressFlow.collectAsState()
     var info by remember { mutableStateOf<VodInfoResponse?>(null) }
     var isFav by remember { mutableStateOf(store.favorites("vod").contains(movie.streamId)) }
     val resumeKey = "vod:${movie.streamId}"
-    val savedPos = remember { store.getResumePosition(resumeKey) }
+    val movieProgress = remember(movie.streamId, progressMap) { store.getPlaybackProgress(resumeKey) }
+    val movieFraction = movieProgress?.progressFraction ?: 0f
+    val savedPos = movieProgress?.resumePositionMs ?: store.getResumePosition(resumeKey)
 
     LaunchedEffect(movie.streamId) {
         runCatching { repo.vodInfo(movie.streamId) }.onSuccess { info = it }
@@ -1915,16 +1946,36 @@ fun MovieDetailScreen(
                 .padding(28.dp),
             horizontalArrangement = Arrangement.spacedBy(28.dp)
         ) {
-            NetworkImage(
-                url = info?.info?.image ?: movie.icon,
-                contentDescription = movie.name,
-                contentScale = ContentScale.Crop,
+            Box(
                 modifier = Modifier
                     .width(230.dp)
                     .height(330.dp)
                     .clip(RoundedCornerShape(18.dp))
                     .border(1.5.dp, GoldAccent, RoundedCornerShape(18.dp))
-            )
+            ) {
+                NetworkImage(
+                    url = info?.info?.image ?: movie.icon,
+                    contentDescription = movie.name,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+                if (movieFraction > 0.01f) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(5.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(Color.Black.copy(alpha = 0.68f))
+                    ) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth(movieFraction.coerceIn(0f, 1f))
+                                .fillMaxHeight()
+                                .background(GoldAccent)
+                        )
+                    }
+                }
+            }
             Column(
                 Modifier
                     .weight(1f)
@@ -1972,14 +2023,14 @@ fun MovieDetailScreen(
                         Icon(Icons.Default.PlayArrow, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            if (savedPos > 15_000L) "Continuar (${savedPos / 60000} min)" else "Reproducir",
+                            if (savedPos > 0L) "Continuar (${savedPos / 60000} min)" else "Reproducir",
                             fontWeight = FontWeight.ExtraBold
                         )
                     }
-                    if (savedPos > 15_000L) {
+                    if (savedPos > 0L) {
                         OutlinedButton(
                             onClick = {
-                                store.saveResumePosition(resumeKey, 0L)
+                                store.savePlaybackProgress(resumeKey, 0L, 0L)
                                 if (streamUrl.isNotBlank()) {
                                     onPlay(streamUrl, movie.name ?: "Película", resumeKey)
                                 }
@@ -2026,6 +2077,7 @@ fun SeriesDetailScreen(
     val appState = LocalAppState.current
     val repo = remember(appState.store.stateVersion) { appState.repo() }
     val store = remember { appState.store }
+    val progressMap by store.playbackProgressFlow.collectAsState()
     var details by remember { mutableStateOf<SeriesDetails?>(null) }
     var episodesBySeason by remember { mutableStateOf<Map<String, List<Episode>>>(emptyMap()) }
     var selectedSeason by remember { mutableStateOf<String?>(null) }
@@ -2103,9 +2155,13 @@ fun SeriesDetailScreen(
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(episodes, key = { it.id }) { ep ->
                     val ext = ep.extension ?: "mp4"
-                    val resumeKey = "series:${ep.id}"
-                    val savedPos = store.getResumePosition(resumeKey)
-                    Row(
+                    val resumeKey = "series:${series.seriesId}:ep:${ep.id}"
+                    val epProgressObj = remember(ep.id, progressMap) {
+                        store.getPlaybackProgress("episode:${ep.id}") ?: store.getPlaybackProgress(resumeKey)
+                    }
+                    val epFraction = epProgressObj?.progressFraction ?: 0f
+                    val savedPos = epProgressObj?.resumePositionMs ?: store.getResumePosition(resumeKey)
+                    Column(
                         Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(12.dp))
@@ -2121,42 +2177,69 @@ fun SeriesDetailScreen(
                                     resumeKey
                                 )
                             }
-                            .padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Box(
+                        Row(
                             Modifier
-                                .size(38.dp)
-                                .clip(CircleShape)
-                                .background(GoldAccent),
-                            contentAlignment = Alignment.Center
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = BgDeepCharcoal)
-                        }
-                        Spacer(Modifier.width(14.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                "${ep.episodeNum ?: "-"}. ${ep.title ?: "Episodio"}",
-                                fontWeight = FontWeight.SemiBold,
-                                color = TextPureWhite
-                            )
-                            if (!ep.info?.plot.isNullOrBlank()) {
+                            Box(
+                                Modifier
+                                    .size(38.dp)
+                                    .clip(CircleShape)
+                                    .background(GoldAccent),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.PlayArrow, contentDescription = null, tint = BgDeepCharcoal)
+                            }
+                            Spacer(Modifier.width(14.dp))
+                            Column(Modifier.weight(1f)) {
                                 Text(
-                                    ep.info?.plot ?: "",
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    fontSize = 12.sp,
-                                    color = TextSilverGray
+                                    "${ep.episodeNum ?: "-"}. ${ep.title ?: "Episodio"}",
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = TextPureWhite
+                                )
+                                if (!ep.info?.plot.isNullOrBlank()) {
+                                    Text(
+                                        ep.info?.plot ?: "",
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontSize = 12.sp,
+                                        color = TextSilverGray
+                                    )
+                                }
+                            }
+                            if (epProgressObj?.isCompleted == true) {
+                                Text(
+                                    "✓ Visto",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = GoldAccent
+                                )
+                            } else if (savedPos > 0L) {
+                                Text(
+                                    "${savedPos / 60000} min vistos",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = GoldChampagne
                                 )
                             }
                         }
-                        if (savedPos > 15_000L) {
-                            Text(
-                                "${savedPos / 60000} min vistos",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = GoldChampagne
-                            )
+                        if (epFraction > 0.01f) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(4.dp)
+                                    .background(Color.Black.copy(alpha = 0.65f))
+                            ) {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth(epFraction.coerceIn(0f, 1f))
+                                        .fillMaxHeight()
+                                        .background(GoldAccent)
+                                )
+                            }
                         }
                     }
                 }
@@ -2176,6 +2259,7 @@ fun SearchScreen(
     val appState = LocalAppState.current
     val repo = remember { appState.repo() }
     val store = remember { appState.store }
+    val progressMap by store.playbackProgressFlow.collectAsState()
     var query by remember { mutableStateOf("") }
     var liveAll by remember { mutableStateOf<List<LiveStream>>(emptyList()) }
     var vodAll by remember { mutableStateOf<List<VodStream>>(emptyList()) }
@@ -2251,10 +2335,14 @@ fun SearchScreen(
                             Spacer(Modifier.height(8.dp))
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 items(vodMatches, key = { it.streamId }) { m ->
+                                    val movProg = remember(m.streamId, progressMap) {
+                                        store.getPlaybackProgress("vod:${m.streamId}")?.progressFraction ?: 0f
+                                    }
                                     PosterCard(
                                         title = m.name ?: "Película",
                                         image = m.icon,
                                         subtitle = m.rating,
+                                        progress = movProg,
                                         onClick = {
                                             store.addRecentlyViewed("movie", m.streamId)
                                             onOpenMovie(m)
@@ -2274,10 +2362,14 @@ fun SearchScreen(
                             Spacer(Modifier.height(8.dp))
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 items(seriesMatches, key = { it.seriesId }) { s ->
+                                    val serProg = remember(s.seriesId, progressMap) {
+                                        store.getPlaybackProgress("series_cover:${s.seriesId}")?.progressFraction ?: 0f
+                                    }
                                     PosterCard(
                                         title = s.name ?: "Serie",
                                         image = s.cover,
                                         subtitle = s.rating,
+                                        progress = serProg,
                                         onClick = {
                                             store.addRecentlyViewed("series", s.seriesId)
                                             onOpenSeries(s)

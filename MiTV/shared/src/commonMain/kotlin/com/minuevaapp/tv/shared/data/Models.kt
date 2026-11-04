@@ -29,13 +29,35 @@ data class Playlist(
 }
 
 @Serializable
+data class PlaybackProgress(
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val updatedAt: Long = 0L
+) {
+    val progressFraction: Float
+        get() = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
+
+    val isCompleted: Boolean
+        get() = progressFraction >= 0.95f
+
+    val resumePositionMs: Long
+        get() = when {
+            isCompleted -> 0L
+            durationMs > 0L -> if (progressFraction in 0.02f..0.9499f) positionMs else 0L
+            positionMs > 5_000L -> positionMs
+            else -> 0L
+        }
+}
+
+@Serializable
 data class StoredAppState(
     var activeName: String? = null,
     var defaultTdtSeeded: Boolean = false,
     var playlists: MutableList<Playlist> = mutableListOf(),
     var favorites: MutableMap<String, MutableSet<String>> = mutableMapOf(),
     var resumePositions: MutableMap<String, Long> = mutableMapOf(),
-    var recentlyViewed: MutableMap<String, MutableList<String>> = mutableMapOf()
+    var recentlyViewed: MutableMap<String, MutableList<String>> = mutableMapOf(),
+    var playbackProgress: MutableMap<String, PlaybackProgress> = mutableMapOf()
 )
 
 @Serializable

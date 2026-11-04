@@ -26,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -43,6 +44,10 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val state = rememberLoad(id, repo) { repo.vodInfo(id) }
     var isFav by remember(id) { mutableStateOf(id in app.store.favorites("movie")) }
+    val progressMap by app.store.playbackProgressFlow.collectAsState()
+    val movieProgress = remember(id, progressMap) { app.store.getPlaybackProgress("movie:$id") }
+    val movieFraction = movieProgress?.progressFraction ?: 0f
+    val movieResumeMs = movieProgress?.resumePositionMs ?: 0L
 
     AppScaffold(
         title = "Ficha de película",
@@ -97,17 +102,37 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                 }
                 Row(Modifier.fillMaxSize().padding(24.dp)) {
                     val posterShape = RoundedCornerShape(14.dp)
-                    NetworkImage(
-                        url = info?.image,
-                        contentDescription = info?.name,
+                    Box(
                         modifier = Modifier
                             .width(210.dp)
                             .aspectRatio(2f / 3f)
                             .shadow(10.dp, posterShape)
                             .clip(posterShape)
-                            .border(1.5.dp, GoldPrimary.copy(alpha = 0.65f), posterShape),
-                        contentScale = ContentScale.Crop,
-                    )
+                            .border(1.5.dp, GoldPrimary.copy(alpha = 0.65f), posterShape)
+                    ) {
+                        NetworkImage(
+                            url = info?.image,
+                            contentDescription = info?.name,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                        )
+                        if (movieFraction > 0.01f) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(5.dp)
+                                    .align(Alignment.BottomCenter)
+                                    .background(Color.Black.copy(alpha = 0.68f))
+                            ) {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth(movieFraction.coerceIn(0f, 1f))
+                                        .fillMaxHeight()
+                                        .background(GoldLight)
+                                )
+                            }
+                        }
+                    }
                     Spacer(Modifier.width(28.dp))
                     Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
                         val title = info?.name?.ifBlank { null } ?: r.movieData?.name.orEmpty()
@@ -145,7 +170,24 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                             ) {
                                 Icon(Icons.Default.PlayArrow, contentDescription = null)
                                 Spacer(Modifier.width(6.dp))
-                                Text("Reproducir / Continuar", fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = if (movieResumeMs > 0L) "Continuar (${movieResumeMs / 60000} min)" else "Reproducir",
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
+                            if (movieResumeMs > 0L) {
+                                OutlinedButton(
+                                    onClick = {
+                                        val sid = r.movieData?.streamId?.takeIf { it.isNotBlank() } ?: id
+                                        app.store.savePlaybackProgress("movie:$sid", 0L, 0L)
+                                        app.store.addRecentlyViewed("movie", sid)
+                                        PlayerActivity.start(ctx, repo.movieUrl(sid, r.movieData?.extension), title, live = false, streamType = "movie", streamId = sid)
+                                    },
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldLight),
+                                ) {
+                                    Text("Desde el principio")
+                                }
                             }
                             OutlinedButton(
                                 onClick = {
@@ -200,6 +242,10 @@ fun SeriesDetailScreen(id: String, onBack: () -> Unit) {
     val state = rememberLoad(id, repo) { repo.seriesInfo(id) }
     var season by rememberSaveable(id) { mutableStateOf<String?>(null) }
     var isFav by remember(id) { mutableStateOf(id in app.store.favorites("series")) }
+    val progressMap by app.store.playbackProgressFlow.collectAsState()
+    val seriesCoverProgress = remember(id, progressMap) {
+        app.store.getPlaybackProgress("series_cover:$id")?.progressFraction ?: 0f
+    }
 
     AppScaffold(
         title = "Ficha de serie",
@@ -222,18 +268,38 @@ fun SeriesDetailScreen(id: String, onBack: () -> Unit) {
             Column(Modifier.padding(pad).fillMaxSize().padding(18.dp)) {
                 Row(verticalAlignment = Alignment.Top) {
                     val coverShape = RoundedCornerShape(12.dp)
-                    NetworkImage(
-                        url = info?.cover,
-                        contentDescription = info?.name,
-                        fallbackIcon = Icons.Default.VideoLibrary,
+                    Box(
                         modifier = Modifier
                             .width(125.dp)
                             .aspectRatio(2f / 3f)
                             .shadow(8.dp, coverShape)
                             .clip(coverShape)
-                            .border(1.5.dp, GoldPrimary.copy(alpha = 0.65f), coverShape),
-                        contentScale = ContentScale.Crop,
-                    )
+                            .border(1.5.dp, GoldPrimary.copy(alpha = 0.65f), coverShape)
+                    ) {
+                        NetworkImage(
+                            url = info?.cover,
+                            contentDescription = info?.name,
+                            fallbackIcon = Icons.Default.VideoLibrary,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                        )
+                        if (seriesCoverProgress > 0.01f) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(4.dp)
+                                    .align(Alignment.BottomCenter)
+                                    .background(Color.Black.copy(alpha = 0.68f))
+                            ) {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth(seriesCoverProgress.coerceIn(0f, 1f))
+                                        .fillMaxHeight()
+                                        .background(GoldLight)
+                                )
+                            }
+                        }
+                    }
                     Spacer(Modifier.width(18.dp))
                     Column(Modifier.weight(1f)) {
                         Text(
@@ -304,7 +370,10 @@ fun SeriesDetailScreen(id: String, onBack: () -> Unit) {
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(episodes, key = { it.id }) { ep ->
                             val epShape = RoundedCornerShape(10.dp)
-                            Row(
+                            val epProgress = remember(ep.id, progressMap) {
+                                app.store.getPlaybackProgress("episode:${ep.id}")?.progressFraction ?: 0f
+                            }
+                            Column(
                                 Modifier
                                     .fillMaxWidth()
                                     .tvClickable(
@@ -312,46 +381,94 @@ fun SeriesDetailScreen(id: String, onBack: () -> Unit) {
                                         idleBorderColor = GoldPrimary.copy(alpha = 0.22f),
                                     ) {
                                         app.store.addRecentlyViewed("series", id)
-                                        PlayerActivity.start(ctx, repo.episodeUrl(ep.id, ep.extension), ep.title, live = false, streamType = "series", streamId = id)
-                                    }
-                                    .background(DarkSurface, epShape)
-                                    .padding(10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                NetworkImage(
-                                    url = ep.info?.image ?: info?.cover,
-                                    contentDescription = ep.title,
-                                    fallbackIcon = Icons.Default.VideoLibrary,
-                                    modifier = Modifier
-                                        .width(145.dp)
-                                        .aspectRatio(16f / 9f)
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .border(1.dp, GoldPrimary.copy(alpha = 0.30f), RoundedCornerShape(8.dp)),
-                                    contentScale = ContentScale.Crop,
-                                )
-                                Spacer(Modifier.width(14.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        text = "E${ep.episodeNum.orEmpty()}  ·  ${ep.title?.ifBlank { "Episodio ${ep.episodeNum.orEmpty()}" } ?: "Episodio"}",
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = TextPrimaryWhite,
-                                    )
-                                    ep.info?.duration?.takeIf { it.isNotBlank() }?.let {
-                                        Text(
-                                            text = it,
-                                            color = GoldLight,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = FontWeight.Medium,
+                                        PlayerActivity.start(
+                                            ctx = ctx,
+                                            url = repo.episodeUrl(ep.id, ep.extension),
+                                            title = ep.title,
+                                            live = false,
+                                            streamType = "series",
+                                            streamId = id,
+                                            episodeId = ep.id,
                                         )
                                     }
-                                    ep.info?.plot?.takeIf { it.isNotBlank() }?.let {
-                                        Spacer(Modifier.height(2.dp))
+                                    .background(DarkSurface, epShape)
+                            ) {
+                                Row(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(145.dp)
+                                            .aspectRatio(16f / 9f)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .border(1.dp, GoldPrimary.copy(alpha = 0.30f), RoundedCornerShape(8.dp))
+                                    ) {
+                                        NetworkImage(
+                                            url = ep.info?.image ?: info?.cover,
+                                            contentDescription = ep.title,
+                                            fallbackIcon = Icons.Default.VideoLibrary,
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentScale = ContentScale.Crop,
+                                        )
+                                        if (epProgress > 0.01f) {
+                                            Box(
+                                                Modifier
+                                                    .fillMaxWidth()
+                                                    .height(4.dp)
+                                                    .align(Alignment.BottomCenter)
+                                                    .background(Color.Black.copy(alpha = 0.68f))
+                                            ) {
+                                                Box(
+                                                    Modifier
+                                                        .fillMaxWidth(epProgress.coerceIn(0f, 1f))
+                                                        .fillMaxHeight()
+                                                        .background(GoldLight)
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Spacer(Modifier.width(14.dp))
+                                    Column(Modifier.weight(1f)) {
                                         Text(
-                                            text = it,
-                                            maxLines = 2,
-                                            overflow = TextOverflow.Ellipsis,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = TextSecondaryGray,
+                                            text = "E${ep.episodeNum.orEmpty()}  ·  ${ep.title?.ifBlank { "Episodio ${ep.episodeNum.orEmpty()}" } ?: "Episodio"}",
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = TextPrimaryWhite,
+                                        )
+                                        ep.info?.duration?.takeIf { it.isNotBlank() }?.let {
+                                            Text(
+                                                text = it,
+                                                color = GoldLight,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Medium,
+                                            )
+                                        }
+                                        ep.info?.plot?.takeIf { it.isNotBlank() }?.let {
+                                            Spacer(Modifier.height(2.dp))
+                                            Text(
+                                                text = it,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = TextSecondaryGray,
+                                            )
+                                        }
+                                    }
+                                }
+                                if (epProgress > 0.01f) {
+                                    Box(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .height(4.dp)
+                                            .background(Color.Black.copy(alpha = 0.65f))
+                                    ) {
+                                        Box(
+                                            Modifier
+                                                .fillMaxWidth(epProgress.coerceIn(0f, 1f))
+                                                .fillMaxHeight()
+                                                .background(GoldLight)
                                         )
                                     }
                                 }
@@ -377,6 +494,7 @@ fun SearchScreen(onMovie: (String) -> Unit, onSeries: (String) -> Unit, onBack: 
     val favLive = remember { app.store.favorites("live") }
     val favMovies = remember { app.store.favorites("movie") }
     val favSeries = remember { app.store.favorites("series") }
+    val progressMap by app.store.playbackProgressFlow.collectAsState()
 
     AppScaffold("Buscar en el catálogo", onBack) { pad ->
         Column(Modifier.padding(pad).padding(16.dp).fillMaxSize()) {
@@ -431,11 +549,19 @@ fun SearchScreen(onMovie: (String) -> Unit, onSeries: (String) -> Unit, onBack: 
                                 'm' -> id in favMovies
                                 else -> id in favSeries
                             }
+                            val itemProg = remember(key, progressMap) {
+                                when (key[0]) {
+                                    'm' -> app.store.getPlaybackProgress("movie:$id")?.progressFraction ?: 0f
+                                    's' -> app.store.getPlaybackProgress("series_cover:$id")?.progressFraction ?: 0f
+                                    else -> 0f
+                                }
+                            }
                             PosterCard(
                                 title = name,
                                 image = img,
                                 subtitle = typeTag,
                                 isFavorite = isFav,
+                                progress = itemProg,
                             ) {
                                 when (key[0]) {
                                     'l' -> {
