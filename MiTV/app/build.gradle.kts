@@ -71,6 +71,7 @@ dependencies {
     // Red (igual que la app original: Retrofit + OkHttp + Gson)
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+    implementation("com.google.code.gson:gson:2.11.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Imágenes (la original usa Glide; en Compose usamos Coil)

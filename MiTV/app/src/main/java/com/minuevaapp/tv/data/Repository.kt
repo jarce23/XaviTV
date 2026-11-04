@@ -4,6 +4,8 @@ import android.content.Context
 import android.util.Base64
 import com.google.gson.Gson
 import com.google.gson.JsonElement
+import com.google.gson.reflect.TypeToken
+import java.lang.reflect.Type
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -561,17 +563,23 @@ class XtreamRepository(
             val r = api.seriesInfo(u, p, id)
             val map = linkedMapOf<String, List<Episode>>()
             val el: JsonElement? = r.episodes
-            val listType = object : TypeToken<List<Episode>>() {}.type
+            val listType: Type = object : TypeToken<List<Episode>>() {}.type
             if (el != null && el.isJsonObject) {
                 el.asJsonObject.entrySet()
-                    .sortedBy { it.key.toIntOrNull() ?: 0 }
-                    .forEach { (season, arr) ->
-                        map[season] = runCatching { gson.fromJson<List<Episode>>(arr, listType) }.getOrDefault(emptyList())
+                    .sortedBy { entry -> entry.key.toIntOrNull() ?: 0 }
+                    .forEach { entry ->
+                        val season: String = entry.key
+                        val arr: JsonElement = entry.value
+                        map[season] = runCatching<List<Episode>> {
+                            gson.fromJson<List<Episode>>(arr, listType) ?: emptyList()
+                        }.getOrDefault(emptyList())
                     }
             } else if (el != null && el.isJsonArray) {
-                el.asJsonArray.forEach { seasonArr ->
-                    val eps: List<Episode> = runCatching { gson.fromJson<List<Episode>>(seasonArr, listType) }.getOrDefault(emptyList())
-                    eps.firstOrNull()?.let { map[it.season ?: "${map.size + 1}"] = eps }
+                el.asJsonArray.forEach { seasonArr: JsonElement ->
+                    val eps: List<Episode> = runCatching<List<Episode>> {
+                        gson.fromJson<List<Episode>>(seasonArr, listType) ?: emptyList()
+                    }.getOrDefault(emptyList())
+                    eps.firstOrNull()?.let { ep: Episode -> map[ep.season ?: "${map.size + 1}"] = eps }
                 }
             }
             r.info to map
