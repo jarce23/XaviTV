@@ -23,6 +23,7 @@ import retrofit2.converter.gson.GsonConverterFactory
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.Base64
+import javax.swing.SwingUtilities
 
 private data class DesktopStorageData(
     var activeName: String? = null,
@@ -81,8 +82,13 @@ class PlaylistStore {
     val playbackProgressFlow: StateFlow<Map<String, PlaybackProgress>> = _playbackProgressFlow.asStateFlow()
 
     private fun notifyStateChanged() {
-        stateVersion++
-        _playbackProgressFlow.value = data.playbackProgress.toMap()
+        val snapshot = synchronized(this) { data.playbackProgress.toMap() }
+        _playbackProgressFlow.value = snapshot
+        if (SwingUtilities.isEventDispatchThread()) {
+            stateVersion++
+        } else {
+            SwingUtilities.invokeLater { stateVersion++ }
+        }
     }
 
     init {
@@ -298,53 +304,70 @@ class PlaylistStore {
     }
 
     @Synchronized
-    fun saveResumePosition(url: String, posMs: Long) {
+    fun saveResumePosition(url: String, posMs: Long, persistImmediately: Boolean = false, notifyUi: Boolean = false) {
         data.resumePositions[url] = posMs
         val existingDur = getPlaybackProgress(url)?.durationMs ?: 0L
-        savePlaybackProgress(url, posMs, existingDur)
+        savePlaybackProgress(url, posMs, existingDur, persistImmediately = persistImmediately, notifyUi = notifyUi)
     }
 
-    @Synchronized
-    fun savePlaybackProgress(id: String, positionMs: Long, durationMs: Long) {
+    fun savePlaybackProgress(
+        id: String,
+        positionMs: Long,
+        durationMs: Long,
+        persistImmediately: Boolean = false,
+        notifyUi: Boolean = true,
+    ) {
         val cleanId = id.trim()
         if (cleanId.isEmpty() || positionMs < 0L) return
 
         if (positionMs == 0L && durationMs == 0L) {
-            removeProgressKeys(cleanId)
-            data.resumePositions.remove(cleanId)
-            notifyStateChanged()
-            persistSync()
+            synchronized(this) {
+                removeProgressKeys(cleanId)
+                data.resumePositions.remove(cleanId)
+            }
+            if (notifyUi) {
+                notifyStateChanged()
+            }
+            if (persistImmediately) persistSync() else persistAsync()
             return
         }
 
-        val existing = getPlaybackProgress(cleanId)
-        val effectiveDuration = when {
-            durationMs > 0L -> durationMs
-            existing != null && existing.durationMs > 0L -> existing.durationMs
-            else -> 0L
-        }
-        if (effectiveDuration <= 0L && positionMs <= 0L) return
+        val updated = synchronized(this) {
+            val existing = getPlaybackProgress(cleanId)
+            val effectiveDuration = when {
+                durationMs > 0L -> durationMs
+                existing != null && existing.durationMs > 0L -> existing.durationMs
+                else -> 0L
+            }
+            if (effectiveDuration <= 0L && positionMs <= 0L) return@synchronized false
 
-        val rawFraction = if (effectiveDuration > 0L) {
-            (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
-        } else {
-            0f
+            val rawFraction = if (effectiveDuration > 0L) {
+                (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+
+            if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
+                return@synchronized false
+            }
+
+            val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
+            val progress = PlaybackProgress(
+                positionMs = finalPos,
+                durationMs = effectiveDuration,
+                updatedAt = System.currentTimeMillis(),
+            )
+            storeProgressUnderAliases(cleanId, progress)
+            data.resumePositions[cleanId] = progress.resumePositionMs
+            true
         }
 
-        if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
-            return
+        if (updated) {
+            if (notifyUi) {
+                notifyStateChanged()
+            }
+            if (persistImmediately) persistSync() else persistAsync()
         }
-
-        val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
-        val progress = PlaybackProgress(
-            positionMs = finalPos,
-            durationMs = effectiveDuration,
-            updatedAt = System.currentTimeMillis(),
-        )
-        storeProgressUnderAliases(cleanId, progress)
-        data.resumePositions[cleanId] = progress.resumePositionMs
-        notifyStateChanged()
-        persistSync()
     }
 
     private fun removeProgressKeys(cleanId: String) {
@@ -451,25 +474,30 @@ class PlaylistStore {
         return emptyList()
     }
 
-    @Synchronized
     fun addRecentlyViewed(type: String, id: String, maxItems: Int = 40) {
         if (id.isBlank()) return
-        val list = data.recentlyViewed.getOrPut(type) { mutableListOf() }
-        list.remove(id)
-        list.add(0, id)
-        while (list.size > maxItems) {
-            list.removeAt(list.lastIndex)
-        }
-        if (type == "movie") {
-            val vodList = data.recentlyViewed.getOrPut("vod") { mutableListOf() }
-            vodList.remove(id)
-            vodList.add(0, id)
-            while (vodList.size > maxItems) {
-                vodList.removeAt(vodList.lastIndex)
+        val changed = synchronized(this) {
+            val list = data.recentlyViewed.getOrPut(type) { mutableListOf() }
+            if (list.firstOrNull() == id) return@synchronized false
+            list.remove(id)
+            list.add(0, id)
+            while (list.size > maxItems) {
+                list.removeAt(list.lastIndex)
             }
+            if (type == "movie") {
+                val vodList = data.recentlyViewed.getOrPut("vod") { mutableListOf() }
+                vodList.remove(id)
+                vodList.add(0, id)
+                while (vodList.size > maxItems) {
+                    vodList.removeAt(vodList.lastIndex)
+                }
+            }
+            true
         }
-        notifyStateChanged()
-        persistSync()
+        if (changed) {
+            notifyStateChanged()
+            persistAsync()
+        }
     }
 
     @Synchronized

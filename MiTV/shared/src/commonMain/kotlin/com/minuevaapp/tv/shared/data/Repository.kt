@@ -6,11 +6,14 @@ import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.statement.bodyAsText
 import io.ktor.util.date.getTimeMillis
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -66,6 +69,8 @@ class PlaylistStore {
         encodeDefaults = true
     }
 
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val diskWriteMutex = Mutex()
     private var writeBlocked: Boolean = false
     private var data: StoredAppState = loadState()
 
@@ -90,10 +95,33 @@ class PlaylistStore {
         return parsed
     }
 
+    private fun snapshotState(): StoredAppState = StoredAppState(
+        playlists = data.playlists.toMutableList(),
+        activeName = data.activeName,
+        defaultTdtSeeded = data.defaultTdtSeeded,
+        favorites = data.favorites.mapValues { (_, v) -> v.toMutableSet() }.toMutableMap(),
+        resumePositions = data.resumePositions.toMutableMap(),
+        recentlyViewed = data.recentlyViewed.mapValues { (_, v) -> v.toMutableList() }.toMutableMap(),
+        playbackProgress = data.playbackProgress.toMutableMap(),
+    )
+
     private fun persist() {
         if (writeBlocked) return
+        val snap = snapshotState()
         runCatching {
-            PlatformStorage.saveStateJson(json.encodeToString(data))
+            PlatformStorage.saveStateJson(json.encodeToString(snap))
+        }
+    }
+
+    private fun persistAsync() {
+        if (writeBlocked) return
+        val snap = snapshotState()
+        ioScope.launch(Dispatchers.IO) {
+            diskWriteMutex.withLock {
+                runCatching {
+                    PlatformStorage.saveStateJson(json.encodeToString(snap))
+                }
+            }
         }
     }
 
@@ -198,21 +226,80 @@ class PlaylistStore {
         return data.resumePositions[key] ?: 0L
     }
 
-    fun saveResumePosition(key: String, posMs: Long) {
+    fun saveResumePosition(key: String, posMs: Long, asyncIo: Boolean = true, notifyUi: Boolean = false) {
         data.resumePositions[key] = posMs
         val existingDur = getPlaybackProgress(key)?.durationMs ?: 0L
-        savePlaybackProgress(key, posMs, existingDur)
+        savePlaybackProgress(key, posMs, existingDur, asyncIo = asyncIo, notifyUi = notifyUi)
     }
 
-    fun savePlaybackProgress(id: String, positionMs: Long, durationMs: Long) {
+    /**
+     * Versión segura para invocarse desde `CoroutineScope(Dispatchers.IO).launch` en el guardado
+     * periódico cada 5 segundos sin bloquear jamás el hilo principal de iOS ni recomponer la UI.
+     */
+    suspend fun savePlaybackProgressBg(
+        id: String,
+        positionMs: Long,
+        durationMs: Long,
+        notifyUi: Boolean = false,
+    ) {
+        val cleanId = id.trim()
+        if (cleanId.isEmpty() || positionMs < 0L) return
+
+        diskWriteMutex.withLock {
+            val existing = getPlaybackProgress(cleanId)
+            val effectiveDuration = when {
+                durationMs > 0L -> durationMs
+                existing != null && existing.durationMs > 0L -> existing.durationMs
+                else -> 0L
+            }
+            if (effectiveDuration <= 0L && positionMs <= 0L) return@withLock
+
+            val rawFraction = if (effectiveDuration > 0L) {
+                (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+            if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
+                return@withLock
+            }
+
+            val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
+            val progress = PlaybackProgress(
+                positionMs = finalPos,
+                durationMs = effectiveDuration,
+                updatedAt = getTimeMillis()
+            )
+            storeProgressUnderAliases(cleanId, progress)
+            data.resumePositions[cleanId] = progress.resumePositionMs
+            if (notifyUi) {
+                _playbackProgressFlow.value = data.playbackProgress.toMap()
+            }
+            if (!writeBlocked) {
+                val snap = snapshotState()
+                runCatching {
+                    PlatformStorage.saveStateJson(json.encodeToString(snap))
+                }
+            }
+        }
+    }
+
+    fun savePlaybackProgress(
+        id: String,
+        positionMs: Long,
+        durationMs: Long,
+        asyncIo: Boolean = false,
+        notifyUi: Boolean = true,
+    ) {
         val cleanId = id.trim()
         if (cleanId.isEmpty() || positionMs < 0L) return
 
         if (positionMs == 0L && durationMs == 0L) {
             removeProgressKeys(cleanId)
             data.resumePositions.remove(cleanId)
-            _playbackProgressFlow.value = data.playbackProgress.toMap()
-            persist()
+            if (notifyUi) {
+                _playbackProgressFlow.value = data.playbackProgress.toMap()
+            }
+            if (asyncIo) persistAsync() else persist()
             return
         }
 
@@ -242,8 +329,10 @@ class PlaylistStore {
         )
         storeProgressUnderAliases(cleanId, progress)
         data.resumePositions[cleanId] = progress.resumePositionMs
-        _playbackProgressFlow.value = data.playbackProgress.toMap()
-        persist()
+        if (notifyUi) {
+            _playbackProgressFlow.value = data.playbackProgress.toMap()
+        }
+        if (asyncIo) persistAsync() else persist()
     }
 
     private fun removeProgressKeys(cleanId: String) {
@@ -324,12 +413,13 @@ class PlaylistStore {
     fun addRecentlyViewed(type: String, id: String, maxItems: Int = 40) {
         if (id.isBlank()) return
         val list = data.recentlyViewed.getOrPut(type) { mutableListOf() }
+        if (list.firstOrNull() == id) return
         list.remove(id)
         list.add(0, id)
         while (list.size > maxItems) {
             list.removeAt(list.lastIndex)
         }
-        persist()
+        persistAsync()
     }
 
     fun clearRecentlyViewed(type: String) {

@@ -353,9 +353,9 @@ actual fun NativeVideoPlayer(
     var showOverlayBar by remember { mutableStateOf(true) }
     var lastInteractionTick by remember { mutableStateOf(0) }
     var hostViewRef by remember { mutableStateOf<UIView?>(null) }
-    var lastKnownTimeMs by remember(url) { mutableStateOf(0L) }
-    var lastKnownDurationMs by remember(url) { mutableStateOf(0L) }
-    var seekApplied by remember(url) { mutableStateOf(false) }
+    // Contenedor no observable para que las lecturas de tiempo cada 1s jamás recompongan NativeVideoPlayer
+    val playbackClockHolder = remember(url) { LongArray(2) } // [0] = timeMs, [1] = durationMs
+    val seekAppliedHolder = remember(url) { BooleanArray(1) }
 
     val currentStreamUrl = candidates.getOrElse(candidateIndex) { url }
 
@@ -427,10 +427,13 @@ actual fun NativeVideoPlayer(
                     currentStreamUrl.contains(".m3u8", ignoreCase = true) -> "HLS (.m3u8)"
                     else -> "Stream directo"
                 }
-                statusLabel = if (isPlaying) {
+                val nextStatus = if (isPlaying) {
                     if (isLive) "VLCKit • En directo ($formatTag)" else "VLCKit • Reproduciendo"
                 } else {
                     "VLCKit • En pausa"
+                }
+                if (statusLabel != nextStatus) {
+                    statusLabel = nextStatus
                 }
             }
             if (!isLive) {
@@ -440,22 +443,21 @@ actual fun NativeVideoPlayer(
                 val durNum = (hostView as? NSObject)?.performSelector(durSel) as? NSNumber
                 val timeMs = timeNum?.longLongValue ?: 0L
                 val durMs = durNum?.longLongValue ?: 0L
-                if (timeMs > 0L) lastKnownTimeMs = timeMs
-                if (durMs > 0L) lastKnownDurationMs = durMs
+                if (timeMs > 0L) playbackClockHolder[0] = timeMs
+                if (durMs > 0L) playbackClockHolder[1] = durMs
 
-                if (!seekApplied && initialPositionMs > 3_000L && timeMs > 0L) {
+                if (!seekAppliedHolder[0] && initialPositionMs > 3_000L && timeMs > 0L) {
                     if (timeMs < initialPositionMs - 3_000L) {
                         val sec = initialPositionMs.toDouble() / 1000.0
                         val seekSel = NSSelectorFromString("seekToNumber:")
                         val nsSec = NSNumber(double = sec)
                         (hostView as? NSObject)?.performSelector(seekSel, withObject = nsSec)
                     }
-                    seekApplied = true
+                    seekAppliedHolder[0] = true
                 }
 
                 if (timeMs > 2000L && tickCount % 5 == 0) {
-                    onSavePosition(timeMs)
-                    onSaveProgress(timeMs, lastKnownDurationMs)
+                    onSaveProgress(timeMs, playbackClockHolder[1])
                 }
             }
         }
@@ -483,11 +485,11 @@ actual fun NativeVideoPlayer(
                 val durSel = NSSelectorFromString("getDurationMs")
                 val curPos = ((hostView as? NSObject)?.performSelector(timeSel) as? NSNumber)?.longLongValue ?: 0L
                 val curDur = ((hostView as? NSObject)?.performSelector(durSel) as? NSNumber)?.longLongValue ?: 0L
-                val finalPos = if (curPos > 0L) curPos else lastKnownTimeMs
-                val finalDur = if (curDur > 0L) curDur else lastKnownDurationMs
+                val finalPos = if (curPos > 0L) curPos else playbackClockHolder[0]
+                val finalDur = if (curDur > 0L) curDur else playbackClockHolder[1]
                 if (finalPos > 2000L) {
-                    onSavePosition(finalPos)
                     onSaveProgress(finalPos, finalDur)
+                    onSavePosition(finalPos)
                 }
             }
             (hostView as? NSObject)?.performSelector(NSSelectorFromString("stopStream"))
@@ -628,10 +630,9 @@ actual fun NativeVideoPlayer(
                                 if (isPlaying && !isLive) {
                                     val timeSel = NSSelectorFromString("getPlaybackTimeMs")
                                     val durSel = NSSelectorFromString("getDurationMs")
-                                    val curPos = ((hostView as? NSObject)?.performSelector(timeSel) as? NSNumber)?.longLongValue ?: lastKnownTimeMs
-                                    val curDur = ((hostView as? NSObject)?.performSelector(durSel) as? NSNumber)?.longLongValue ?: lastKnownDurationMs
+                                    val curPos = ((hostView as? NSObject)?.performSelector(timeSel) as? NSNumber)?.longLongValue ?: playbackClockHolder[0]
+                                    val curDur = ((hostView as? NSObject)?.performSelector(durSel) as? NSNumber)?.longLongValue ?: playbackClockHolder[1]
                                     if (curPos > 2000L) {
-                                        onSavePosition(curPos)
                                         onSaveProgress(curPos, curDur)
                                     }
                                 }

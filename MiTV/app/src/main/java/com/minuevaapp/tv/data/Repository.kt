@@ -7,10 +7,13 @@ import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.reflect.TypeToken
 import java.lang.reflect.Type
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -34,6 +37,7 @@ data class RefreshResult(
 class PlaylistStore(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences("playlists", Context.MODE_PRIVATE)
     private val gson = Gson()
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** Copia en memoria de las listas leídas de disco (se rellena síncronamente en el init). */
     @Volatile
@@ -178,38 +182,53 @@ class PlaylistStore(context: Context) {
         prefs.edit().putStringSet("fav_$type", updated).commit()
     }
 
+    private val recentMemoryCache = mutableMapOf<String, List<String>>()
     private val _recentUpdates = MutableStateFlow(0)
     val recentUpdates: StateFlow<Int> = _recentUpdates.asStateFlow()
 
+    @Synchronized
     fun getRecentlyViewed(type: String): List<String> {
+        recentMemoryCache[type]?.let { return it }
         val json = prefs.getString("recent_$type", null) ?: return emptyList()
         return runCatching {
             gson.fromJson(json, Array<String>::class.java)?.toList().orEmpty()
-        }.getOrDefault(emptyList())
+        }.getOrDefault(emptyList()).also {
+            recentMemoryCache[type] = it
+        }
     }
 
+    @Synchronized
     fun addRecentlyViewed(type: String, id: String, maxItems: Int = 40) {
         if (id.isBlank()) return
         val list = getRecentlyViewed(type).toMutableList()
+        if (list.firstOrNull() == id) return
         list.remove(id)
         list.add(0, id)
         while (list.size > maxItems) {
             list.removeAt(list.lastIndex)
         }
-        prefs.edit().putString("recent_$type", gson.toJson(list)).commit()
+        val snapshot = list.toList()
+        recentMemoryCache[type] = snapshot
         _recentUpdates.value++
+        ioScope.launch(Dispatchers.IO) {
+            prefs.edit().putString("recent_$type", gson.toJson(snapshot)).apply()
+        }
     }
 
+    @Synchronized
     fun clearRecentlyViewed(type: String) {
-        prefs.edit().remove("recent_$type").commit()
+        recentMemoryCache.remove(type)
         _recentUpdates.value++
+        ioScope.launch(Dispatchers.IO) {
+            prefs.edit().remove("recent_$type").apply()
+        }
     }
 
     fun getSelectedCategory(type: String): String =
         prefs.getString("selected_cat_$type", "__all") ?: "__all"
 
     fun setSelectedCategory(type: String, categoryId: String) {
-        prefs.edit().putString("selected_cat_$type", categoryId).commit()
+        prefs.edit().putString("selected_cat_$type", categoryId).apply()
     }
 
     fun getScrollPosition(key: String): Pair<Int, Int> {
@@ -246,8 +265,8 @@ class PlaylistStore(context: Context) {
     }
 
     @Synchronized
-    private fun persistPlaybackProgressSync() {
-        val entries = progressMap.entries.map { (k, v) ->
+    private fun snapshotProgressEntries(): Array<PlaybackProgressEntry> =
+        progressMap.entries.map { (k, v) ->
             PlaybackProgressEntry(
                 id = k,
                 positionMs = v.positionMs,
@@ -255,53 +274,90 @@ class PlaylistStore(context: Context) {
                 updatedAt = v.updatedAt,
             )
         }.toTypedArray()
-        prefs.edit().putString(KEY_PLAYBACK_PROGRESS, gson.toJson(entries)).commit()
-        _playbackProgressFlow.value = progressMap.toMap()
-        _recentUpdates.value++
+
+    /**
+     * Persiste el mapa de progreso en SharedPreferences:
+     * - Guardado periódico (commitSync = false): serializa y ejecuta .apply() en Dispatchers.IO sin
+     *   bloquear jamás el hilo principal ni forzar recomposiciones innecesarias durante el vídeo.
+     * - Eventos críticos (commitSync = true, ej. onPause / onStop / onDestroy): actualiza los flujos
+     *   reactivos de UI y confirma en disco con .commit().
+     */
+    private fun persistPlaybackProgress(commitSync: Boolean, notifyUi: Boolean) {
+        val snapshotMap: Map<String, PlaybackProgress>
+        val entriesSnapshot: Array<PlaybackProgressEntry>
+        synchronized(this) {
+            snapshotMap = progressMap.toMap()
+            entriesSnapshot = snapshotProgressEntries()
+        }
+        if (notifyUi) {
+            _playbackProgressFlow.value = snapshotMap
+            _recentUpdates.value++
+        }
+        if (commitSync) {
+            val json = gson.toJson(entriesSnapshot)
+            prefs.edit().putString(KEY_PLAYBACK_PROGRESS, json).commit()
+        } else {
+            ioScope.launch(Dispatchers.IO) {
+                val json = gson.toJson(entriesSnapshot)
+                prefs.edit().putString(KEY_PLAYBACK_PROGRESS, json).apply()
+            }
+        }
     }
 
-    @Synchronized
-    fun savePlaybackProgress(id: String, positionMs: Long, durationMs: Long) {
+    fun savePlaybackProgress(
+        id: String,
+        positionMs: Long,
+        durationMs: Long,
+        commitSync: Boolean = true,
+        notifyUi: Boolean = true,
+    ) {
         val cleanId = id.trim()
         if (cleanId.isEmpty() || positionMs < 0L) return
 
         // Si ambos son 0L, significa reseteo explícito ("Desde el principio")
         if (positionMs == 0L && durationMs == 0L) {
-            removeProgressKeys(cleanId)
-            persistPlaybackProgressSync()
+            synchronized(this) {
+                removeProgressKeys(cleanId)
+            }
+            persistPlaybackProgress(commitSync = commitSync, notifyUi = notifyUi)
             return
         }
 
-        val existing = getPlaybackProgress(cleanId)
-        val effectiveDuration = when {
-            durationMs > 0L -> durationMs
-            existing != null && existing.durationMs > 0L -> existing.durationMs
-            else -> 0L
+        val shouldPersist = synchronized(this) {
+            val existing = getPlaybackProgress(cleanId)
+            val effectiveDuration = when {
+                durationMs > 0L -> durationMs
+                existing != null && existing.durationMs > 0L -> existing.durationMs
+                else -> 0L
+            }
+            if (effectiveDuration <= 0L && positionMs <= 0L) return@synchronized false
+
+            val rawFraction = if (effectiveDuration > 0L) {
+                (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+
+            // Si ya estaba completado y apenas empieza a reproducirse (< 3s), no machacar la barra llena todavía
+            if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
+                return@synchronized false
+            }
+
+            // Si supera el 95% (>= 0.95f), se marca como completado manteniendo la barra llena (positionMs = durationMs)
+            // y PlaybackProgress.resumePositionMs devolverá 0L en futuras reproducciones.
+            val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
+            val progress = PlaybackProgress(
+                positionMs = finalPos,
+                durationMs = effectiveDuration,
+                updatedAt = System.currentTimeMillis(),
+            )
+
+            storeProgressUnderAliases(cleanId, progress)
+            true
         }
-        if (effectiveDuration <= 0L && positionMs <= 0L) return
-
-        val rawFraction = if (effectiveDuration > 0L) {
-            (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
-        } else {
-            0f
+        if (shouldPersist) {
+            persistPlaybackProgress(commitSync = commitSync, notifyUi = notifyUi)
         }
-
-        // Si ya estaba completado y apenas empieza a reproducirse (< 3s), no machacar la barra llena todavía
-        if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
-            return
-        }
-
-        // Si supera el 95% (>= 0.95f), se marca como completado manteniendo la barra llena (positionMs = durationMs)
-        // y PlaybackProgress.resumePositionMs devolverá 0L en futuras reproducciones.
-        val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
-        val progress = PlaybackProgress(
-            positionMs = finalPos,
-            durationMs = effectiveDuration,
-            updatedAt = System.currentTimeMillis(),
-        )
-
-        storeProgressUnderAliases(cleanId, progress)
-        persistPlaybackProgressSync()
     }
 
     private fun removeProgressKeys(cleanId: String) {

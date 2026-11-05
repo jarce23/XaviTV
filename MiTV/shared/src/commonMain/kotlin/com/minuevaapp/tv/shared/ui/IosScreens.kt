@@ -508,6 +508,7 @@ fun IosXaviTVApp() {
                             else -> appState.store.getResumePosition(current.resumeKey)
                         }
                     }
+                    val playerIoScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
                     NativeVideoPlayer(
                         url = current.url,
                         title = current.title,
@@ -516,13 +517,28 @@ fun IosXaviTVApp() {
                         resumeKey = current.resumeKey,
                         initialPositionMs = startPosMs,
                         onSavePosition = { posMs ->
-                            if (!current.isLive && current.resumeKey.isNotEmpty() && posMs > 5_000L) {
-                                appState.store.saveResumePosition(current.resumeKey, posMs)
+                            if (!current.isLive && current.resumeKey.isNotEmpty() && posMs > 2_000L) {
+                                val existingDur = appState.store.getPlaybackProgress(current.resumeKey)?.durationMs ?: 0L
+                                playerIoScope.launch(Dispatchers.IO) {
+                                    appState.store.savePlaybackProgressBg(
+                                        id = current.resumeKey,
+                                        positionMs = posMs,
+                                        durationMs = existingDur,
+                                        notifyUi = true,
+                                    )
+                                }
                             }
                         },
                         onSaveProgress = { posMs, durMs ->
                             if (!current.isLive && current.resumeKey.isNotEmpty() && posMs > 2_000L) {
-                                appState.store.savePlaybackProgress(current.resumeKey, posMs, durMs)
+                                playerIoScope.launch(Dispatchers.IO) {
+                                    appState.store.savePlaybackProgressBg(
+                                        id = current.resumeKey,
+                                        positionMs = posMs,
+                                        durationMs = durMs,
+                                        notifyUi = false,
+                                    )
+                                }
                             }
                         },
                         onClose = { popBack() }

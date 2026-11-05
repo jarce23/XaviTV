@@ -46,6 +46,11 @@ import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import androidx.media3.ui.PlayerView
 import com.minuevaapp.tv.R
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * Reproductor a pantalla completa con Media3 ExoPlayer optimizado para Fire TV, Android TV,
@@ -70,6 +75,7 @@ class PlayerActivity : Activity() {
     private lateinit var reloadButton: Button
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val playerIoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var reconnectRunnable: Runnable? = null
     private var progressSaveRunnable: Runnable? = null
     private var videoWatchdogRunnable: Runnable? = null
@@ -78,6 +84,8 @@ class PlayerActivity : Activity() {
     private var lastRenderedFrameCount = -1
     private var frozenFrameStallTicks = 0
     private var videoRendererResetAttempted = false
+    private var lastCommittedPosMs = -1L
+    private var lastCommittedDurMs = -1L
 
     private val prefs by lazy { applicationContext.getSharedPreferences("resume", MODE_PRIVATE) }
     private val url by lazy { intent.getStringExtra(EXTRA_URL).orEmpty() }
@@ -109,7 +117,9 @@ class PlayerActivity : Activity() {
         }
         val sId = streamId
         if (!sId.isNullOrBlank()) {
-            com.minuevaapp.tv.MiTVApp.instance.store.addRecentlyViewed(streamType, sId)
+            playerIoScope.launch(Dispatchers.IO) {
+                com.minuevaapp.tv.MiTVApp.instance.store.addRecentlyViewed(streamType, sId)
+            }
         }
         // Si la URL apunta explícitamente a un manifiesto .m3u8 (ej. TDTChannels), iniciamos con HLS
         // y mantenemos el fallback automático a ProgressiveMediaSource si fuese un flujo TS crudo.
@@ -365,24 +375,22 @@ class PlayerActivity : Activity() {
         lastRenderedFrameCount = -1
         frozenFrameStallTicks = 0
 
-        // Selector de códecs con prioridad inteligente:
-        // - Si forceSoftwareDecoder está activo (o si estamos en un emulador Android cuyos códecs
-        //   c2.goldfish / omx.goldfish se congelan en el primer fotograma con streams entrelazados),
-        //   prioriza los decodificadores por software estables (c2.android / omx.google).
-        // - En dispositivos físicos (Fire TV, Android TV, móviles) prioriza hardware con fallback a software.
-        val preferSwForEmulator = forceSoftwareDecoder || isRunningOnEmulator()
+        // Selector de códecs:
+        // - Por defecto prioriza decodificación por Hardware (MediaCodec HW) para 1080p/50fps fluido
+        //   con fallback automático (setEnableDecoderFallback(true)) si un perfil falla.
+        // - Solo fuerza decodificadores por software (c2.android / omx.google) si el usuario lo activa
+        //   manualmente o tras un error real irrecuperable de inicialización del códec HW.
         val codecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
             val infos = MediaCodecUtil.getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
-            if (preferSwForEmulator) {
+            if (forceSoftwareDecoder) {
                 val swFirst = infos.sortedWith(
                     compareByDescending<MediaCodecInfo> { isReliableSoftwareCodec(it) }
-                        .thenBy { isGoldfishEmulatedHwCodec(it) }
+                        .thenByDescending { isSoftwareCodec(it) }
                 )
                 swFirst.ifEmpty { infos }
             } else {
                 val hwFirst = infos.sortedWith(
                     compareBy<MediaCodecInfo> { isSoftwareCodec(it) }
-                        .thenBy { isGoldfishEmulatedHwCodec(it) }
                 )
                 hwFirst.ifEmpty { infos }
             }
@@ -484,10 +492,9 @@ class PlayerActivity : Activity() {
                         droppedFrames: Int,
                         elapsedMs: Long
                     ) {
-                        // Si se descartan demasiados fotogramas seguidos y el renderizador queda bloqueado,
-                        // reiniciamos el renderizador de vídeo en caliente.
+                        // Solo reiniciamos si ningún fotograma llegó jamás a renderizarse pese a recibir paquetes
                         val rendered = p.videoDecoderCounters?.renderedOutputBufferCount ?: 0
-                        if (droppedFrames >= 50 && rendered <= 2) {
+                        if (droppedFrames >= 120 && rendered == 0) {
                             mainHandler.post {
                                 restartVideoRendererOrFallback("onDroppedVideoFrames")
                             }
@@ -507,16 +514,24 @@ class PlayerActivity : Activity() {
                             } else {
                                 val dur = p.duration.takeIf { it > 0L && it != C.TIME_UNSET } ?: 0L
                                 if (dur > 0L) {
-                                    com.minuevaapp.tv.MiTVApp.instance.store.savePlaybackProgress(progressKey, dur, dur)
-                                    prefs.edit().putLong(url, 0L).commit()
+                                    playerIoScope.launch(Dispatchers.IO) {
+                                        com.minuevaapp.tv.MiTVApp.instance.store.savePlaybackProgress(
+                                            id = progressKey,
+                                            positionMs = dur,
+                                            durationMs = dur,
+                                            commitSync = false,
+                                            notifyUi = true
+                                        )
+                                        prefs.edit().putLong(url, 0L).apply()
+                                    }
                                 }
                             }
                         }
                     }
 
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
-                        if (!isPlaying && !isLive) {
-                            saveResumePosition()
+                        if (!isPlaying && !isLive && !isFinishing && !isDestroyed) {
+                            saveResumePositionPeriodicAsync()
                         }
                     }
 
@@ -597,9 +612,9 @@ class PlayerActivity : Activity() {
     }
 
     /**
-     * Supervisa cada 1.5s que los fotogramas renderizados de vídeo avancen mientras el audio
-     * está reproduciéndose. Si el vídeo se queda congelado en el primer fotograma durante 3s,
-     * reinicia el renderizador de vídeo o conmuta automáticamente a decodificador por software.
+     * Supervisa cada 2s que el decodificador de vídeo no haya quedado totalmente mudo al arrancar
+     * (0 fotogramas renderizados pese a haber encolado >90 paquetes durante más de 8 segundos).
+     * Evita falsos positivos durante la espera normal del primer keyframe IDR en MPEG-TS.
      */
     private fun startVideoFreezeWatchdog() {
         stopVideoFreezeWatchdog()
@@ -608,12 +623,15 @@ class PlayerActivity : Activity() {
                 if (!isFinishing && !isDestroyed) {
                     val p = player
                     if (p != null && p.isPlaying && p.playbackState == Player.STATE_READY && p.videoFormat != null) {
-                        val rendered = p.videoDecoderCounters?.renderedOutputBufferCount ?: 0
-                        if (rendered <= 2 || rendered == lastRenderedFrameCount) {
+                        val counters = p.videoDecoderCounters
+                        val rendered = counters?.renderedOutputBufferCount ?: 0
+                        val queued = counters?.queuedInputBufferCount ?: 0
+                        val dropped = counters?.droppedBufferCount ?: 0
+                        if (rendered == 0 && queued > 90 && dropped == 0) {
                             frozenFrameStallTicks++
-                            if (frozenFrameStallTicks >= 2 && rendered <= 3) {
+                            if (frozenFrameStallTicks >= 4) {
                                 frozenFrameStallTicks = 0
-                                restartVideoRendererOrFallback("FrozenFirstFrameWatchdog")
+                                restartVideoRendererOrFallback("DeadHardwareDecoderWatchdog")
                             }
                         } else {
                             frozenFrameStallTicks = 0
@@ -622,40 +640,17 @@ class PlayerActivity : Activity() {
                     } else {
                         frozenFrameStallTicks = 0
                     }
-                    mainHandler.postDelayed(this, 1_500L)
+                    mainHandler.postDelayed(this, 2_000L)
                 }
             }
         }
         videoWatchdogRunnable = task
-        mainHandler.postDelayed(task, 1_500L)
+        mainHandler.postDelayed(task, 2_000L)
     }
 
     private fun stopVideoFreezeWatchdog() {
         videoWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
         videoWatchdogRunnable = null
-    }
-
-    private fun isRunningOnEmulator(): Boolean {
-        val fp = Build.FINGERPRINT.lowercase()
-        val model = Build.MODEL.lowercase()
-        val hw = Build.HARDWARE.lowercase()
-        val product = Build.PRODUCT.lowercase()
-        return fp.startsWith("generic") ||
-            fp.startsWith("unknown") ||
-            model.contains("google_sdk") ||
-            model.contains("emulator") ||
-            model.contains("android sdk built for") ||
-            model.contains("sdk_gphone") ||
-            model.contains("sdk_google_atv") ||
-            hw.contains("goldfish") ||
-            hw.contains("ranchu") ||
-            product.contains("sdk") ||
-            product.contains("emulator")
-    }
-
-    private fun isGoldfishEmulatedHwCodec(info: MediaCodecInfo): Boolean {
-        val name = info.name.lowercase()
-        return name.contains("goldfish") || name.contains("ranchu")
     }
 
     private fun isReliableSoftwareCodec(info: MediaCodecInfo): Boolean {
@@ -680,14 +675,14 @@ class PlayerActivity : Activity() {
                 if (!isFinishing && !isDestroyed) {
                     val p = player
                     if (p != null && p.isPlaying) {
-                        saveResumePosition()
+                        saveResumePositionPeriodicAsync()
                     }
-                    mainHandler.postDelayed(this, 6_000L)
+                    mainHandler.postDelayed(this, 5_000L)
                 }
             }
         }
         progressSaveRunnable = task
-        mainHandler.postDelayed(task, 6_000L)
+        mainHandler.postDelayed(task, 5_000L)
     }
 
     private fun stopPeriodicProgressSaver() {
@@ -695,18 +690,55 @@ class PlayerActivity : Activity() {
         progressSaveRunnable = null
     }
 
-    private fun saveResumePosition() {
-        player?.let { p ->
-            if (!isLive && url.isNotBlank()) {
-                val pos = p.currentPosition.coerceAtLeast(0L)
-                val dur = p.duration.takeIf { it > 0L && it != C.TIME_UNSET } ?: 0L
-                if (pos > 0L || dur > 0L) {
-                    com.minuevaapp.tv.MiTVApp.instance.store.savePlaybackProgress(progressKey, pos, dur)
-                }
-                val nearEnd = dur > 0L && (pos.toFloat() / dur.toFloat()) >= 0.95f
-                prefs.edit().putLong(url, if (nearEnd) 0L else pos).commit()
-            }
+    /**
+     * Guardado periódico cada 5s en segundo plano (Dispatchers.IO) usando .apply() en memoria RAM:
+     * Nunca bloquea el hilo principal (UI / TextureView) ni provoca recomposiciones de UI.
+     */
+    private fun saveResumePositionPeriodicAsync() {
+        val p = player ?: return
+        if (isLive || url.isBlank()) return
+        val pos = p.currentPosition.coerceAtLeast(0L)
+        val dur = p.duration.takeIf { it > 0L && it != C.TIME_UNSET } ?: 0L
+        if (pos <= 0L && dur <= 0L) return
+        val key = progressKey
+        val targetUrl = url
+
+        playerIoScope.launch(Dispatchers.IO) {
+            com.minuevaapp.tv.MiTVApp.instance.store.savePlaybackProgress(
+                id = key,
+                positionMs = pos,
+                durationMs = dur,
+                commitSync = false,
+                notifyUi = false,
+            )
+            val nearEnd = dur > 0L && (pos.toFloat() / dur.toFloat()) >= 0.95f
+            prefs.edit().putLong(targetUrl, if (nearEnd) 0L else pos).apply()
         }
+    }
+
+    /**
+     * Guardado síncrono crítico (.commit()) reservado exclusivamente para salida/pausa del ciclo
+     * de vida (onPause, onStop, onDestroy), deduplicado para no repetir fsync innecesarios.
+     */
+    private fun saveResumePositionCriticalSync() {
+        val p = player ?: return
+        if (isLive || url.isBlank()) return
+        val pos = p.currentPosition.coerceAtLeast(0L)
+        val dur = p.duration.takeIf { it > 0L && it != C.TIME_UNSET } ?: 0L
+        if (pos <= 0L && dur <= 0L) return
+        if (pos == lastCommittedPosMs && dur == lastCommittedDurMs) return
+        lastCommittedPosMs = pos
+        lastCommittedDurMs = dur
+
+        com.minuevaapp.tv.MiTVApp.instance.store.savePlaybackProgress(
+            id = progressKey,
+            positionMs = pos,
+            durationMs = dur,
+            commitSync = true,
+            notifyUi = true,
+        )
+        val nearEnd = dur > 0L && (pos.toFloat() / dur.toFloat()) >= 0.95f
+        prefs.edit().putLong(url, if (nearEnd) 0L else pos).commit()
     }
 
     override fun onResume() {
@@ -720,7 +752,7 @@ class PlayerActivity : Activity() {
     }
 
     override fun onPause() {
-        saveResumePosition()
+        saveResumePositionCriticalSync()
         playerView.onPause()
         super.onPause()
     }
@@ -730,14 +762,15 @@ class PlayerActivity : Activity() {
         cancelPendingReconnect()
         stopPeriodicProgressSaver()
         stopVideoFreezeWatchdog()
-        saveResumePosition()
+        saveResumePositionCriticalSync()
         player?.pause()
     }
 
     override fun onDestroy() {
         stopPeriodicProgressSaver()
         stopVideoFreezeWatchdog()
-        saveResumePosition()
+        saveResumePositionCriticalSync()
+        playerIoScope.cancel()
         playerView.player = null
         releasePlayer()
         super.onDestroy()
