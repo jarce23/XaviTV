@@ -1970,9 +1970,8 @@ fun IosCatalogScreen(
                 .clickable {
                     selectedLiveChannel = ch
                     store.addRecentlyViewed("live", ch.streamId)
-                    favRefresh++
                     val url = ch.directUrl?.takeIf { it.isNotBlank() }
-                        ?: repo.liveUrl(ch.streamId, "m3u8")
+                        ?: repo.liveUrl(ch.streamId, "ts")
                     onPlayStream(url, ch.name ?: "Canal", "TV en directo", true, "")
                 }
                 .padding(12.dp),
@@ -2224,9 +2223,8 @@ fun IosCatalogScreen(
                                                                         ch = ch,
                                                                         onPlay = {
                                                                             store.addRecentlyViewed("live", ch.streamId)
-                                                                            favRefresh++
                                                                             val url = ch.directUrl?.takeIf { it.isNotBlank() }
-                                                                                ?: repo.liveUrl(ch.streamId, "m3u8")
+                                                                                ?: repo.liveUrl(ch.streamId, "ts")
                                                                             onPlayStream(url, ch.name ?: "Canal", "TV en directo", true, "")
                                                                         }
                                                                     )
@@ -2266,7 +2264,7 @@ fun IosCatalogScreen(
                                         if (isWideTablet && selectedLiveChannel != null) {
                                             val ch = selectedLiveChannel!!
                                             val streamUrl = ch.directUrl?.takeIf { it.isNotBlank() }
-                                                ?: repo.liveUrl(ch.streamId, "m3u8")
+                                                ?: repo.liveUrl(ch.streamId, "ts")
                                             Surface(
                                                 color = BgCardSurface.copy(alpha = 0.92f),
                                                 border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.3f)),
@@ -2388,9 +2386,8 @@ fun IosCatalogScreen(
                                                                     ch = ch,
                                                                     onPlay = {
                                                                         store.addRecentlyViewed("live", ch.streamId)
-                                                                        favRefresh++
                                                                         val url = ch.directUrl?.takeIf { it.isNotBlank() }
-                                                                            ?: repo.liveUrl(ch.streamId, "m3u8")
+                                                                            ?: repo.liveUrl(ch.streamId, "ts")
                                                                         onPlayStream(url, ch.name ?: "Canal", "TV en directo", true, "")
                                                                     }
                                                                 )
@@ -3022,7 +3019,7 @@ fun IosSearchScreen(
                                     subtitle = "LIVE",
                                     onClick = {
                                         val url = ch.directUrl?.takeIf { it.isNotBlank() }
-                                            ?: repo.liveUrl(ch.streamId, "m3u8")
+                                            ?: repo.liveUrl(ch.streamId, "ts")
                                         onPlayLive(ch, url)
                                     }
                                 )

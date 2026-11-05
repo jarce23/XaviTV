@@ -866,10 +866,10 @@ class XtreamRepository(
     }
 
     /**
-     * En iOS (AVPlayer), los flujos en directo de Xtream Codes se sirven preferiblemente en formato .m3u8
-     * con fallback automático a .ts en el reproductor nativo.
+     * En iOS (VLCKit), los flujos en directo de Xtream Codes se sirven directamente en formato .ts
+     * (igual que en Android y Windows Desktop) con fallback automático a .m3u8 en el reproductor nativo.
      */
-    fun liveUrl(streamId: String, ext: String = "m3u8"): String =
+    fun liveUrl(streamId: String, ext: String = "ts"): String =
         resolveDirectUrl(streamId) ?: "$base/live/$u/$p/$streamId.$ext"
 
     fun movieUrl(streamId: String, ext: String?): String =
