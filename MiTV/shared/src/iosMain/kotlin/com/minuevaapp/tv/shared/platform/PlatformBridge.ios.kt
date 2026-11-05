@@ -321,6 +321,28 @@ private fun buildIosCandidateStreamUrls(originalUrl: String, isLive: Boolean): L
 }
 
 @Composable
+private fun IsolatedIosVlcSurface(
+    onViewCreated: (UIView) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    UIKitView(
+        factory = {
+            val rawClass = NSClassFromString("VLCPlayerHostView") ?: NSClassFromString("iosApp.VLCPlayerHostView")
+            val classAsObj = rawClass as? NSObject
+            val view = vlcPlayerViewFactory?.invoke()
+                ?: (classAsObj?.performSelector(NSSelectorFromString("new")) as? UIView)
+                ?: UIView().apply { backgroundColor = UIColor.blackColor }
+            onViewCreated(view)
+            view
+        },
+        update = { _ ->
+            // Intencionalmente vacío: evita reasignar el reproductor o destruir el Surface en recomposiciones
+        },
+        modifier = modifier
+    )
+}
+
+@Composable
 actual fun NativeVideoPlayer(
     url: String,
     title: String,
@@ -503,18 +525,9 @@ actual fun NativeVideoPlayer(
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // Vista nativa UIKit alojada: VLCPlayerHostView con decodificador MobileVLCKit / LibVLC
-        UIKitView(
-            factory = {
-                val rawClass = NSClassFromString("VLCPlayerHostView") ?: NSClassFromString("iosApp.VLCPlayerHostView")
-                val classAsObj = rawClass as? NSObject
-                val view = vlcPlayerViewFactory?.invoke()
-                    ?: (classAsObj?.performSelector(NSSelectorFromString("new")) as? UIView)
-                    ?: UIView().apply { backgroundColor = UIColor.blackColor }
-                hostViewRef = view
-                view
-            },
-            update = { _ -> },
+        // Vista nativa UIKit alojada en un @Composable aislado sin lectura de State:
+        IsolatedIosVlcSurface(
+            onViewCreated = { view -> hostViewRef = view },
             modifier = Modifier.fillMaxSize()
         )
 

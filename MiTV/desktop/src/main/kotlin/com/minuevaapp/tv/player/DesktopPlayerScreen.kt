@@ -7,10 +7,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -25,21 +23,16 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.awt.SwingPanel
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.FilterQuality
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.input.pointer.pointerHoverIcon
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.minuevaapp.tv.ui.LocalAppState
@@ -55,53 +48,42 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import org.jetbrains.skia.Bitmap
-import org.jetbrains.skia.ColorAlphaType
-import org.jetbrains.skia.ColorType
-import org.jetbrains.skia.Image
-import org.jetbrains.skia.ImageInfo
 import uk.co.caprica.vlcj.binding.support.runtime.RuntimeUtil
 import uk.co.caprica.vlcj.factory.MediaPlayerFactory
 import uk.co.caprica.vlcj.factory.discovery.NativeDiscovery
 import uk.co.caprica.vlcj.player.base.MediaPlayer
 import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter
-import uk.co.caprica.vlcj.player.embedded.EmbeddedMediaPlayer
-import uk.co.caprica.vlcj.player.embedded.videosurface.CallbackVideoSurface
-import uk.co.caprica.vlcj.player.embedded.videosurface.VideoSurfaceAdapters
-import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormat
-import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormatCallbackAdapter
-import uk.co.caprica.vlcj.player.embedded.videosurface.callback.RenderCallback
-import uk.co.caprica.vlcj.player.embedded.videosurface.callback.format.RV32BufferFormat
+import uk.co.caprica.vlcj.player.component.CallbackMediaPlayerComponent
 import java.awt.AWTEvent
+import java.awt.BorderLayout
 import java.awt.Cursor
 import java.awt.Desktop
 import java.awt.Point
 import java.awt.Toolkit
 import java.awt.event.AWTEventListener
+import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.event.MouseMotionAdapter
 import java.awt.image.BufferedImage
 import java.io.File
 import java.net.URI
-import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
+import javax.swing.JPanel
 import javax.swing.SwingUtilities
 import kotlin.math.abs
-import kotlin.math.roundToInt
 
 private const val VLC_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-private const val LIVE_CACHING_MS = 1500
-private const val VOD_CACHING_MS = 2000
+private const val LIVE_CACHING_MS = 300
+private const val VOD_CACHING_MS = 600
 private const val MAX_AUTO_RETRIES = 3
 private const val FULLSCREEN_CONTROLS_HIDE_DELAY_MS = 3_000L
 
 /**
  * Estado aislado del reloj de reproducción VOD para que las actualizaciones de tiempo (cada 1s)
- * y el guardado periódico (cada 5s) jamás recompongan la pantalla completa ni el lienzo de vídeo.
+ * y el guardado periódico (cada 5s) jamás recompongan la pantalla del reproductor ni el SwingPanel.
  */
 @Stable
 private class PlaybackClockState {
@@ -142,210 +124,55 @@ private class PlaybackClockState {
 }
 
 /**
- * Superficie de vídeo de alta definición 1:1 (HiDPI / Full HD / 4K) sobre Skia/Compose Desktop:
- * - El hilo nativo C de LibVLC (`updateFrame`) solo copia bytes en un doble búfer RAM reutilizable
- *   sin tocar objetos Skia ni mutar estados de Compose fuera del hilo UI.
- * - Programa un repintado coalescente en el EDT (`SwingUtilities.invokeLater`) que despierta solo
- *   la fase de dibujado (`Canvas`) de `IsolatedHiDpiVideoCanvas`, con cero recomposiciones.
- * - En la fase de dibujado crea un `org.jetbrains.skia.Image` fresco (liberando el anterior) y
- *   lo escala con `FilterQuality.High` (interpolación bicúbica) sin texturas GPU congeladas.
- */
-private class HiDpiComposeVideoSurface {
-    private val frameLock = Any()
-    private var frontPixels: ByteArray? = null
-    private var backPixels: ByteArray? = null
-    private var uploadStagingPixels: ByteArray? = null
-
-    private var skiaBitmap: Bitmap? = null
-    private var currentSkiaImage: Image? = null
-    private var currentComposeBitmap: ImageBitmap? = null
-    private var uploadedSeq: Long = 0L
-
-    private val frameSeq = AtomicLong(0L)
-    private val repaintScheduled = AtomicBoolean(false)
-
-    @Volatile
-    var videoWidth: Int = 0
-        private set
-
-    @Volatile
-    var videoHeight: Int = 0
-        private set
-
-    val frameTickState = mutableLongStateOf(0L)
-
-    fun updateFrame(nativeBuffers: Array<ByteBuffer>, bufferFormat: BufferFormat) {
-        val w = bufferFormat.width
-        val h = bufferFormat.height
-        if (w <= 0 || h <= 0 || nativeBuffers.isEmpty()) return
-        val byteCount = w * h * 4
-        val srcBuffer = nativeBuffers[0]
-        if (srcBuffer.remaining() < byteCount) return
-
-        synchronized(frameLock) {
-            var writeBuf = backPixels
-            if (writeBuf == null || writeBuf.size != byteCount) {
-                writeBuf = ByteArray(byteCount)
-            }
-            srcBuffer.rewind()
-            srcBuffer.get(writeBuf, 0, byteCount)
-
-            val prevFront = frontPixels
-            frontPixels = writeBuf
-            backPixels = prevFront
-            videoWidth = w
-            videoHeight = h
-            frameSeq.incrementAndGet()
-        }
-
-        if (repaintScheduled.compareAndSet(false, true)) {
-            SwingUtilities.invokeLater {
-                repaintScheduled.set(false)
-                frameTickState.longValue = frameSeq.get()
-            }
-        }
-    }
-
-    /**
-     * Debe invocarse exclusivamente desde el hilo UI/Render dentro del bloque DrawScope del Canvas.
-     */
-    fun prepareCurrentFrameForDraw(): Triple<ImageBitmap, Int, Int>? {
-        val latestSeq = frameSeq.get()
-        if (latestSeq <= 0L) return null
-
-        if (uploadedSeq != latestSeq || currentComposeBitmap == null) {
-            val w: Int
-            val h: Int
-            val byteCount: Int
-            val localCopy: ByteArray
-
-            synchronized(frameLock) {
-                val src = frontPixels ?: return null
-                w = videoWidth
-                h = videoHeight
-                byteCount = w * h * 4
-                if (w <= 0 || h <= 0 || src.size < byteCount) return null
-                var staging = uploadStagingPixels
-                if (staging == null || staging.size != byteCount) {
-                    staging = ByteArray(byteCount)
-                    uploadStagingPixels = staging
-                }
-                System.arraycopy(src, 0, staging, 0, byteCount)
-                localCopy = staging
-            }
-
-            var bmp = skiaBitmap
-            if (bmp == null || bmp.width != w || bmp.height != h) {
-                runCatching { bmp?.close() }
-                val created = Bitmap()
-                created.allocPixels(ImageInfo(w, h, ColorType.BGRA_8888, ColorAlphaType.OPAQUE))
-                skiaBitmap = created
-                bmp = created
-            }
-            bmp.installPixels(bmp.imageInfo, localCopy, w * 4)
-            bmp.notifyPixelsChanged()
-
-            val prevImage = currentSkiaImage
-            val freshImage = Image.makeFromBitmap(bmp)
-            currentSkiaImage = freshImage
-            currentComposeBitmap = freshImage.toComposeImageBitmap()
-            uploadedSeq = latestSeq
-            runCatching { prevImage?.close() }
-        }
-
-        val img = currentComposeBitmap ?: return null
-        val drawW = videoWidth
-        val drawH = videoHeight
-        if (drawW <= 0 || drawH <= 0) return null
-        return Triple(img, drawW, drawH)
-    }
-
-    fun release() {
-        val prevImg: Image?
-        val prevBmp: Bitmap?
-        synchronized(frameLock) {
-            frontPixels = null
-            backPixels = null
-            uploadStagingPixels = null
-            videoWidth = 0
-            videoHeight = 0
-            prevImg = currentSkiaImage
-            prevBmp = skiaBitmap
-            currentSkiaImage = null
-            currentComposeBitmap = null
-            skiaBitmap = null
-        }
-        val cleanup = Runnable {
-            runCatching { prevImg?.close() }
-            runCatching { prevBmp?.close() }
-        }
-        if (SwingUtilities.isEventDispatchThread()) {
-            cleanup.run()
-        } else {
-            SwingUtilities.invokeLater(cleanup)
-        }
-    }
-}
-
-/**
- * Lienzo aislado para el fotograma de vídeo: solo ejecuta la fase Draw de Skia a 50/60fps,
- * sin recomponer jamás `DesktopPlayerScreen` ni las barras de controles.
+ * Contenedor aislado del reproductor de vídeo VLCJ:
+ * - NO lee ningún State cambiante (ni progreso, ni reloj, ni visibilidad de controles).
+ * - El bloque update = {} está vacío para no reasignar ni recrear la superficie de vídeo.
  */
 @Composable
-private fun IsolatedHiDpiVideoCanvas(
-    surface: HiDpiComposeVideoSurface,
-    modifier: Modifier = Modifier,
+private fun IsolatedVlcSwingSurface(
+    swingContainerRef: MutableState<JPanel?>,
+    vlcComponentRef: MutableState<CallbackMediaPlayerComponent?>,
+    onMouseMoved: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    Canvas(modifier = modifier) {
-        val tick = surface.frameTickState.longValue
-        if (tick > 0L) {
-            val frame = surface.prepareCurrentFrameForDraw()
-            if (frame != null) {
-                val (bmp, srcW, srcH) = frame
-                val canvasW = size.width
-                val canvasH = size.height
-                if (canvasW > 0f && canvasH > 0f) {
-                    val srcAspect = srcW.toFloat() / srcH.toFloat()
-                    val dstAspect = canvasW / canvasH
-                    val drawW: Int
-                    val drawH: Int
-                    if (srcAspect > dstAspect) {
-                        drawW = canvasW.roundToInt()
-                        drawH = (canvasW / srcAspect).roundToInt().coerceAtLeast(1)
-                    } else {
-                        drawH = canvasH.roundToInt()
-                        drawW = (canvasH * srcAspect).roundToInt().coerceAtLeast(1)
+    SwingPanel(
+        background = Color.Black,
+        modifier = modifier,
+        factory = {
+            JPanel(BorderLayout()).apply {
+                background = java.awt.Color.BLACK
+                addMouseMotionListener(object : MouseMotionAdapter() {
+                    override fun mouseMoved(e: MouseEvent) {
+                        onMouseMoved()
                     }
-                    val offsetX = ((canvasW.roundToInt() - drawW) / 2).coerceAtLeast(0)
-                    val offsetY = ((canvasH.roundToInt() - drawH) / 2).coerceAtLeast(0)
-                    drawImage(
-                        image = bmp,
-                        srcOffset = IntOffset.Zero,
-                        srcSize = IntSize(srcW, srcH),
-                        dstOffset = IntOffset(offsetX, offsetY),
-                        dstSize = IntSize(drawW, drawH),
-                        filterQuality = FilterQuality.High
-                    )
+                })
+                swingContainerRef.value = this
+                vlcComponentRef.value?.let { existingComp ->
+                    if (existingComp.parent !== this) {
+                        add(existingComp, BorderLayout.CENTER)
+                    }
                 }
             }
+        },
+        update = {
+            // Intencionalmente vacío: evita reasignar el reproductor o invalidar el Surface en recomposiciones
         }
-    }
+    )
 }
 
 @Composable
 private fun VodProgressSlider(
     clockState: PlaybackClockState,
-    onSeekMs: (Long) -> Unit,
+    onSeek: (Long) -> Unit
 ) {
-    val cur = clockState.uiPosMs.longValue
-    val tot = clockState.uiDurationMs.longValue
-    if (tot > 0L) {
+    val curPos = clockState.uiPosMs.longValue
+    val totDur = clockState.uiDurationMs.longValue
+    if (totDur > 0L) {
         Slider(
-            value = (cur.toFloat() / tot.toFloat()).coerceIn(0f, 1f),
+            value = (curPos.toFloat() / totDur.toFloat()).coerceIn(0f, 1f),
             onValueChange = { fraction ->
-                val targetMs = (fraction * tot).toLong()
-                clockState.seekFromUi(targetMs)
-                onSeekMs(targetMs)
+                val targetMs = (fraction * totDur).toLong()
+                onSeek(targetMs)
             },
             colors = SliderDefaults.colors(
                 thumbColor = GoldAccent,
@@ -359,10 +186,10 @@ private fun VodProgressSlider(
 
 @Composable
 private fun VodTimeLabel(clockState: PlaybackClockState) {
-    val cur = clockState.uiPosMs.longValue
-    val tot = clockState.uiDurationMs.longValue
+    val curPos = clockState.uiPosMs.longValue
+    val totDur = clockState.uiDurationMs.longValue
     Text(
-        "${formatTimeMs(cur)} / ${formatTimeMs(tot)}",
+        "${formatTimeMs(curPos)} / ${formatTimeMs(totDur)}",
         color = TextSilverGray,
         fontSize = 12.sp
     )
@@ -389,36 +216,25 @@ fun DesktopPlayerScreen(
     var isPlaying by remember { mutableStateOf(true) }
     var isMuted by remember { mutableStateOf(false) }
     var volume by remember { mutableFloatStateOf(1.0f) }
-    // Con CallbackVideoSurface (vmem en RAM), FFmpeg multinúcleo (:avcodec-hw=none) evita bloqueos
-    // de readback GPU->CPU D3D11VA en LibVLC 3.x manteniendo el filtro deblocking FHD al 100%.
-    var useHardwareVmem by remember { mutableStateOf(false) }
+    var useSoftwareDecoder by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    var statusBanner by remember { mutableStateOf<String?>("Conectando canal FHD...") }
+    var statusBanner by remember { mutableStateOf<String?>("Conectando canal...") }
     var externalNotice by remember { mutableStateOf<String?>(null) }
     var autoRetryCount by remember { mutableIntStateOf(0) }
     var reloadTrigger by remember { mutableIntStateOf(0) }
 
     var videoResolutionText by remember { mutableStateOf("") }
-    val clockState = remember { PlaybackClockState() }
-    val seekAppliedRef = remember { AtomicBoolean(false) }
-    val bestTrackSelectedRef = remember { AtomicBoolean(false) }
+    val clockState = remember(url) { PlaybackClockState() }
+    var seekApplied by remember { mutableStateOf(false) }
 
     // Estado de visibilidad de controles para el modo inmersivo en pantalla completa
     var controlsVisible by remember { mutableStateOf(true) }
-    var lastMouseActivityMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    val lastMouseActivityMsRef = remember { java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis()) }
     var lastScreenX by remember { mutableIntStateOf(-1) }
     var lastScreenY by remember { mutableIntStateOf(-1) }
 
-    val mediaPlayerRef = remember { mutableStateOf<EmbeddedMediaPlayer?>(null) }
-    val hiDpiSurface = remember { HiDpiComposeVideoSurface() }
-
-    fun runOnUi(block: () -> Unit) {
-        if (SwingUtilities.isEventDispatchThread()) {
-            block()
-        } else {
-            SwingUtilities.invokeLater(block)
-        }
-    }
+    val vlcComponentRef = remember { mutableStateOf<CallbackMediaPlayerComponent?>(null) }
+    val swingContainerRef = remember { mutableStateOf<JPanel?>(null) }
 
     // Cursor invisible para cuando los controles se ocultan en pantalla completa
     val blankCursor = remember {
@@ -428,66 +244,50 @@ fun DesktopPlayerScreen(
         }.getOrDefault(Cursor.getDefaultCursor())
     }
 
-    fun notifyMouseActivity() {
-        lastMouseActivityMs = System.currentTimeMillis()
-        if (!controlsVisible) {
-            controlsVisible = true
+    fun updateVideoSurfaceCursor(visible: Boolean) {
+        val targetCursor = if (visible || !isFullscreen) Cursor.getDefaultCursor() else blankCursor
+        SwingUtilities.invokeLater {
+            swingContainerRef.value?.cursor = targetCursor
+            vlcComponentRef.value?.cursor = targetCursor
+            vlcComponentRef.value?.videoSurfaceComponent()?.cursor = targetCursor
         }
     }
 
-    /**
-     * Si el canal es un flujo HLS/M3U8 o MPEG-TS multipista, selecciona en Dispatchers.IO la
-     * pista de vídeo con mayor resolución (1080p FHD / 4K) y mayor bitrate disponible.
-     */
-    fun selectHighestQualityVideoTrackBg(mp: MediaPlayer) {
-        runCatching {
-            val videoTracks = mp.media().info()?.videoTracks().orEmpty()
-            if (videoTracks.size > 1) {
-                val bestTrack = videoTracks.maxByOrNull { track ->
-                    (track.width().toLong() * track.height().toLong()) * 10_000_000L + track.bitRate().toLong().coerceAtLeast(0L)
-                }
-                if (bestTrack != null && bestTrack.id() >= 0) {
-                    val currentId = mp.video().track()
-                    if (currentId != bestTrack.id()) {
-                        mp.video().setTrack(bestTrack.id())
-                    }
-                    val bw = bestTrack.width()
-                    val bh = bestTrack.height()
-                    if (bw > 0 && bh > 0) {
-                        val label = "${bw}×${bh}"
-                        runOnUi {
-                            if (videoResolutionText != label) videoResolutionText = label
-                        }
-                    }
-                }
-            }
+    fun notifyMouseActivity() {
+        lastMouseActivityMsRef.set(System.currentTimeMillis())
+        if (!controlsVisible) {
+            controlsVisible = true
+            updateVideoSurfaceCursor(true)
         }
     }
 
     // Al entrar o salir de pantalla completa, sincronizar visibilidad y temporizador de inactividad
     LaunchedEffect(isFullscreen) {
-        lastMouseActivityMs = System.currentTimeMillis()
+        lastMouseActivityMsRef.set(System.currentTimeMillis())
         controlsVisible = true
+        updateVideoSurfaceCursor(true)
     }
 
     // Temporizador automático que oculta las barras tras 3 segundos de inactividad en pantalla completa
-    LaunchedEffect(isFullscreen, controlsVisible, lastMouseActivityMs) {
+    LaunchedEffect(isFullscreen, controlsVisible) {
         if (!isFullscreen) {
             controlsVisible = true
+            updateVideoSurfaceCursor(true)
             return@LaunchedEffect
         }
         while (isFullscreen && controlsVisible) {
-            val elapsed = System.currentTimeMillis() - lastMouseActivityMs
+            val elapsed = System.currentTimeMillis() - lastMouseActivityMsRef.get()
             val remaining = FULLSCREEN_CONTROLS_HIDE_DELAY_MS - elapsed
             if (remaining <= 0L) {
                 controlsVisible = false
+                updateVideoSurfaceCursor(false)
                 break
             }
             delay(remaining.coerceAtMost(250L))
         }
     }
 
-    // Detector global AWT de movimiento y clics del ratón
+    // Detector global AWT de movimiento y clics del ratón (captura eventos sobre SwingPanel / LibVLC y sobre Compose)
     DisposableEffect(Unit) {
         val awtListener = AWTEventListener { event ->
             if (event is MouseEvent) {
@@ -521,19 +321,23 @@ fun DesktopPlayerScreen(
     }
 
     fun pauseCurrentPlayback() {
+        isPlaying = false
+        val posSnapshot = clockState.rawPosMs
+        val durSnapshot = clockState.rawDurationMs
         playerIoScope.launch(Dispatchers.IO) {
-            runCatching { mediaPlayerRef.value?.controls()?.pause() }
-            if (!isLive && resumeKey.isNotEmpty() && clockState.rawPosMs > 0L) {
+            runCatching {
+                vlcComponentRef.value?.mediaPlayer()?.controls()?.pause()
+            }
+            if (!isLive && resumeKey.isNotEmpty() && posSnapshot > 0L) {
                 appState.store.savePlaybackProgress(
                     id = resumeKey,
-                    positionMs = clockState.rawPosMs,
-                    durationMs = clockState.rawDurationMs,
+                    positionMs = posSnapshot,
+                    durationMs = durSnapshot,
                     persistImmediately = false,
-                    notifyUi = false,
+                    notifyUi = false
                 )
             }
         }
-        isPlaying = false
     }
 
     fun launchExternalPlayer() {
@@ -547,9 +351,9 @@ fun DesktopPlayerScreen(
     }
 
     fun handleStreamFailure(detail: String) {
-        if (useHardwareVmem) {
-            useHardwareVmem = false
-            statusBanner = "Conmutando a decodificación multinúcleo directa (SW)..."
+        if (!useSoftwareDecoder) {
+            useSoftwareDecoder = true
+            statusBanner = "Conmutando a decodificación VLC por software (SW)..."
             return
         }
         if (autoRetryCount < MAX_AUTO_RETRIES) {
@@ -577,49 +381,56 @@ fun DesktopPlayerScreen(
         }
     }
 
-    // Telemetría y guardado periódico VOD cada 5s íntegramente en Dispatchers.IO sin bloquear UI ni recomponer pantalla
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            var tickCount = 0
-            while (true) {
-                delay(1000L)
-                tickCount++
-                val mp = mediaPlayerRef.value ?: continue
-                val playingNow = runCatching { mp.status().isPlaying }.getOrDefault(false)
-                if (!playingNow) continue
-
-                if (!bestTrackSelectedRef.get()) {
-                    bestTrackSelectedRef.set(true)
-                    selectHighestQualityVideoTrackBg(mp)
-                }
-
-                val sw = hiDpiSurface.videoWidth
-                val sh = hiDpiSurface.videoHeight
-                if (sw > 0 && sh > 0) {
-                    val resLabel = "${sw}×${sh}"
-                    if (videoResolutionText != resLabel) {
-                        runOnUi {
-                            if (videoResolutionText != resLabel) videoResolutionText = resLabel
+    // Guardado periódico de progreso VOD (cada 5 segundos) en Dispatchers.IO y actualización de reloj aislada
+    LaunchedEffect(url, isLive) {
+        var tickCount = 0
+        while (true) {
+            delay(1000)
+            tickCount++
+            val mp = vlcComponentRef.value?.mediaPlayer()
+            if (mp != null) {
+                val snapshot = withContext(Dispatchers.IO) {
+                    val playingNow = runCatching { mp.status().isPlaying }.getOrDefault(false)
+                    if (!playingNow) {
+                        null
+                    } else {
+                        val cur = if (!isLive) {
+                            runCatching { mp.status().time() }.getOrDefault(0L).coerceAtLeast(0L)
+                        } else {
+                            0L
                         }
+                        val tot = if (!isLive) {
+                            runCatching { mp.status().length() }.getOrDefault(0L)
+                        } else {
+                            0L
+                        }
+                        val dim = if (videoResolutionText.isEmpty()) {
+                            runCatching { mp.video().videoDimension() }.getOrNull()
+                        } else {
+                            null
+                        }
+                        Triple(cur, tot, dim)
                     }
                 }
 
-                if (!isLive) {
-                    val cur = runCatching { mp.status().time() }.getOrDefault(0L).coerceAtLeast(0L)
-                    val tot = runCatching { mp.status().length() }.getOrDefault(0L)
-                    clockState.updateFromBackground(
-                        posMs = cur,
-                        durMs = tot,
-                        publishToUi = !isFullscreen || controlsVisible,
-                    )
-                    if (resumeKey.isNotEmpty() && cur > 2_000L && tickCount % 5 == 0) {
+                if (snapshot != null) {
+                    val (cur, tot, dim) = snapshot
+                    if (!isLive) {
+                        val barVisible = !isFullscreen || controlsVisible
+                        clockState.updateFromBackground(cur, tot, publishToUi = barVisible)
+                    }
+                    if (dim != null && dim.width > 0 && dim.height > 0 && videoResolutionText.isEmpty()) {
+                        videoResolutionText = "${dim.width}×${dim.height}"
+                    }
+                    if (!isLive && resumeKey.isNotEmpty() && cur > 2_000L && tickCount % 5 == 0) {
+                        val durToSave = clockState.rawDurationMs
                         playerIoScope.launch(Dispatchers.IO) {
                             appState.store.savePlaybackProgress(
                                 id = resumeKey,
                                 positionMs = cur,
-                                durationMs = clockState.rawDurationMs,
+                                durationMs = durToSave,
                                 persistImmediately = false,
-                                notifyUi = false,
+                                notifyUi = false
                             )
                         }
                     }
@@ -628,20 +439,20 @@ fun DesktopPlayerScreen(
         }
     }
 
-    // Inicialización de LibVLC en Dispatchers.IO con renderizado nativo 1:1 HiDPI y desentrelazado FHD
-    LaunchedEffect(url, useHardwareVmem, reloadTrigger, errorMessage) {
+    // Carga perezosa (Lazy Initialization) de LibVLC en Dispatchers.IO y zapping ultrarrápido (300ms buffer)
+    LaunchedEffect(url, useSoftwareDecoder, reloadTrigger, errorMessage) {
         if (errorMessage != null) return@LaunchedEffect
 
         isBuffering = true
         videoResolutionText = ""
-        seekAppliedRef.set(false)
-        bestTrackSelectedRef.set(false)
-        statusBanner = if (useHardwareVmem) {
-            "FHD 1:1 · Motor VLCJ (HW · ${LIVE_CACHING_MS}ms)..."
+        seekApplied = false
+        statusBanner = if (useSoftwareDecoder) {
+            "Zapping rápido · Motor VLCJ (SW · ${LIVE_CACHING_MS}ms)..."
         } else {
-            "FHD 1:1 · Motor VLCJ (Multicore · ${LIVE_CACHING_MS}ms)..."
+            "Zapping rápido · Motor VLCJ (HW · ${LIVE_CACHING_MS}ms)..."
         }
 
+        // 1. Inicialización perezosa de LibVLC exclusivamente al entrar al reproductor y en Dispatchers.IO
         val factory = VlcRuntimeManager.ensureFactoryInitializedAsync()
         if (factory == null) {
             isBuffering = false
@@ -652,167 +463,186 @@ fun DesktopPlayerScreen(
             return@LaunchedEffect
         }
 
-        var mp = mediaPlayerRef.value
-        if (mp == null) {
+        // 2. Esperar a que el contenedor Swing esté montado (intervalo corto de 10ms para no retrasar el zapping)
+        var waitTicks = 0
+        while (swingContainerRef.value == null && waitTicks < 40) {
+            delay(10)
+            waitTicks++
+        }
+
+        // 3. Crear el CallbackMediaPlayerComponent una sola vez y montarlo en AWT
+        var comp = vlcComponentRef.value
+        if (comp == null) {
             val created = withContext(Dispatchers.IO) {
                 runCatching {
-                    val player = factory.mediaPlayers().newEmbeddedMediaPlayer()
-                    val bufferFormatCallback = object : BufferFormatCallbackAdapter() {
-                        override fun getBufferFormat(sourceWidth: Int, sourceHeight: Int): BufferFormat {
-                            // Mantiene estrictamente la resolución nativa 1:1 del vídeo (1920x1080 o superior)
-                            val w = sourceWidth.coerceAtLeast(1)
-                            val h = sourceHeight.coerceAtLeast(1)
-                            val label = "${w}×${h}"
-                            runOnUi {
-                                if (videoResolutionText != label) videoResolutionText = label
+                    CallbackMediaPlayerComponent(factory, null, null, true, null).apply {
+                        background = java.awt.Color.BLACK
+                        videoSurfaceComponent().background = java.awt.Color.BLACK
+
+                        val swingMotionListener = object : MouseMotionAdapter() {
+                            override fun mouseMoved(e: MouseEvent) {
+                                notifyMouseActivity()
                             }
-                            return RV32BufferFormat(w, h)
+
+                            override fun mouseDragged(e: MouseEvent) {
+                                notifyMouseActivity()
+                            }
                         }
-                    }
-                    val renderCallback = RenderCallback { _, nativeBuffers, bufferFormat ->
-                        hiDpiSurface.updateFrame(nativeBuffers, bufferFormat)
-                    }
-                    val videoSurface = CallbackVideoSurface(
-                        bufferFormatCallback,
-                        renderCallback,
-                        true,
-                        VideoSurfaceAdapters.getVideoSurfaceAdapter()
-                    )
-                    player.videoSurface().set(videoSurface)
-
-                    player.events().addMediaPlayerEventListener(
-                        object : MediaPlayerEventAdapter() {
-                            override fun opening(mediaPlayer: MediaPlayer) {
-                                runOnUi { isBuffering = true }
+                        val swingClickListener = object : MouseAdapter() {
+                            override fun mousePressed(e: MouseEvent) {
+                                notifyMouseActivity()
                             }
 
-                            override fun buffering(mediaPlayer: MediaPlayer, newCache: Float) {
-                                val pct = newCache.toInt()
-                                if (pct < 100) {
-                                    // Solo actualizamos el banner al principio para no forzar recomposiciones continuas
-                                    if (pct == 0 || pct >= 95) {
-                                        runOnUi {
-                                            isBuffering = true
-                                            statusBanner = "Búfer FHD ($pct%)..."
+                            override fun mouseClicked(e: MouseEvent) {
+                                notifyMouseActivity()
+                                if (e.clickCount == 2 && SwingUtilities.isLeftMouseButton(e)) {
+                                    onToggleFullscreen()
+                                }
+                            }
+                        }
+                        addMouseMotionListener(swingMotionListener)
+                        addMouseListener(swingClickListener)
+                        videoSurfaceComponent().addMouseMotionListener(swingMotionListener)
+                        videoSurfaceComponent().addMouseListener(swingClickListener)
+
+                        mediaPlayer().events().addMediaPlayerEventListener(
+                            object : MediaPlayerEventAdapter() {
+                                override fun opening(mediaPlayer: MediaPlayer) {
+                                    SwingUtilities.invokeLater {
+                                        isBuffering = true
+                                    }
+                                }
+
+                                override fun buffering(mediaPlayer: MediaPlayer, newCache: Float) {
+                                    SwingUtilities.invokeLater {
+                                        if (newCache < 100f) {
+                                            if (!isBuffering) isBuffering = true
+                                        } else {
+                                            if (isBuffering) isBuffering = false
+                                            if (statusBanner != null) statusBanner = null
                                         }
                                     }
-                                } else {
-                                    runOnUi {
+                                }
+
+                                override fun playing(mediaPlayer: MediaPlayer) {
+                                    SwingUtilities.invokeLater {
                                         isBuffering = false
+                                        isPlaying = true
                                         statusBanner = null
+                                        errorMessage = null
+                                        autoRetryCount = 0
                                     }
-                                }
-                            }
 
-                            override fun playing(mediaPlayer: MediaPlayer) {
-                                runOnUi {
-                                    isBuffering = false
-                                    isPlaying = true
-                                    statusBanner = null
-                                    errorMessage = null
-                                    autoRetryCount = 0
-                                }
-
-                                // Todas las llamadas hacia MediaPlayer deben ejecutarse fuera del hilo de eventos de LibVLC
-                                playerIoScope.launch(Dispatchers.IO) {
-                                    if (!isLive && resumeKey.isNotEmpty() && seekAppliedRef.compareAndSet(false, true)) {
+                                    if (!isLive && !seekApplied && resumeKey.isNotEmpty()) {
+                                        seekApplied = true
                                         val savedProg = appState.store.getPlaybackProgress(resumeKey)
                                         val savedPos = savedProg?.resumePositionMs
                                             ?: appState.store.getResumePosition(resumeKey)
                                         if (savedPos > 0L) {
-                                            runCatching { mediaPlayer.controls().setTime(savedPos) }
-                                        }
-                                    }
-                                    selectHighestQualityVideoTrackBg(mediaPlayer)
-                                }
-                            }
-
-                            override fun paused(mediaPlayer: MediaPlayer) {
-                                runOnUi { isPlaying = false }
-                                if (!isLive && resumeKey.isNotEmpty() && clockState.rawPosMs > 0L) {
-                                    val pos = clockState.rawPosMs
-                                    val dur = clockState.rawDurationMs
-                                    playerIoScope.launch(Dispatchers.IO) {
-                                        appState.store.savePlaybackProgress(
-                                            id = resumeKey,
-                                            positionMs = pos,
-                                            durationMs = dur,
-                                            persistImmediately = false,
-                                            notifyUi = false,
-                                        )
-                                    }
-                                }
-                            }
-
-                            override fun finished(mediaPlayer: MediaPlayer) {
-                                if (!isLive && resumeKey.isNotEmpty() && clockState.rawDurationMs > 0L) {
-                                    val dur = clockState.rawDurationMs
-                                    playerIoScope.launch(Dispatchers.IO) {
-                                        appState.store.savePlaybackProgress(
-                                            id = resumeKey,
-                                            positionMs = dur,
-                                            durationMs = dur,
-                                            persistImmediately = true,
-                                            notifyUi = true,
-                                        )
-                                    }
-                                }
-                            }
-
-                            override fun videoOutput(mediaPlayer: MediaPlayer, newCount: Int) {
-                                runOnUi {
-                                    isBuffering = false
-                                    statusBanner = null
-                                }
-                                playerIoScope.launch(Dispatchers.IO) {
-                                    selectHighestQualityVideoTrackBg(mediaPlayer)
-                                    val dim = runCatching { mediaPlayer.video().videoDimension() }.getOrNull()
-                                    if (dim != null && dim.width > 0 && dim.height > 0) {
-                                        val label = "${dim.width}×${dim.height}"
-                                        runOnUi {
-                                            if (videoResolutionText != label) videoResolutionText = label
+                                            playerIoScope.launch(Dispatchers.IO) {
+                                                runCatching { mediaPlayer.controls().setTime(savedPos) }
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            override fun timeChanged(mediaPlayer: MediaPlayer, newTime: Long) {
-                                if (!isLive && newTime >= 0L) {
-                                    clockState.rawPosMs = newTime
+                                override fun paused(mediaPlayer: MediaPlayer) {
+                                    SwingUtilities.invokeLater {
+                                        isPlaying = false
+                                    }
+                                    val posSnapshot = clockState.rawPosMs
+                                    val durSnapshot = clockState.rawDurationMs
+                                    if (!isLive && resumeKey.isNotEmpty() && posSnapshot > 0L) {
+                                        playerIoScope.launch(Dispatchers.IO) {
+                                            appState.store.savePlaybackProgress(
+                                                id = resumeKey,
+                                                positionMs = posSnapshot,
+                                                durationMs = durSnapshot,
+                                                persistImmediately = false,
+                                                notifyUi = false
+                                            )
+                                        }
+                                    }
                                 }
-                                if (isBuffering && newTime > 0L) {
-                                    runOnUi {
-                                        isBuffering = false
-                                        statusBanner = null
+
+                                override fun finished(mediaPlayer: MediaPlayer) {
+                                    val durSnapshot = clockState.rawDurationMs
+                                    if (!isLive && resumeKey.isNotEmpty() && durSnapshot > 0L) {
+                                        playerIoScope.launch(Dispatchers.IO) {
+                                            appState.store.savePlaybackProgress(
+                                                id = resumeKey,
+                                                positionMs = durSnapshot,
+                                                durationMs = durSnapshot,
+                                                persistImmediately = false,
+                                                notifyUi = true
+                                            )
+                                        }
+                                    }
+                                }
+
+                                override fun videoOutput(mediaPlayer: MediaPlayer, newCount: Int) {
+                                    playerIoScope.launch(Dispatchers.IO) {
+                                        val dim = runCatching { mediaPlayer.video().videoDimension() }.getOrNull()
+                                        SwingUtilities.invokeLater {
+                                            isBuffering = false
+                                            statusBanner = null
+                                            if (dim != null && dim.width > 0 && dim.height > 0) {
+                                                videoResolutionText = "${dim.width}×${dim.height}"
+                                            }
+                                            swingContainerRef.value?.let { container ->
+                                                container.revalidate()
+                                                container.repaint()
+                                            }
+                                        }
+                                    }
+                                }
+
+                                override fun timeChanged(mediaPlayer: MediaPlayer, newTime: Long) {
+                                    val clean = newTime.coerceAtLeast(0L)
+                                    clockState.rawPosMs = clean
+                                    if (isBuffering && clean > 0L) {
+                                        SwingUtilities.invokeLater {
+                                            isBuffering = false
+                                            statusBanner = null
+                                        }
+                                    }
+                                }
+
+                                override fun lengthChanged(mediaPlayer: MediaPlayer, newLength: Long) {
+                                    if (newLength > 0L && newLength < Long.MAX_VALUE / 2) {
+                                        clockState.rawDurationMs = newLength
+                                    }
+                                }
+
+                                override fun error(mediaPlayer: MediaPlayer) {
+                                    scope.launch {
+                                        handleStreamFailure("Error de flujo o contenedor en LibVLC")
                                     }
                                 }
                             }
-
-                            override fun lengthChanged(mediaPlayer: MediaPlayer, newLength: Long) {
-                                if (!isLive && newLength > 0L && newLength < Long.MAX_VALUE / 2) {
-                                    clockState.rawDurationMs = newLength
-                                }
-                            }
-
-                            override fun error(mediaPlayer: MediaPlayer) {
-                                runOnUi {
-                                    handleStreamFailure("Error de flujo o contenedor en LibVLC")
-                                }
-                            }
-                        }
-                    )
-                    player
+                        )
+                    }
                 }.getOrNull()
             }
 
             if (created == null) {
-                handleStreamFailure("No se pudo inicializar EmbeddedMediaPlayer con CallbackVideoSurface")
+                handleStreamFailure("No se pudo inicializar CallbackMediaPlayerComponent")
                 return@LaunchedEffect
             }
-            mp = created
-            mediaPlayerRef.value = created
+
+            comp = created
+            vlcComponentRef.value = created
+            SwingUtilities.invokeLater {
+                swingContainerRef.value?.let { container ->
+                    container.removeAll()
+                    container.add(created, BorderLayout.CENTER)
+                    container.revalidate()
+                    container.repaint()
+                }
+            }
         }
 
+        // 4. Iniciar reproducción directamente en Dispatchers.IO
         val cleanUrl = url.trim()
         val cachingMs = if (isLive) LIVE_CACHING_MS else VOD_CACHING_MS
         val originReferer = cleanUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}/" }
@@ -828,28 +658,18 @@ fun DesktopPlayerScreen(
             add(":clock-synchro=0")
             add(":http-reconnect")
             add(":no-sub-autodetect-file")
-            // Máxima calidad de imagen FHD 1080p/1080i sin bloquear la tubería vmem:
-            // - Filtro deblocking H.264/HEVC completo (:avcodec-skiploopfilter=0)
-            // - Decodificación multinúcleo directa a RAM (:avcodec-threads=0)
-            // - Desentrelazado fluido compatible con vmem (:deinterlace=-1, :deinterlace-mode=linear)
-            // - Máxima resolución en streams HLS/M3U8 adaptativos (:preferred-resolution=-1, :adaptive-logic=highest)
-            add(":avcodec-skiploopfilter=0")
-            add(":avcodec-threads=0")
-            add(":deinterlace=-1")
-            add(":deinterlace-mode=linear")
-            add(":preferred-resolution=-1")
-            add(":adaptive-logic=highest")
-            add(":adaptive-maxwidth=3840")
-            add(":adaptive-maxheight=2160")
-            if (useHardwareVmem) {
-                add(":avcodec-hw=any")
-            } else {
+            add(":avcodec-fast")
+            add(":avcodec-skiploopfilter=1")
+            if (useSoftwareDecoder) {
                 add(":avcodec-hw=none")
+            } else {
+                add(":avcodec-hw=any")
             }
         }.toTypedArray()
 
         withContext(Dispatchers.IO) {
             try {
+                val mp = comp.mediaPlayer()
                 mp.audio().setMute(isMuted)
                 mp.audio().setVolume((volume * 100).toInt().coerceIn(0, 100))
                 mp.media().play(cleanUrl, *mediaOptions)
@@ -863,52 +683,42 @@ fun DesktopPlayerScreen(
 
     DisposableEffect(Unit) {
         onDispose {
-            val mp = mediaPlayerRef.value
-            mediaPlayerRef.value = null
+            val comp = vlcComponentRef.value
+            vlcComponentRef.value = null
             val finalPos = clockState.rawPosMs
             val finalDur = clockState.rawDurationMs
             playerIoScope.cancel()
-            Thread {
-                if (mp != null && !isLive && resumeKey.isNotEmpty() && finalPos > 0L) {
-                    runCatching {
-                        appState.store.savePlaybackProgress(
-                            id = resumeKey,
-                            positionMs = finalPos,
-                            durationMs = finalDur,
-                            persistImmediately = true,
-                            notifyUi = true,
-                        )
-                    }
+            if (comp != null) {
+                if (!isLive && resumeKey.isNotEmpty() && finalPos > 0L) {
+                    appState.store.savePlaybackProgress(
+                        id = resumeKey,
+                        positionMs = finalPos,
+                        durationMs = finalDur,
+                        persistImmediately = true,
+                        notifyUi = true
+                    )
                 }
-                if (mp != null) {
+                Thread {
                     runCatching {
-                        mp.controls().stop()
-                        mp.release()
+                        comp.mediaPlayer().controls().stop()
+                        comp.release()
                     }
-                }
-                hiDpiSurface.release()
-            }.apply { isDaemon = true }.start()
+                }.apply { isDaemon = true }.start()
+            }
         }
     }
 
     val showBars = !isFullscreen || controlsVisible
-    val activePointerIcon = remember(isFullscreen, controlsVisible) {
-        if (isFullscreen && !controlsVisible) {
-            PointerIcon(blankCursor)
-        } else {
-            PointerIcon.Default
-        }
-    }
+    val stableMouseCallback = remember { { notifyMouseActivity() } }
 
     Box(
         Modifier
             .fillMaxSize()
             .background(if (isFullscreen) Color.Black else BgDeepCharcoal)
-            .pointerHoverIcon(activePointerIcon)
             .onPointerEvent(PointerEventType.Move) { notifyMouseActivity() }
             .onPointerEvent(PointerEventType.Press) { notifyMouseActivity() }
     ) {
-        // ─── 1. LIENZO CENTRAL DE VÍDEO FHD 1:1 CON FILTERQUALITY.HIGH ─
+        // ─── 1. LIENZO CENTRAL DE VÍDEO AISLADO (100% de la ventana en Pantalla Completa) ─
         Box(
             Modifier
                 .fillMaxSize()
@@ -917,15 +727,6 @@ fun DesktopPlayerScreen(
                     bottom = if (isFullscreen) 0.dp else 68.dp
                 )
                 .background(Color.Black)
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onTap = { notifyMouseActivity() },
-                        onDoubleTap = {
-                            notifyMouseActivity()
-                            onToggleFullscreen()
-                        }
-                    )
-                }
         ) {
             if (errorMessage != null) {
                 Column(
@@ -988,7 +789,7 @@ fun DesktopPlayerScreen(
                             onClick = {
                                 autoRetryCount = 0
                                 errorMessage = null
-                                useHardwareVmem = !useHardwareVmem
+                                useSoftwareDecoder = !useSoftwareDecoder
                             },
                             border = BorderStroke(1.dp, GoldChampagne),
                             shape = RoundedCornerShape(12.dp),
@@ -999,7 +800,7 @@ fun DesktopPlayerScreen(
                         ) {
                             Icon(Icons.Default.Memory, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text(if (useHardwareVmem) "Modo Multicore" else "Probar HW")
+                            Text(if (useSoftwareDecoder) "Usar HW" else "Forzar SW")
                         }
                         OutlinedButton(
                             onClick = { launchExternalPlayer() },
@@ -1021,9 +822,10 @@ fun DesktopPlayerScreen(
                     }
                 }
             } else {
-                // Lienzo aislado FHD 1:1 bicúbico: actualiza fotogramas a 50/60fps sin recomponer la pantalla
-                IsolatedHiDpiVideoCanvas(
-                    surface = hiDpiSurface,
+                IsolatedVlcSwingSurface(
+                    swingContainerRef = swingContainerRef,
+                    vlcComponentRef = vlcComponentRef,
+                    onMouseMoved = stableMouseCallback,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -1150,12 +952,12 @@ fun DesktopPlayerScreen(
 
                     Spacer(Modifier.width(8.dp))
 
-                    // Conmutador de decodificación LibVLC (Multicore RAM / HW)
+                    // Conmutador de decodificación LibVLC (HW / SW)
                     OutlinedButton(
                         onClick = {
                             autoRetryCount = 0
                             errorMessage = null
-                            useHardwareVmem = !useHardwareVmem
+                            useSoftwareDecoder = !useSoftwareDecoder
                         },
                         shape = RoundedCornerShape(10.dp),
                         border = BorderStroke(1.dp, GoldAccent),
@@ -1169,7 +971,7 @@ fun DesktopPlayerScreen(
                         Icon(Icons.Default.Memory, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            if (useHardwareVmem) "VLCJ · HW" else "VLCJ · FHD",
+                            if (useSoftwareDecoder) "VLCJ · SW" else "VLCJ · HW",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold
                         )
@@ -1252,10 +1054,13 @@ fun DesktopPlayerScreen(
                     if (!isLive) {
                         VodProgressSlider(
                             clockState = clockState,
-                            onSeekMs = { targetMs ->
+                            onSeek = { targetMs ->
                                 notifyMouseActivity()
+                                clockState.seekFromUi(targetMs)
                                 playerIoScope.launch(Dispatchers.IO) {
-                                    runCatching { mediaPlayerRef.value?.controls()?.setTime(targetMs) }
+                                    runCatching {
+                                        vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(targetMs)
+                                    }
                                 }
                             }
                         )
@@ -1273,11 +1078,12 @@ fun DesktopPlayerScreen(
                             IconButton(
                                 onClick = {
                                     notifyMouseActivity()
-                                    val mp = mediaPlayerRef.value ?: return@IconButton
-                                    val wasPlaying = isPlaying
+                                    val mp = vlcComponentRef.value?.mediaPlayer() ?: return@IconButton
+                                    val currentlyPlaying = isPlaying
+                                    isPlaying = !currentlyPlaying
                                     playerIoScope.launch(Dispatchers.IO) {
                                         runCatching {
-                                            if (wasPlaying) mp.controls().pause() else mp.controls().play()
+                                            if (currentlyPlaying) mp.controls().pause() else mp.controls().play()
                                         }
                                     }
                                 },
@@ -1301,7 +1107,9 @@ fun DesktopPlayerScreen(
                                         val target = (clockState.rawPosMs - 10_000L).coerceAtLeast(0L)
                                         clockState.seekFromUi(target)
                                         playerIoScope.launch(Dispatchers.IO) {
-                                            runCatching { mediaPlayerRef.value?.controls()?.setTime(target) }
+                                            runCatching {
+                                                vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(target)
+                                            }
                                         }
                                     }
                                 ) {
@@ -1313,7 +1121,9 @@ fun DesktopPlayerScreen(
                                         val target = clockState.rawPosMs + 10_000L
                                         clockState.seekFromUi(target)
                                         playerIoScope.launch(Dispatchers.IO) {
-                                            runCatching { mediaPlayerRef.value?.controls()?.setTime(target) }
+                                            runCatching {
+                                                vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(target)
+                                            }
                                         }
                                     }
                                 ) {
@@ -1323,7 +1133,7 @@ fun DesktopPlayerScreen(
                             } else {
                                 Text(
                                     statusBanner
-                                        ?: "En directo · FHD 1:1 Bicúbico (${if (useHardwareVmem) "HW" else "Multicore"} · ${LIVE_CACHING_MS}ms)",
+                                        ?: "Reproduciendo en directo · Zapping VLCJ (${if (useSoftwareDecoder) "SW" else "HW"} · ${LIVE_CACHING_MS}ms)",
                                     color = GoldChampagne,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.Medium
@@ -1342,7 +1152,9 @@ fun DesktopPlayerScreen(
                                     val nextMuted = !isMuted
                                     isMuted = nextMuted
                                     playerIoScope.launch(Dispatchers.IO) {
-                                        runCatching { mediaPlayerRef.value?.audio()?.setMute(nextMuted) }
+                                        runCatching {
+                                            vlcComponentRef.value?.mediaPlayer()?.audio()?.setMute(nextMuted)
+                                        }
                                     }
                                 }
                             ) {
@@ -1357,14 +1169,14 @@ fun DesktopPlayerScreen(
                                 value = if (isMuted) 0f else volume,
                                 onValueChange = { v ->
                                     notifyMouseActivity()
-                                    val nextMuted = v == 0f
-                                    val targetVol = (v * 100).toInt().coerceIn(0, 100)
                                     volume = v
-                                    isMuted = nextMuted
+                                    val mutedNow = v == 0f
+                                    isMuted = mutedNow
+                                    val volInt = (v * 100).toInt().coerceIn(0, 100)
                                     playerIoScope.launch(Dispatchers.IO) {
                                         runCatching {
-                                            mediaPlayerRef.value?.audio()?.setMute(nextMuted)
-                                            mediaPlayerRef.value?.audio()?.setVolume(targetVol)
+                                            vlcComponentRef.value?.mediaPlayer()?.audio()?.setMute(mutedNow)
+                                            vlcComponentRef.value?.mediaPlayer()?.audio()?.setVolume(volInt)
                                         }
                                     }
                                 },
@@ -1384,11 +1196,11 @@ fun DesktopPlayerScreen(
 }
 
 /**
- * Gestor del motor nativo LibVLC (vlcj) para Windows con Carga Perezosa (Lazy Initialization)
- * y parámetros de máxima nitidez para canales IPTV Full HD (1080p / 1080i):
- * - Desentrelazado automático de alta calidad (`--deinterlace=-1`, `--deinterlace-mode=yadif2x`).
- * - Selección automática de máxima resolución en HLS/M3U8 (`--preferred-resolution=-1`, `--adaptive-logic=highest`).
- * - Filtro deblocking H.264/HEVC completo (`--avcodec-skiploopfilter=0`) y `--network-caching=1500`.
+ * Gestor del motor nativo LibVLC (vlcj) para Windows con Carga Perezosa (Lazy Initialization):
+ * - No carga ningún binario nativo al arrancar la aplicación para que la ventana principal abra al instante.
+ * - Inicializa LibVLC de forma asíncrona en Dispatchers.IO exclusivamente cuando el usuario accede al reproductor.
+ * - Configura MediaPlayerFactory con parámetros de Zapping Rápido (búfer de 300ms, jitter 0 y desactivación de
+ *   módulos innecesarios de subtítulos/OSD/estadísticas).
  */
 object VlcRuntimeManager {
     private val initMutex = Mutex()
@@ -1450,7 +1262,7 @@ object VlcRuntimeManager {
             val args = mutableListOf(
                 "--network-caching=$LIVE_CACHING_MS",
                 "--live-caching=$LIVE_CACHING_MS",
-                "--file-caching=$VOD_CACHING_MS",
+                "--file-caching=$LIVE_CACHING_MS",
                 "--disc-caching=$LIVE_CACHING_MS",
                 "--clock-jitter=0",
                 "--clock-synchro=0",
@@ -1463,15 +1275,9 @@ object VlcRuntimeManager {
                 "--no-spu",
                 "--no-snapshot-preview",
                 "--no-metadata-network-access",
-                "--deinterlace=-1",
-                "--deinterlace-mode=linear",
-                "--preferred-resolution=-1",
-                "--adaptive-logic=highest",
-                "--adaptive-maxwidth=3840",
-                "--adaptive-maxheight=2160",
-                "--avcodec-skiploopfilter=0",
-                "--avcodec-threads=0",
-                "--avcodec-hw=none",
+                "--avcodec-fast",
+                "--avcodec-skiploopfilter=1",
+                "--avcodec-hw=any",
                 "--quiet"
             )
             detectedVlcDir?.let { dir ->
@@ -1530,10 +1336,6 @@ private object VlcExternalLauncher {
                     "--http-user-agent=$VLC_USER_AGENT",
                     "--network-caching=$LIVE_CACHING_MS",
                     "--live-caching=$LIVE_CACHING_MS",
-                    "--deinterlace=-1",
-                    "--deinterlace-mode=yadif2x",
-                    "--preferred-resolution=-1",
-                    "--avcodec-hw=any",
                     "--clock-jitter=0",
                     "--no-sub-autodetect-file",
                     cleanUrl

@@ -6,7 +6,6 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -33,19 +32,16 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import androidx.media3.ui.PlayerView
-import com.minuevaapp.tv.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -53,22 +49,21 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
- * Reproductor a pantalla completa con Media3 ExoPlayer optimizado para Fire TV, Android TV,
- * emuladores Android TV y móviles/tablets:
- * - DefaultRenderersFactory con setEnableDecoderFallback(true) y EXTENSION_RENDERER_MODE_PREFER.
- * - PlayerView sobre TextureView (app:surface_type="texture_view") para evitar congelación del primer
- *   fotograma por conflictos de Hardware Composer con overlays y streams H.264/HEVC entrelazados.
- * - DefaultTrackSelector con setExceedRendererCapabilitiesIfNecessary(true) y
- *   setExceedVideoConstraintsIfNecessary(true) para que ningún canal FHD/HEVC pause el renderizador.
- * - Watchdog de fotogramas congelados y AnalyticsListener (onVideoCodecError / onDroppedVideoFrames)
- *   que reinician el renderizador de vídeo o conmutan automáticamente a decodificación por software.
+ * Reproductor a pantalla completa con Media3 ExoPlayer y diseño en tonos oscuros, verde bético y dorado.
+ * Incluye:
+ * - Superficie nativa directa (PlayerView sobre SurfaceView) aislada de cualquier recomposición de Compose,
+ *   garantizando que el Surface de vídeo jamás se destruya ni se reasigne durante la reproducción.
+ * - Uso de ProgressiveMediaSource.Factory por defecto para enlaces directos de Xtream Codes (.ts, .mp4, .mkv),
+ *   evitando ERROR_CODE_PARSING_MANIFEST_MALFORMED, con fallback a HLS sólo si el contenedor es un manifiesto M3U8 real.
+ * - Soporte completo para HTTP sin cifrar y redirecciones HTTP <-> HTTPS (allowCrossProtocolRedirects).
+ * - Reconexión automática ante cortes de red o caídas del stream en directo.
+ * - Fallback automático y conmutador manual fluido entre decodificación por Hardware (HW+SW) y Software (SW).
+ * - Guardado periódico de progreso en segundo plano (Dispatchers.IO + .apply()) sin bloquear el hilo UI.
  */
 @OptIn(UnstableApi::class)
 class PlayerActivity : Activity() {
     private var player: ExoPlayer? = null
-    private var trackSelector: DefaultTrackSelector? = null
     private var playerListener: Player.Listener? = null
-    private var analyticsListener: AnalyticsListener? = null
     private lateinit var playerView: PlayerView
     private lateinit var topControlsBar: LinearLayout
     private lateinit var decoderButton: Button
@@ -78,12 +73,7 @@ class PlayerActivity : Activity() {
     private val playerIoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var reconnectRunnable: Runnable? = null
     private var progressSaveRunnable: Runnable? = null
-    private var videoWatchdogRunnable: Runnable? = null
     private var reconnectAttempts = 0
-
-    private var lastRenderedFrameCount = -1
-    private var frozenFrameStallTicks = 0
-    private var videoRendererResetAttempted = false
     private var lastCommittedPosMs = -1L
     private var lastCommittedDurMs = -1L
 
@@ -141,9 +131,7 @@ class PlayerActivity : Activity() {
             setBackgroundColor(0xFF0E1410.toInt())
         }
 
-        // Inflamos PlayerView con app:surface_type="texture_view" desde XML para garantizar
-        // renderizado por TextureView sin bloqueos de Hardware Composer en Fire TV y emuladores.
-        playerView = (layoutInflater.inflate(R.layout.activity_player_view, root, false) as PlayerView).apply {
+        playerView = PlayerView(this).apply {
             keepScreenOn = true
             setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
             setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
@@ -169,7 +157,6 @@ class PlayerActivity : Activity() {
                 val pos = if (isLive) 0L else (player?.currentPosition ?: 0L)
                 forceSoftwareDecoder = !forceSoftwareDecoder
                 reconnectAttempts = 0
-                videoRendererResetAttempted = false
                 updateDecoderLabel()
                 initPlayer(startPositionMs = pos)
             }
@@ -181,7 +168,6 @@ class PlayerActivity : Activity() {
             setOnClickListener {
                 val pos = if (isLive) 0L else (player?.currentPosition ?: 0L)
                 reconnectAttempts = 0
-                videoRendererResetAttempted = false
                 initPlayer(startPositionMs = pos)
             }
         }
@@ -235,7 +221,6 @@ class PlayerActivity : Activity() {
         }
         initPlayer(startPositionMs = initialPosMs)
         startPeriodicProgressSaver()
-        startVideoFreezeWatchdog()
         playerView.requestFocus()
     }
 
@@ -307,122 +292,46 @@ class PlayerActivity : Activity() {
         mainHandler.postDelayed(task, delayMs)
     }
 
-    /**
-     * Reinicia en caliente el renderizador de vídeo de ExoPlayer (deshabilitando y rehabilitando
-     * el renderer de vídeo tras un pulso de reloj) o conmuta al decodificador por software si persiste.
-     */
-    private fun restartVideoRendererOrFallback(reason: String) {
-        if (isFinishing || isDestroyed) return
-        val p = player ?: return
-        val selector = trackSelector
-        val currentPos = if (isLive) 0L else p.currentPosition
-
-        if (!videoRendererResetAttempted && selector != null) {
-            videoRendererResetAttempted = true
-            var videoRendererIndex = -1
-            for (i in 0 until p.rendererCount) {
-                if (p.getRendererType(i) == C.TRACK_TYPE_VIDEO) {
-                    videoRendererIndex = i
-                    break
-                }
-            }
-            if (videoRendererIndex >= 0) {
-                val idx = videoRendererIndex
-                selector.setParameters(
-                    selector.buildUponParameters().setRendererDisabled(idx, true)
-                )
-                mainHandler.postDelayed({
-                    if (!isFinishing && !isDestroyed && player === p) {
-                        selector.setParameters(
-                            selector.buildUponParameters().setRendererDisabled(idx, false)
-                        )
-                        if (isLive) {
-                            p.seekToDefaultPosition()
-                        } else if (currentPos > 0L) {
-                            p.seekTo(currentPos)
-                        }
-                    }
-                }, 120L)
-                return
-            }
-        }
-
-        if (!forceSoftwareDecoder) {
-            forceSoftwareDecoder = true
-            decoderButton.updateDecoderLabel()
-            initPlayer(startPositionMs = currentPos)
-        } else {
-            videoRendererResetAttempted = false
-            initPlayer(startPositionMs = currentPos)
-        }
-    }
-
     private fun releasePlayer() {
         cancelPendingReconnect()
         player?.let { p ->
             playerListener?.let { p.removeListener(it) }
-            analyticsListener?.let { p.removeAnalyticsListener(it) }
             p.release()
         }
         playerListener = null
-        analyticsListener = null
-        trackSelector = null
         player = null
     }
 
     private fun initPlayer(startPositionMs: Long) {
         releasePlayer()
-        lastRenderedFrameCount = -1
-        frozenFrameStallTicks = 0
 
-        // Selector de códecs:
-        // - Por defecto prioriza decodificación por Hardware (MediaCodec HW) para 1080p/50fps fluido
-        //   con fallback automático (setEnableDecoderFallback(true)) si un perfil falla.
-        // - Solo fuerza decodificadores por software (c2.android / omx.google) si el usuario lo activa
-        //   manualmente o tras un error real irrecuperable de inicialización del códec HW.
+        // Selector de códecs optimizado para Fire TV / Android TV:
+        // Por defecto prioriza estrictamente los decodificadores por hardware nativos del televisor
+        // y deja los decodificadores por software como respaldo final.
         val codecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
             val infos = MediaCodecUtil.getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
             if (forceSoftwareDecoder) {
-                val swFirst = infos.sortedWith(
-                    compareByDescending<MediaCodecInfo> { isReliableSoftwareCodec(it) }
-                        .thenByDescending { isSoftwareCodec(it) }
-                )
-                swFirst.ifEmpty { infos }
+                val swOnly = infos.filter { isSoftwareCodec(it) }
+                swOnly.ifEmpty { infos }
             } else {
-                val hwFirst = infos.sortedWith(
-                    compareBy<MediaCodecInfo> { isSoftwareCodec(it) }
-                )
+                val hwFirst = infos.sortedBy { isSoftwareCodec(it) }
                 hwFirst.ifEmpty { infos }
             }
         }
 
-        // DefaultRenderersFactory con fallback de decodificador y EXTENSION_RENDERER_MODE_PREFER
         val renderersFactory = DefaultRenderersFactory(applicationContext)
             .setEnableDecoderFallback(true)
-            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
-            .setAllowedVideoJoiningTimeMs(5_000L)
-            .setMediaCodecSelector(codecSelector)
-
-        // DefaultTrackSelector configurado para no pausar ni descartar pistas de vídeo FHD / HEVC
-        // que superen las capacidades nominales reportadas por Fire TV o el emulador de Android TV.
-        val selector = DefaultTrackSelector(applicationContext).apply {
-            setParameters(
-                buildUponParameters()
-                    .setExceedRendererCapabilitiesIfNecessary(true)
-                    .setExceedVideoConstraintsIfNecessary(true)
-                    .setExceedAudioConstraintsIfNecessary(true)
-                    .setAllowVideoMixedMimeTypeAdaptiveness(true)
-                    .setAllowVideoNonSeamlessAdaptiveness(true)
-                    .clearVideoSizeConstraints()
+            .setExtensionRendererMode(
+                if (forceSoftwareDecoder) DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+                else DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON
             )
-        }
-        trackSelector = selector
+            .setMediaCodecSelector(codecSelector)
 
         // Permite HTTP sin cifrar y redirecciones entre HTTP <-> HTTPS habituales en paneles IPTV
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(12_000)
-            .setReadTimeoutMs(20_000)
+            .setConnectTimeoutMs(10_000)
+            .setReadTimeoutMs(18_000)
             .setUserAgent("XaviTV/1.0 (ExoPlayer; AndroidTV)")
 
         val dataSourceFactory = DefaultDataSource.Factory(applicationContext, httpDataSourceFactory)
@@ -433,8 +342,7 @@ class PlayerActivity : Activity() {
             .setConstantBitrateSeekingEnabled(true)
             .setTsExtractorFlags(
                 DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
-                    DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS or
-                    DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS
+                    DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
             )
 
         // Factoría principal: ProgressiveMediaSource.Factory para evitar ERROR_CODE_PARSING_MANIFEST_MALFORMED
@@ -449,16 +357,16 @@ class PlayerActivity : Activity() {
             progressiveFactory
         }
 
-        // DefaultLoadControl optimizado para IPTV en directo y VOD sin inanición del decoder de vídeo
+        // Búfer inicial reducido en canales en directo para lograr Zapping Rápido en Fire TV / Android TV
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ if (isLive) 10_000 else 18_000,
-                /* maxBufferMs = */ if (isLive) 30_000 else 45_000,
-                /* bufferForPlaybackMs = */ if (isLive) 1_000 else 1_500,
-                /* bufferForPlaybackAfterRebufferMs = */ if (isLive) 2_000 else 3_000,
+                /* minBufferMs = */ if (isLive) 6_000 else 15_000,
+                /* maxBufferMs = */ if (isLive) 20_000 else 40_000,
+                /* bufferForPlaybackMs = */ if (isLive) 500 else 1_200,
+                /* bufferForPlaybackAfterRebufferMs = */ if (isLive) 1_200 else 2_500,
             )
             .setPrioritizeTimeOverSizeThresholds(true)
-            .setTargetBufferBytes(if (isLive) 12 * 1024 * 1024 else 20 * 1024 * 1024)
+            .setTargetBufferBytes(if (isLive) 8 * 1024 * 1024 else 16 * 1024 * 1024)
             .build()
 
         val mediaItem = MediaItem.Builder()
@@ -469,41 +377,14 @@ class PlayerActivity : Activity() {
         val mediaSource = mediaSourceFactory.createMediaSource(mediaItem)
 
         player = ExoPlayer.Builder(applicationContext, renderersFactory)
-            .setTrackSelector(selector)
             .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
             .also { p ->
-                playerView.player = p
-
-                val analytics = object : AnalyticsListener {
-                    override fun onVideoCodecError(
-                        eventTime: AnalyticsListener.EventTime,
-                        videoCodecError: Exception
-                    ) {
-                        mainHandler.post {
-                            restartVideoRendererOrFallback("onVideoCodecError")
-                        }
-                    }
-
-                    override fun onDroppedVideoFrames(
-                        eventTime: AnalyticsListener.EventTime,
-                        droppedFrames: Int,
-                        elapsedMs: Long
-                    ) {
-                        // Solo reiniciamos si ningún fotograma llegó jamás a renderizarse pese a recibir paquetes
-                        val rendered = p.videoDecoderCounters?.renderedOutputBufferCount ?: 0
-                        if (droppedFrames >= 120 && rendered == 0) {
-                            mainHandler.post {
-                                restartVideoRendererOrFallback("onDroppedVideoFrames")
-                            }
-                        }
-                    }
+                if (playerView.player !== p) {
+                    playerView.player = p
                 }
-                analyticsListener = analytics
-                p.addAnalyticsListener(analytics)
-
                 val listener = object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_READY) {
@@ -520,7 +401,7 @@ class PlayerActivity : Activity() {
                                             positionMs = dur,
                                             durationMs = dur,
                                             commitSync = false,
-                                            notifyUi = true
+                                            notifyUi = true,
                                         )
                                         prefs.edit().putLong(url, 0L).apply()
                                     }
@@ -556,7 +437,7 @@ class PlayerActivity : Activity() {
                             return
                         }
 
-                        // 3. Fallback automático de códec Hardware -> Software o reinicio de renderizador
+                        // 3. Fallback automático de códec Hardware -> Software
                         val isCodecError = error.errorCode in listOf(
                             PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
                             PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED,
@@ -564,19 +445,15 @@ class PlayerActivity : Activity() {
                             PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
                             PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
                         )
-                        if (isCodecError) {
-                            if (!forceSoftwareDecoder) {
-                                forceSoftwareDecoder = true
-                                decoderButton.updateDecoderLabel()
-                                Toast.makeText(
-                                    this@PlayerActivity,
-                                    "Fallo en códec HW; cambiando a decodificación por software (SW)…",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                                initPlayer(startPositionMs = currentPos)
-                            } else {
-                                restartVideoRendererOrFallback(error.errorCodeName)
-                            }
+                        if (isCodecError && !forceSoftwareDecoder) {
+                            forceSoftwareDecoder = true
+                            decoderButton.updateDecoderLabel()
+                            Toast.makeText(
+                                this@PlayerActivity,
+                                "Fallo en códec HW; cambiando a decodificación por software (SW)…",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            initPlayer(startPositionMs = currentPos)
                             return
                         }
 
@@ -609,53 +486,6 @@ class PlayerActivity : Activity() {
                 p.prepare()
                 p.playWhenReady = true
             }
-    }
-
-    /**
-     * Supervisa cada 2s que el decodificador de vídeo no haya quedado totalmente mudo al arrancar
-     * (0 fotogramas renderizados pese a haber encolado >90 paquetes durante más de 8 segundos).
-     * Evita falsos positivos durante la espera normal del primer keyframe IDR en MPEG-TS.
-     */
-    private fun startVideoFreezeWatchdog() {
-        stopVideoFreezeWatchdog()
-        val task = object : Runnable {
-            override fun run() {
-                if (!isFinishing && !isDestroyed) {
-                    val p = player
-                    if (p != null && p.isPlaying && p.playbackState == Player.STATE_READY && p.videoFormat != null) {
-                        val counters = p.videoDecoderCounters
-                        val rendered = counters?.renderedOutputBufferCount ?: 0
-                        val queued = counters?.queuedInputBufferCount ?: 0
-                        val dropped = counters?.droppedBufferCount ?: 0
-                        if (rendered == 0 && queued > 90 && dropped == 0) {
-                            frozenFrameStallTicks++
-                            if (frozenFrameStallTicks >= 4) {
-                                frozenFrameStallTicks = 0
-                                restartVideoRendererOrFallback("DeadHardwareDecoderWatchdog")
-                            }
-                        } else {
-                            frozenFrameStallTicks = 0
-                        }
-                        lastRenderedFrameCount = rendered
-                    } else {
-                        frozenFrameStallTicks = 0
-                    }
-                    mainHandler.postDelayed(this, 2_000L)
-                }
-            }
-        }
-        videoWatchdogRunnable = task
-        mainHandler.postDelayed(task, 2_000L)
-    }
-
-    private fun stopVideoFreezeWatchdog() {
-        videoWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
-        videoWatchdogRunnable = null
-    }
-
-    private fun isReliableSoftwareCodec(info: MediaCodecInfo): Boolean {
-        val name = info.name.lowercase()
-        return name.startsWith("c2.android.") || name.startsWith("omx.google.")
     }
 
     private fun isSoftwareCodec(info: MediaCodecInfo): Boolean {
@@ -692,7 +522,7 @@ class PlayerActivity : Activity() {
 
     /**
      * Guardado periódico cada 5s en segundo plano (Dispatchers.IO) usando .apply() en memoria RAM:
-     * Nunca bloquea el hilo principal (UI / TextureView) ni provoca recomposiciones de UI.
+     * Nunca bloquea el hilo principal ni altera el SurfaceView de vídeo.
      */
     private fun saveResumePositionPeriodicAsync() {
         val p = player ?: return
@@ -741,19 +571,8 @@ class PlayerActivity : Activity() {
         prefs.edit().putLong(url, if (nearEnd) 0L else pos).commit()
     }
 
-    override fun onResume() {
-        super.onResume()
-        playerView.onResume()
-        player?.let { p ->
-            if (isLive && !p.isPlaying && p.playbackState == Player.STATE_READY) {
-                p.play()
-            }
-        }
-    }
-
     override fun onPause() {
         saveResumePositionCriticalSync()
-        playerView.onPause()
         super.onPause()
     }
 
@@ -761,14 +580,12 @@ class PlayerActivity : Activity() {
         super.onStop()
         cancelPendingReconnect()
         stopPeriodicProgressSaver()
-        stopVideoFreezeWatchdog()
         saveResumePositionCriticalSync()
         player?.pause()
     }
 
     override fun onDestroy() {
         stopPeriodicProgressSaver()
-        stopVideoFreezeWatchdog()
         saveResumePositionCriticalSync()
         playerIoScope.cancel()
         playerView.player = null
