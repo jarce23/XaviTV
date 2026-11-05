@@ -367,8 +367,6 @@ fun CatalogScreen(
                                 listState = listState,
                                 recentItems = if (selected == ALL && searchQuery.isEmpty()) recentItems else emptyList(),
                                 onPlayRecent = { ch ->
-                                    app.store.addRecentlyViewed(type, ch.id)
-                                    recentRefresh++
                                     PlayerActivity.start(ctx, repo.liveUrl(ch.id), ch.name, live = true, streamType = type, streamId = ch.id)
                                 },
                                 onToggleFav = { id ->
@@ -376,8 +374,6 @@ fun CatalogScreen(
                                     favs = app.store.favorites(type)
                                 },
                                 onPlay = { item ->
-                                    app.store.addRecentlyViewed(type, item.id)
-                                    recentRefresh++
                                     PlayerActivity.start(ctx, repo.liveUrl(item.id), item.name, live = true, streamType = type, streamId = item.id)
                                 },
                                 modifier = Modifier.weight(1f).fillMaxWidth(),

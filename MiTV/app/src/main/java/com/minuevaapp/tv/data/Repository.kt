@@ -198,7 +198,7 @@ class PlaylistStore(context: Context) {
     }
 
     @Synchronized
-    fun addRecentlyViewed(type: String, id: String, maxItems: Int = 40) {
+    fun addRecentlyViewed(type: String, id: String, maxItems: Int = 40, notifyUi: Boolean = false) {
         if (id.isBlank()) return
         val list = getRecentlyViewed(type).toMutableList()
         if (list.firstOrNull() == id) return
@@ -209,7 +209,9 @@ class PlaylistStore(context: Context) {
         }
         val snapshot = list.toList()
         recentMemoryCache[type] = snapshot
-        _recentUpdates.value++
+        if (notifyUi) {
+            _recentUpdates.value++
+        }
         ioScope.launch(Dispatchers.IO) {
             prefs.edit().putString("recent_$type", gson.toJson(snapshot)).apply()
         }
