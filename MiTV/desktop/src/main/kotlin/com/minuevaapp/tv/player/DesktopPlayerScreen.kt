@@ -41,7 +41,6 @@ import com.sun.jna.NativeLibrary
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -81,120 +80,6 @@ private const val VOD_CACHING_MS = 600
 private const val MAX_AUTO_RETRIES = 3
 private const val FULLSCREEN_CONTROLS_HIDE_DELAY_MS = 3_000L
 
-/**
- * Estado aislado del reloj de reproducción VOD para que las actualizaciones de tiempo (cada 1s)
- * y el guardado periódico (cada 5s) jamás recompongan la pantalla del reproductor ni el SwingPanel.
- */
-@Stable
-private class PlaybackClockState {
-    @Volatile
-    var rawPosMs: Long = 0L
-
-    @Volatile
-    var rawDurationMs: Long = 0L
-
-    val uiPosMs = mutableLongStateOf(0L)
-    val uiDurationMs = mutableLongStateOf(0L)
-
-    fun updateFromBackground(posMs: Long, durMs: Long, publishToUi: Boolean) {
-        val cleanPos = posMs.coerceAtLeast(0L)
-        rawPosMs = cleanPos
-        if (durMs > 0L && durMs < Long.MAX_VALUE / 2) {
-            rawDurationMs = durMs
-        }
-        if (publishToUi) {
-            val targetDur = rawDurationMs
-            if (SwingUtilities.isEventDispatchThread()) {
-                uiPosMs.longValue = cleanPos
-                if (targetDur > 0L) uiDurationMs.longValue = targetDur
-            } else {
-                SwingUtilities.invokeLater {
-                    uiPosMs.longValue = cleanPos
-                    if (targetDur > 0L) uiDurationMs.longValue = targetDur
-                }
-            }
-        }
-    }
-
-    fun seekFromUi(targetMs: Long) {
-        val clean = targetMs.coerceAtLeast(0L)
-        rawPosMs = clean
-        uiPosMs.longValue = clean
-    }
-}
-
-/**
- * Contenedor aislado del reproductor de vídeo VLCJ:
- * - NO lee ningún State cambiante (ni progreso, ni reloj, ni visibilidad de controles).
- * - El bloque update = {} está vacío para no reasignar ni recrear la superficie de vídeo.
- */
-@Composable
-private fun IsolatedVlcSwingSurface(
-    swingContainerRef: MutableState<JPanel?>,
-    vlcComponentRef: MutableState<CallbackMediaPlayerComponent?>,
-    onMouseMoved: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    SwingPanel(
-        background = Color.Black,
-        modifier = modifier,
-        factory = {
-            JPanel(BorderLayout()).apply {
-                background = java.awt.Color.BLACK
-                addMouseMotionListener(object : MouseMotionAdapter() {
-                    override fun mouseMoved(e: MouseEvent) {
-                        onMouseMoved()
-                    }
-                })
-                swingContainerRef.value = this
-                vlcComponentRef.value?.let { existingComp ->
-                    if (existingComp.parent !== this) {
-                        add(existingComp, BorderLayout.CENTER)
-                    }
-                }
-            }
-        },
-        update = {
-            // Intencionalmente vacío: evita reasignar el reproductor o invalidar el Surface en recomposiciones
-        }
-    )
-}
-
-@Composable
-private fun VodProgressSlider(
-    clockState: PlaybackClockState,
-    onSeek: (Long) -> Unit
-) {
-    val curPos = clockState.uiPosMs.longValue
-    val totDur = clockState.uiDurationMs.longValue
-    if (totDur > 0L) {
-        Slider(
-            value = (curPos.toFloat() / totDur.toFloat()).coerceIn(0f, 1f),
-            onValueChange = { fraction ->
-                val targetMs = (fraction * totDur).toLong()
-                onSeek(targetMs)
-            },
-            colors = SliderDefaults.colors(
-                thumbColor = GoldAccent,
-                activeTrackColor = GoldAccent,
-                inactiveTrackColor = BetisGreenPrimary
-            ),
-            modifier = Modifier.fillMaxWidth().height(26.dp)
-        )
-    }
-}
-
-@Composable
-private fun VodTimeLabel(clockState: PlaybackClockState) {
-    val curPos = clockState.uiPosMs.longValue
-    val totDur = clockState.uiDurationMs.longValue
-    Text(
-        "${formatTimeMs(curPos)} / ${formatTimeMs(totDur)}",
-        color = TextSilverGray,
-        fontSize = 12.sp
-    )
-}
-
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun DesktopPlayerScreen(
@@ -209,7 +94,6 @@ fun DesktopPlayerScreen(
 ) {
     val appState = LocalAppState.current
     val scope = rememberCoroutineScope()
-    val playerIoScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
     val isLive = streamType.equals("live", ignoreCase = true)
 
     var isBuffering by remember { mutableStateOf(true) }
@@ -224,12 +108,13 @@ fun DesktopPlayerScreen(
     var reloadTrigger by remember { mutableIntStateOf(0) }
 
     var videoResolutionText by remember { mutableStateOf("") }
-    val clockState = remember(url) { PlaybackClockState() }
+    var currentPosMs by remember { mutableLongStateOf(0L) }
+    var totalDurationMs by remember { mutableLongStateOf(0L) }
     var seekApplied by remember { mutableStateOf(false) }
 
     // Estado de visibilidad de controles para el modo inmersivo en pantalla completa
     var controlsVisible by remember { mutableStateOf(true) }
-    val lastMouseActivityMsRef = remember { java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis()) }
+    var lastMouseActivityMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var lastScreenX by remember { mutableIntStateOf(-1) }
     var lastScreenY by remember { mutableIntStateOf(-1) }
 
@@ -254,7 +139,7 @@ fun DesktopPlayerScreen(
     }
 
     fun notifyMouseActivity() {
-        lastMouseActivityMsRef.set(System.currentTimeMillis())
+        lastMouseActivityMs = System.currentTimeMillis()
         if (!controlsVisible) {
             controlsVisible = true
             updateVideoSurfaceCursor(true)
@@ -263,20 +148,25 @@ fun DesktopPlayerScreen(
 
     // Al entrar o salir de pantalla completa, sincronizar visibilidad y temporizador de inactividad
     LaunchedEffect(isFullscreen) {
-        lastMouseActivityMsRef.set(System.currentTimeMillis())
-        controlsVisible = true
-        updateVideoSurfaceCursor(true)
+        if (isFullscreen) {
+            lastMouseActivityMs = System.currentTimeMillis()
+            controlsVisible = true
+            updateVideoSurfaceCursor(true)
+        } else {
+            controlsVisible = true
+            updateVideoSurfaceCursor(true)
+        }
     }
 
     // Temporizador automático que oculta las barras tras 3 segundos de inactividad en pantalla completa
-    LaunchedEffect(isFullscreen, controlsVisible) {
+    LaunchedEffect(isFullscreen, controlsVisible, lastMouseActivityMs) {
         if (!isFullscreen) {
             controlsVisible = true
             updateVideoSurfaceCursor(true)
             return@LaunchedEffect
         }
         while (isFullscreen && controlsVisible) {
-            val elapsed = System.currentTimeMillis() - lastMouseActivityMsRef.get()
+            val elapsed = System.currentTimeMillis() - lastMouseActivityMs
             val remaining = FULLSCREEN_CONTROLS_HIDE_DELAY_MS - elapsed
             if (remaining <= 0L) {
                 controlsVisible = false
@@ -321,23 +211,10 @@ fun DesktopPlayerScreen(
     }
 
     fun pauseCurrentPlayback() {
-        isPlaying = false
-        val posSnapshot = clockState.rawPosMs
-        val durSnapshot = clockState.rawDurationMs
-        playerIoScope.launch(Dispatchers.IO) {
-            runCatching {
-                vlcComponentRef.value?.mediaPlayer()?.controls()?.pause()
-            }
-            if (!isLive && resumeKey.isNotEmpty() && posSnapshot > 0L) {
-                appState.store.savePlaybackProgress(
-                    id = resumeKey,
-                    positionMs = posSnapshot,
-                    durationMs = durSnapshot,
-                    persistImmediately = false,
-                    notifyUi = false
-                )
-            }
+        runCatching {
+            vlcComponentRef.value?.mediaPlayer()?.controls()?.pause()
         }
+        isPlaying = false
     }
 
     fun launchExternalPlayer() {
@@ -378,64 +255,6 @@ fun DesktopPlayerScreen(
         if (externalNotice != null) {
             delay(4500)
             externalNotice = null
-        }
-    }
-
-    // Guardado periódico de progreso VOD (cada 5 segundos) en Dispatchers.IO y actualización de reloj aislada
-    LaunchedEffect(url, isLive) {
-        var tickCount = 0
-        while (true) {
-            delay(1000)
-            tickCount++
-            val mp = vlcComponentRef.value?.mediaPlayer()
-            if (mp != null) {
-                val snapshot = withContext(Dispatchers.IO) {
-                    val playingNow = runCatching { mp.status().isPlaying }.getOrDefault(false)
-                    if (!playingNow) {
-                        null
-                    } else {
-                        val cur = if (!isLive) {
-                            runCatching { mp.status().time() }.getOrDefault(0L).coerceAtLeast(0L)
-                        } else {
-                            0L
-                        }
-                        val tot = if (!isLive) {
-                            runCatching { mp.status().length() }.getOrDefault(0L)
-                        } else {
-                            0L
-                        }
-                        val dim = if (videoResolutionText.isEmpty()) {
-                            runCatching { mp.video().videoDimension() }.getOrNull()
-                        } else {
-                            null
-                        }
-                        Triple(cur, tot, dim)
-                    }
-                }
-
-                if (snapshot != null) {
-                    val (cur, tot, dim) = snapshot
-                    if (!isLive) {
-                        val barVisible = !isFullscreen || controlsVisible
-                        clockState.updateFromBackground(cur, tot, publishToUi = barVisible)
-                    }
-                    if (dim != null && dim.width > 0 && dim.height > 0 && videoResolutionText.isEmpty()) {
-                        videoResolutionText = "${dim.width}×${dim.height}"
-                    }
-                    if (!isLive && resumeKey.isNotEmpty() && cur > 2_000L && tickCount % 5 == 0) {
-                        val durToSave = clockState.rawDurationMs
-                        playerIoScope.launch(Dispatchers.IO) {
-                            appState.store.savePlaybackProgress(
-                                id = resumeKey,
-                                positionMs = cur,
-                                durationMs = durToSave,
-                                persistImmediately = false,
-                                notifyUi = false
-                            )
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -508,30 +327,25 @@ fun DesktopPlayerScreen(
                         mediaPlayer().events().addMediaPlayerEventListener(
                             object : MediaPlayerEventAdapter() {
                                 override fun opening(mediaPlayer: MediaPlayer) {
-                                    SwingUtilities.invokeLater {
-                                        isBuffering = true
-                                    }
+                                    isBuffering = true
                                 }
 
                                 override fun buffering(mediaPlayer: MediaPlayer, newCache: Float) {
-                                    SwingUtilities.invokeLater {
-                                        if (newCache < 100f) {
-                                            if (!isBuffering) isBuffering = true
-                                        } else {
-                                            if (isBuffering) isBuffering = false
-                                            if (statusBanner != null) statusBanner = null
-                                        }
+                                    if (newCache < 100f) {
+                                        isBuffering = true
+                                        statusBanner = "Búfer rápido (${newCache.toInt()}%)..."
+                                    } else {
+                                        isBuffering = false
+                                        statusBanner = null
                                     }
                                 }
 
                                 override fun playing(mediaPlayer: MediaPlayer) {
-                                    SwingUtilities.invokeLater {
-                                        isBuffering = false
-                                        isPlaying = true
-                                        statusBanner = null
-                                        errorMessage = null
-                                        autoRetryCount = 0
-                                    }
+                                    isBuffering = false
+                                    isPlaying = true
+                                    statusBanner = null
+                                    errorMessage = null
+                                    autoRetryCount = 0
 
                                     if (!isLive && !seekApplied && resumeKey.isNotEmpty()) {
                                         seekApplied = true
@@ -539,78 +353,41 @@ fun DesktopPlayerScreen(
                                         val savedPos = savedProg?.resumePositionMs
                                             ?: appState.store.getResumePosition(resumeKey)
                                         if (savedPos > 0L) {
-                                            playerIoScope.launch(Dispatchers.IO) {
-                                                runCatching { mediaPlayer.controls().setTime(savedPos) }
-                                            }
+                                            runCatching { mediaPlayer.controls().setTime(savedPos) }
                                         }
                                     }
                                 }
 
                                 override fun paused(mediaPlayer: MediaPlayer) {
-                                    SwingUtilities.invokeLater {
-                                        isPlaying = false
-                                    }
-                                    val posSnapshot = clockState.rawPosMs
-                                    val durSnapshot = clockState.rawDurationMs
-                                    if (!isLive && resumeKey.isNotEmpty() && posSnapshot > 0L) {
-                                        playerIoScope.launch(Dispatchers.IO) {
-                                            appState.store.savePlaybackProgress(
-                                                id = resumeKey,
-                                                positionMs = posSnapshot,
-                                                durationMs = durSnapshot,
-                                                persistImmediately = false,
-                                                notifyUi = false
-                                            )
-                                        }
-                                    }
-                                }
-
-                                override fun finished(mediaPlayer: MediaPlayer) {
-                                    val durSnapshot = clockState.rawDurationMs
-                                    if (!isLive && resumeKey.isNotEmpty() && durSnapshot > 0L) {
-                                        playerIoScope.launch(Dispatchers.IO) {
-                                            appState.store.savePlaybackProgress(
-                                                id = resumeKey,
-                                                positionMs = durSnapshot,
-                                                durationMs = durSnapshot,
-                                                persistImmediately = false,
-                                                notifyUi = true
-                                            )
-                                        }
-                                    }
+                                    isPlaying = false
                                 }
 
                                 override fun videoOutput(mediaPlayer: MediaPlayer, newCount: Int) {
-                                    playerIoScope.launch(Dispatchers.IO) {
-                                        val dim = runCatching { mediaPlayer.video().videoDimension() }.getOrNull()
-                                        SwingUtilities.invokeLater {
-                                            isBuffering = false
-                                            statusBanner = null
-                                            if (dim != null && dim.width > 0 && dim.height > 0) {
-                                                videoResolutionText = "${dim.width}×${dim.height}"
-                                            }
-                                            swingContainerRef.value?.let { container ->
-                                                container.revalidate()
-                                                container.repaint()
-                                            }
+                                    isBuffering = false
+                                    statusBanner = null
+                                    val dim = runCatching { mediaPlayer.video().videoDimension() }.getOrNull()
+                                    if (dim != null && dim.width > 0 && dim.height > 0) {
+                                        videoResolutionText = "${dim.width}×${dim.height}"
+                                    }
+                                    SwingUtilities.invokeLater {
+                                        swingContainerRef.value?.let { container ->
+                                            container.revalidate()
+                                            container.repaint()
                                         }
                                     }
                                 }
 
                                 override fun timeChanged(mediaPlayer: MediaPlayer, newTime: Long) {
-                                    val clean = newTime.coerceAtLeast(0L)
-                                    clockState.rawPosMs = clean
-                                    if (isBuffering && clean > 0L) {
-                                        SwingUtilities.invokeLater {
-                                            isBuffering = false
-                                            statusBanner = null
-                                        }
+                                    currentPosMs = newTime.coerceAtLeast(0L)
+                                    if (isBuffering && newTime > 0L) {
+                                        isBuffering = false
+                                        statusBanner = null
                                     }
                                 }
 
                                 override fun lengthChanged(mediaPlayer: MediaPlayer, newLength: Long) {
                                     if (newLength > 0L && newLength < Long.MAX_VALUE / 2) {
-                                        clockState.rawDurationMs = newLength
+                                        totalDurationMs = newLength
                                     }
                                 }
 
@@ -642,7 +419,7 @@ fun DesktopPlayerScreen(
             }
         }
 
-        // 4. Iniciar reproducción directamente en Dispatchers.IO
+        // 4. Iniciar reproducción directamente en Dispatchers.IO sin petición HTTP previa redundante
         val cleanUrl = url.trim()
         val cachingMs = if (isLive) LIVE_CACHING_MS else VOD_CACHING_MS
         val originReferer = cleanUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}/" }
@@ -681,20 +458,18 @@ fun DesktopPlayerScreen(
         }
     }
 
+    // Guardado de progreso totalmente desacoplado: sólo se ejecuta pasivamente al salir del reproductor (onDispose)
     DisposableEffect(Unit) {
         onDispose {
             val comp = vlcComponentRef.value
             vlcComponentRef.value = null
-            val finalPos = clockState.rawPosMs
-            val finalDur = clockState.rawDurationMs
-            playerIoScope.cancel()
             if (comp != null) {
-                if (!isLive && resumeKey.isNotEmpty() && finalPos > 0L) {
+                if (!isLive && resumeKey.isNotEmpty() && currentPosMs > 0L) {
                     appState.store.savePlaybackProgress(
                         id = resumeKey,
-                        positionMs = finalPos,
-                        durationMs = finalDur,
-                        persistImmediately = true,
+                        positionMs = currentPosMs,
+                        durationMs = totalDurationMs,
+                        persistImmediately = false,
                         notifyUi = true
                     )
                 }
@@ -709,7 +484,6 @@ fun DesktopPlayerScreen(
     }
 
     val showBars = !isFullscreen || controlsVisible
-    val stableMouseCallback = remember { { notifyMouseActivity() } }
 
     Box(
         Modifier
@@ -718,7 +492,7 @@ fun DesktopPlayerScreen(
             .onPointerEvent(PointerEventType.Move) { notifyMouseActivity() }
             .onPointerEvent(PointerEventType.Press) { notifyMouseActivity() }
     ) {
-        // ─── 1. LIENZO CENTRAL DE VÍDEO AISLADO (100% de la ventana en Pantalla Completa) ─
+        // ─── 1. LIENZO CENTRAL DE VÍDEO (100% de la ventana en Pantalla Completa) ─
         Box(
             Modifier
                 .fillMaxSize()
@@ -822,11 +596,23 @@ fun DesktopPlayerScreen(
                     }
                 }
             } else {
-                IsolatedVlcSwingSurface(
-                    swingContainerRef = swingContainerRef,
-                    vlcComponentRef = vlcComponentRef,
-                    onMouseMoved = stableMouseCallback,
-                    modifier = Modifier.fillMaxSize()
+                SwingPanel(
+                    background = Color.Black,
+                    modifier = Modifier.fillMaxSize(),
+                    factory = {
+                        JPanel(BorderLayout()).apply {
+                            background = java.awt.Color.BLACK
+                            addMouseMotionListener(object : MouseMotionAdapter() {
+                                override fun mouseMoved(e: MouseEvent) {
+                                    notifyMouseActivity()
+                                }
+                            })
+                            swingContainerRef.value = this
+                            vlcComponentRef.value?.let { existingComp ->
+                                add(existingComp, BorderLayout.CENTER)
+                            }
+                        }
+                    }
                 )
             }
         }
@@ -1051,18 +837,23 @@ fun DesktopPlayerScreen(
                         )
                     }
 
-                    if (!isLive) {
-                        VodProgressSlider(
-                            clockState = clockState,
-                            onSeek = { targetMs ->
+                    if (!isLive && totalDurationMs > 0L) {
+                        Slider(
+                            value = (currentPosMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f),
+                            onValueChange = { fraction ->
                                 notifyMouseActivity()
-                                clockState.seekFromUi(targetMs)
-                                playerIoScope.launch(Dispatchers.IO) {
-                                    runCatching {
-                                        vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(targetMs)
-                                    }
+                                val targetMs = (fraction * totalDurationMs).toLong()
+                                currentPosMs = targetMs
+                                runCatching {
+                                    vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(targetMs)
                                 }
-                            }
+                            },
+                            colors = SliderDefaults.colors(
+                                thumbColor = GoldAccent,
+                                activeTrackColor = GoldAccent,
+                                inactiveTrackColor = BetisGreenPrimary
+                            ),
+                            modifier = Modifier.fillMaxWidth().height(26.dp)
                         )
                     }
 
@@ -1079,13 +870,7 @@ fun DesktopPlayerScreen(
                                 onClick = {
                                     notifyMouseActivity()
                                     val mp = vlcComponentRef.value?.mediaPlayer() ?: return@IconButton
-                                    val currentlyPlaying = isPlaying
-                                    isPlaying = !currentlyPlaying
-                                    playerIoScope.launch(Dispatchers.IO) {
-                                        runCatching {
-                                            if (currentlyPlaying) mp.controls().pause() else mp.controls().play()
-                                        }
-                                    }
+                                    if (isPlaying) mp.controls().pause() else mp.controls().play()
                                 },
                                 modifier = Modifier
                                     .size(38.dp)
@@ -1104,12 +889,10 @@ fun DesktopPlayerScreen(
                                 IconButton(
                                     onClick = {
                                         notifyMouseActivity()
-                                        val target = (clockState.rawPosMs - 10_000L).coerceAtLeast(0L)
-                                        clockState.seekFromUi(target)
-                                        playerIoScope.launch(Dispatchers.IO) {
-                                            runCatching {
-                                                vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(target)
-                                            }
+                                        val target = (currentPosMs - 10_000L).coerceAtLeast(0L)
+                                        currentPosMs = target
+                                        runCatching {
+                                            vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(target)
                                         }
                                     }
                                 ) {
@@ -1118,18 +901,20 @@ fun DesktopPlayerScreen(
                                 IconButton(
                                     onClick = {
                                         notifyMouseActivity()
-                                        val target = clockState.rawPosMs + 10_000L
-                                        clockState.seekFromUi(target)
-                                        playerIoScope.launch(Dispatchers.IO) {
-                                            runCatching {
-                                                vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(target)
-                                            }
+                                        val target = currentPosMs + 10_000L
+                                        currentPosMs = target
+                                        runCatching {
+                                            vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(target)
                                         }
                                     }
                                 ) {
                                     Icon(Icons.Default.Forward10, contentDescription = "+10s", tint = TextPureWhite)
                                 }
-                                VodTimeLabel(clockState = clockState)
+                                Text(
+                                    "${formatTimeMs(currentPosMs)} / ${formatTimeMs(totalDurationMs)}",
+                                    color = TextSilverGray,
+                                    fontSize = 12.sp
+                                )
                             } else {
                                 Text(
                                     statusBanner
@@ -1149,12 +934,9 @@ fun DesktopPlayerScreen(
                             IconButton(
                                 onClick = {
                                     notifyMouseActivity()
-                                    val nextMuted = !isMuted
-                                    isMuted = nextMuted
-                                    playerIoScope.launch(Dispatchers.IO) {
-                                        runCatching {
-                                            vlcComponentRef.value?.mediaPlayer()?.audio()?.setMute(nextMuted)
-                                        }
+                                    isMuted = !isMuted
+                                    runCatching {
+                                        vlcComponentRef.value?.mediaPlayer()?.audio()?.setMute(isMuted)
                                     }
                                 }
                             ) {
@@ -1170,14 +952,10 @@ fun DesktopPlayerScreen(
                                 onValueChange = { v ->
                                     notifyMouseActivity()
                                     volume = v
-                                    val mutedNow = v == 0f
-                                    isMuted = mutedNow
-                                    val volInt = (v * 100).toInt().coerceIn(0, 100)
-                                    playerIoScope.launch(Dispatchers.IO) {
-                                        runCatching {
-                                            vlcComponentRef.value?.mediaPlayer()?.audio()?.setMute(mutedNow)
-                                            vlcComponentRef.value?.mediaPlayer()?.audio()?.setVolume(volInt)
-                                        }
+                                    isMuted = v == 0f
+                                    runCatching {
+                                        vlcComponentRef.value?.mediaPlayer()?.audio()?.setMute(isMuted)
+                                        vlcComponentRef.value?.mediaPlayer()?.audio()?.setVolume((v * 100).toInt())
                                     }
                                 },
                                 colors = SliderDefaults.colors(

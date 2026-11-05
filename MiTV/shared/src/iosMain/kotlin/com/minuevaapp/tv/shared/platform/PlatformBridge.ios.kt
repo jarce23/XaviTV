@@ -477,10 +477,6 @@ actual fun NativeVideoPlayer(
                     }
                     seekAppliedHolder[0] = true
                 }
-
-                if (timeMs > 2000L && tickCount % 5 == 0) {
-                    onSaveProgress(timeMs, playbackClockHolder[1])
-                }
             }
         }
     }
