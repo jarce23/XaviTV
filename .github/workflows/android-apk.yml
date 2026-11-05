@@ -33,20 +33,20 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Build Release APK (XaviTV.apk)
+      - name: Build Standard and FireTV APKs
         run: |
           if [ -f "MiTV/gradlew" ]; then
             cd MiTV
           fi
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
-          ./gradlew :app:assembleRelease --no-daemon
+          ./gradlew :app:assembleStandardDebug :app:assembleFireosDebug --no-daemon
 
-      - name: Upload XaviTV.apk Artifact
+      - name: Upload XaviTV-Standard.apk and XaviTV-FireTV.apk Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: XaviTV-Android-APK
           path: |
-            MiTV/app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/release/*.apk
+            MiTV/app/build/outputs/apk/standard/debug/XaviTV-Standard.apk
+            MiTV/app/build/outputs/apk/fireos/debug/XaviTV-FireTV.apk
           if-no-files-found: error

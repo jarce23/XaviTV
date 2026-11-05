@@ -47,13 +47,13 @@ android {
         }
     }
 
-    // Renombra el APK resultante según el flavor (app-fireos-debug.apk para fireos y XaviTV.apk para standard)
+    // Renombra el APK resultante según el flavor (XaviTV-FireTV.apk para fireos y XaviTV-Standard.apk para standard)
     applicationVariants.all {
         val variant = this
         outputs.all {
             (this as? BaseVariantOutputImpl)?.outputFileName =
-                if (variant.flavorName == "fireos") "app-fireos-${variant.buildType.name}.apk"
-                else "XaviTV.apk"
+                if (variant.flavorName == "fireos") "XaviTV-FireTV.apk"
+                else "XaviTV-Standard.apk"
         }
     }
 
