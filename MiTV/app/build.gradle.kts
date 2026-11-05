@@ -26,6 +26,18 @@ android {
         buildConfigField("String", "TMDB_API_KEY", "\"${localProps.getProperty("tmdb.apiKey", "")}\"")
     }
 
+    flavorDimensions += "device"
+    productFlavors {
+        create("standard") {
+            dimension = "device"
+            buildConfigField("boolean", "FORCE_SOFTWARE_DECODER", "false")
+        }
+        create("fireos") {
+            dimension = "device"
+            buildConfigField("boolean", "FORCE_SOFTWARE_DECODER", "true")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -35,10 +47,13 @@ android {
         }
     }
 
-    // Renombra automáticamente el archivo APK resultante a XaviTV.apk
+    // Renombra el APK resultante según el flavor (app-fireos-debug.apk para fireos y XaviTV.apk para standard)
     applicationVariants.all {
+        val variant = this
         outputs.all {
-            (this as? BaseVariantOutputImpl)?.outputFileName = "XaviTV.apk"
+            (this as? BaseVariantOutputImpl)?.outputFileName =
+                if (variant.flavorName == "fireos") "app-fireos-${variant.buildType.name}.apk"
+                else "XaviTV.apk"
         }
     }
 

@@ -1,11 +1,13 @@
 package com.minuevaapp.tv.player
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.MediaFormat
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -24,6 +26,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
@@ -34,7 +37,9 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.Renderer
 import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
@@ -42,36 +47,37 @@ import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.video.MediaCodecVideoRenderer
+import androidx.media3.exoplayer.video.VideoRendererEventListener
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import androidx.media3.ui.PlayerView
 import coil.Coil
+import com.minuevaapp.tv.BuildConfig
 import com.minuevaapp.tv.R
 
 /**
- * Reproductor a pantalla completa con Media3 ExoPlayer optimizado para Fire TV Stick (1 GB RAM / Fire OS 7)
- * y Android TV Box.
- * Incluye:
- * - Superficie de vídeo dedicada mediante SurfaceView nativo (definido explícitamente con surface_type="surface_view"
- *   en activity_player_view.xml), evitando TextureView y liberando caché gráfica de Coil al abrir el reproductor.
- * - DefaultRenderersFactory con setEnableDecoderFallback(true), EXTENSION_RENDERER_MODE_PREFER y
- *   forceDisableMediaCodecAsynchronousQueueing() para evitar bloqueos tras el primer fotograma en SoCs MediaTek/Amlogic.
- * - Detección puntual de bloqueo silencioso tras el primer fotograma con conmutación automática a decodificador secundario/SW.
- * - DefaultLoadControl ajustado a dispositivos de 1 GB de RAM (entre 15 s y 25 s máx. y límite estricto de RAM sin back-buffer).
- * - Guardado de progreso de reproducción totalmente pasivo al salir (onStop / onDestroy), sin bucles periódicos en el hilo UI.
+ * Reproductor a pantalla completa con Media3 ExoPlayer:
+ * - Variante `standard` (BuildConfig.FORCE_SOFTWARE_DECODER == false):
+ *   Usa aceleración por hardware nativa (MediaCodecSelector.DEFAULT) con fallback automático a software,
+ *   óptima para Xiaomi TV Box S y dispositivos Android TV estándar.
+ * - Variante `fireos` (BuildConfig.FORCE_SOFTWARE_DECODER == true):
+ *   Optimizada específicamente para Amazon Fire TV Stick de 1 GB de RAM (Fire OS 7 / MediaTek MT8695D),
+ *   fijando directamente la decodificación por software multihilo (c2.android.* / OMX.google.*) con prioridad
+ *   en tiempo real, rechazo estricto de OMX.MTK., selección preferente de pistas 720p (setMaxVideoSize(1280, 720)
+ *   con setExceedVideoConstraintsIfNecessary(true)) y búfer de 16 MB en directo / 20 MB en VOD.
  */
 @OptIn(UnstableApi::class)
 class PlayerActivity : Activity() {
+
     private var player: ExoPlayer? = null
     private var playerListener: Player.Listener? = null
     private lateinit var playerView: PlayerView
     private lateinit var topControlsBar: LinearLayout
-    private lateinit var decoderButton: Button
     private lateinit var reloadButton: Button
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var reconnectRunnable: Runnable? = null
-    private var firstFrameCheckRunnable: Runnable? = null
     private var reconnectAttempts = 0
 
     private val prefs by lazy { applicationContext.getSharedPreferences("resume", MODE_PRIVATE) }
@@ -93,7 +99,7 @@ class PlayerActivity : Activity() {
         }
     }
 
-    private var forceSoftwareDecoder = false
+    private var forceSoftwareDecoder = BuildConfig.FORCE_SOFTWARE_DECODER
     private var useHlsFallback = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -103,14 +109,11 @@ class PlayerActivity : Activity() {
             return
         }
 
-        // Liberar caché de bitmaps en RAM (Coil) para maximizar la memoria gráfica disponible
-        // para MediaCodec y SurfaceFlinger en dispositivos de 1 GB de RAM (Fire TV Stick 3ª Gen).
+        // Liberar caché de bitmaps en RAM (Coil) al abrir el reproductor
         runCatching {
             Coil.imageLoader(applicationContext).memoryCache?.clear()
         }
 
-        // Si la URL apunta explícitamente a un manifiesto .m3u8 (ej. TDTChannels), iniciamos con HLS
-        // y mantenemos el fallback automático a ProgressiveMediaSource si fuese un flujo TS crudo.
         useHlsFallback = url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -129,8 +132,6 @@ class PlayerActivity : Activity() {
             setBackgroundColor(Color.BLACK)
         }
 
-        // Inflamos el PlayerView desde XML con app:surface_type="surface_view" explícito
-        // para garantizar el uso exclusivo de SurfaceView por hardware y descartar TextureView.
         playerView = (LayoutInflater.from(this).inflate(
             R.layout.activity_player_view,
             root,
@@ -156,17 +157,6 @@ class PlayerActivity : Activity() {
             visibility = if (streamTitle.isBlank()) android.view.View.GONE else android.view.View.VISIBLE
         }
 
-        decoderButton = createOverlayButton(padH, padV).apply {
-            updateDecoderLabel()
-            setOnClickListener {
-                val pos = player?.currentPosition ?: 0L
-                forceSoftwareDecoder = !forceSoftwareDecoder
-                reconnectAttempts = 0
-                updateDecoderLabel()
-                initPlayer(startPositionMs = pos)
-            }
-        }
-
         reloadButton = createOverlayButton(padH, padV).apply {
             text = "↻ Reconectar"
             setTextColor(0xFFE5C158.toInt())
@@ -188,13 +178,6 @@ class PlayerActivity : Activity() {
             )
             addView(
                 reloadButton,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { marginEnd = (10 * density).toInt() }
-            )
-            addView(
-                decoderButton,
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -273,40 +256,9 @@ class PlayerActivity : Activity() {
         }
     }
 
-    private fun Button.updateDecoderLabel() {
-        text = if (forceSoftwareDecoder) "⚙ Decodificador: SW" else "⚙ Decodificador: HW+SW"
-        setTextColor(if (forceSoftwareDecoder) 0xFFE5C158.toInt() else Color.WHITE)
-    }
-
     private fun cancelPendingCallbacks() {
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         reconnectRunnable = null
-        firstFrameCheckRunnable?.let { mainHandler.removeCallbacks(it) }
-        firstFrameCheckRunnable = null
-    }
-
-    private fun scheduleFirstFrameFreezeCheck() {
-        firstFrameCheckRunnable?.let { mainHandler.removeCallbacks(it) }
-        if (forceSoftwareDecoder) return
-        val checkTask = Runnable {
-            val p = player ?: return@Runnable
-            if (isFinishing || isDestroyed || forceSoftwareDecoder) return@Runnable
-            if (p.playbackState == Player.STATE_READY && p.playWhenReady && p.isPlaying) {
-                val counters = p.videoDecoderCounters
-                val renderedFrames = counters?.renderedOutputBufferCount ?: 0
-                // Si tras 3.2 segundos con el audio sonando el decodificador HW de MediaTek/Fire OS
-                // se ha quedado congelado en el primer fotograma (1 o 2 frames renderizados en total),
-                // conmutamos automáticamente a decodificación por software sin intervención manual.
-                if (counters != null && renderedFrames in 1..2) {
-                    val resumePos = if (isLive) 0L else p.currentPosition
-                    forceSoftwareDecoder = true
-                    decoderButton.updateDecoderLabel()
-                    initPlayer(startPositionMs = resumePos)
-                }
-            }
-        }
-        firstFrameCheckRunnable = checkTask
-        mainHandler.postDelayed(checkTask, 3_200L)
     }
 
     private fun scheduleReconnect(resumePositionMs: Long, reason: String) {
@@ -346,44 +298,168 @@ class PlayerActivity : Activity() {
         player = null
     }
 
+    /**
+     * Renderizador de vídeo por software optimizado para Fire OS (BuildConfig.FORCE_SOFTWARE_DECODER == true):
+     * - Rechaza de forma directa y definitiva los decodificadores hardware OMX.MTK. sin intentos fallidos.
+     * - Prioriza los decodificadores de software multihilo de Android (c2.android.* seguido de OMX.google.*).
+     * - Aplica prioridad de tiempo real (KEY_PRIORITY = 0), frecuencia máxima (KEY_OPERATING_RATE) y 4 hilos.
+     */
+    private inner class FireOsSoftwareVideoRenderer(
+        context: Context,
+        codecAdapterFactory: MediaCodecAdapter.Factory,
+        mediaCodecSelector: MediaCodecSelector,
+        allowedJoiningTimeMs: Long,
+        enableDecoderFallback: Boolean,
+        eventHandler: Handler,
+        eventListener: VideoRendererEventListener,
+        maxDroppedFramesToNotify: Int,
+    ) : MediaCodecVideoRenderer(
+        context,
+        codecAdapterFactory,
+        mediaCodecSelector,
+        allowedJoiningTimeMs,
+        enableDecoderFallback,
+        eventHandler,
+        eventListener,
+        maxDroppedFramesToNotify,
+    ) {
+        override fun getDecoderInfos(
+            mediaCodecSelector: MediaCodecSelector,
+            format: Format,
+            requiresSecureDecoder: Boolean,
+        ): MutableList<MediaCodecInfo> {
+            val mimeType = format.sampleMimeType
+                ?: return super.getDecoderInfos(mediaCodecSelector, format, requiresSecureDecoder)
+            val allInfos = MediaCodecUtil.getDecoderInfos(mimeType, requiresSecureDecoder, false)
+            if (allInfos.isEmpty()) {
+                return super.getDecoderInfos(mediaCodecSelector, format, requiresSecureDecoder)
+            }
+            val withoutMtk = allInfos.filterNot { info ->
+                val name = info.name.lowercase()
+                name.startsWith("omx.mtk.") || name.contains(".mtk.")
+            }
+            val swOnly = withoutMtk
+                .filter { isSoftwareCodec(it) }
+                .sortedBy { info -> if (info.name.lowercase().startsWith("c2.android.")) 0 else 1 }
+            return when {
+                swOnly.isNotEmpty() -> swOnly.toMutableList()
+                withoutMtk.isNotEmpty() -> withoutMtk.toMutableList()
+                else -> allInfos.toMutableList()
+            }
+        }
+
+        @SuppressLint("InlinedApi")
+        override fun getMediaFormat(
+            format: Format,
+            codecMimeType: String,
+            codecMaxValues: CodecMaxValues,
+            codecOperatingRate: Float,
+            deviceNeedsNoPostProcessWorkaround: Boolean,
+            tunnelingAudioSessionId: Int,
+        ): MediaFormat {
+            val mediaFormat = super.getMediaFormat(
+                format,
+                codecMimeType,
+                codecMaxValues,
+                codecOperatingRate,
+                /* deviceNeedsNoPostProcessWorkaround = */ true,
+                tunnelingAudioSessionId,
+            )
+            runCatching {
+                mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                mediaFormat.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
+                mediaFormat.setInteger("threads", 4)
+                mediaFormat.setInteger("vendor.android.media.swcodec.threads", 4)
+                mediaFormat.setInteger("skip-loop-filter", 16)
+            }
+            return mediaFormat
+        }
+    }
+
     private fun initPlayer(startPositionMs: Long) {
         releasePlayer()
 
-        // Configuración de RenderersFactory optimizada para Fire OS 7 (MediaTek MT8695D, 1 GB RAM):
-        // 1. setEnableDecoderFallback(true) para saltar automáticamente a un decodificador secundario si el primario falla.
-        // 2. EXTENSION_RENDERER_MODE_PREFER para priorizar extensiones disponibles.
-        // 3. forceDisableMediaCodecAsynchronousQueueing() para evitar que la cola asíncrona de MediaCodec en Fire OS 7
-        //    bloquee la salida de vídeo tras renderizar el primer fotograma en streams entrelazados / MPEG-TS.
-        val renderersFactory = DefaultRenderersFactory(applicationContext)
-            .setEnableDecoderFallback(true)
-            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
-            .setAllowedVideoJoiningTimeMs(5_000L)
-            .forceDisableMediaCodecAsynchronousQueueing()
-
-        if (forceSoftwareDecoder) {
-            val swSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+        val renderersFactory = if (BuildConfig.FORCE_SOFTWARE_DECODER) {
+            // Variante fireos: usa directamente el decodificador por software multihilo sin pasar por OMX.MTK.
+            val swCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
                 val infos = MediaCodecUtil.getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
-                val swOnly = infos.filter { isSoftwareCodec(it) }
-                swOnly.ifEmpty { infos }
+                val withoutMtk = infos.filterNot { info ->
+                    val codecName = info.name.lowercase()
+                    codecName.startsWith("omx.mtk.") || codecName.contains(".mtk.")
+                }
+                val swOnly = withoutMtk
+                    .filter { isSoftwareCodec(it) }
+                    .sortedBy { info -> if (info.name.lowercase().startsWith("c2.android.")) 0 else 1 }
+                when {
+                    swOnly.isNotEmpty() -> swOnly
+                    withoutMtk.isNotEmpty() -> withoutMtk
+                    else -> infos
+                }
             }
-            renderersFactory.setMediaCodecSelector(swSelector)
+            object : DefaultRenderersFactory(applicationContext) {
+                override fun buildVideoRenderers(
+                    context: Context,
+                    extensionRendererMode: Int,
+                    mediaCodecSelector: MediaCodecSelector,
+                    enableDecoderFallback: Boolean,
+                    eventHandler: Handler,
+                    eventListener: VideoRendererEventListener,
+                    allowedVideoJoiningTimeMs: Long,
+                    out: ArrayList<Renderer>,
+                ) {
+                    out.add(
+                        FireOsSoftwareVideoRenderer(
+                            context = context,
+                            codecAdapterFactory = codecAdapterFactory,
+                            mediaCodecSelector = swCodecSelector,
+                            allowedJoiningTimeMs = allowedVideoJoiningTimeMs,
+                            enableDecoderFallback = enableDecoderFallback,
+                            eventHandler = eventHandler,
+                            eventListener = eventListener,
+                            maxDroppedFramesToNotify = MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY,
+                        )
+                    )
+                }
+            }
+                .setEnableDecoderFallback(true)
+                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+                .setAllowedVideoJoiningTimeMs(5_000L)
+                .forceDisableMediaCodecAsynchronousQueueing()
+                .setMediaCodecSelector(swCodecSelector)
         } else {
-            renderersFactory.setMediaCodecSelector(MediaCodecSelector.DEFAULT)
+            // Variante standard intacta: aceleración por hardware normal (MediaCodecSelector.DEFAULT)
+            DefaultRenderersFactory(applicationContext)
+                .setEnableDecoderFallback(true)
+                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+                .setAllowedVideoJoiningTimeMs(5_000L)
+                .forceDisableMediaCodecAsynchronousQueueing()
+                .apply {
+                    if (forceSoftwareDecoder) {
+                        val swSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+                            val infos = MediaCodecUtil.getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
+                            val swOnly = infos.filter { isSoftwareCodec(it) }
+                            swOnly.ifEmpty { infos }
+                        }
+                        setMediaCodecSelector(swSelector)
+                    } else {
+                        setMediaCodecSelector(MediaCodecSelector.DEFAULT)
+                    }
+                }
         }
 
-        // TrackSelector configurado para no pausar ni descartar la pista de vídeo en Fire TV
-        // y con tunneling multimedia desactivado (evita congelación del vídeo cuando hay jitter de PTS en IPTV).
         val trackSelector = DefaultTrackSelector(applicationContext).apply {
-            setParameters(
-                buildUponParameters()
-                    .setExceedRendererCapabilitiesIfNecessary(true)
-                    .setExceedVideoConstraintsIfNecessary(true)
-                    .setExceedAudioConstraintsIfNecessary(true)
-                    .setTunnelingEnabled(false)
-            )
+            val paramsBuilder = buildUponParameters()
+                .setExceedRendererCapabilitiesIfNecessary(true)
+                .setExceedVideoConstraintsIfNecessary(true)
+                .setExceedAudioConstraintsIfNecessary(true)
+                .setTunnelingEnabled(false)
+            if (BuildConfig.FORCE_SOFTWARE_DECODER) {
+                // En fireos, elige siempre la pista 720p automáticamente en streams adaptativos
+                paramsBuilder.setMaxVideoSize(1280, 720)
+            }
+            setParameters(paramsBuilder)
         }
 
-        // Permite HTTP sin cifrar y redirecciones entre HTTP <-> HTTPS habituales en paneles IPTV
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(10_000)
@@ -393,7 +469,6 @@ class PlayerActivity : Activity() {
         val dataSourceFactory = DefaultDataSource.Factory(applicationContext, httpDataSourceFactory)
         val errorHandlingPolicy = DefaultLoadErrorHandlingPolicy(/* minimumLoadableRetryCount = */ 5)
 
-        // Extractores tolerantes a flujos MPEG-TS directos de Xtream Codes con arranque rápido
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setTsExtractorFlags(
@@ -401,7 +476,6 @@ class PlayerActivity : Activity() {
                     DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
             )
 
-        // Factoría principal: ProgressiveMediaSource.Factory para evitar ERROR_CODE_PARSING_MANIFEST_MALFORMED
         val progressiveFactory = ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
             .setLoadErrorHandlingPolicy(errorHandlingPolicy)
 
@@ -413,19 +487,15 @@ class PlayerActivity : Activity() {
             progressiveFactory
         }
 
-        // DefaultLoadControl ajustado específicamente para dispositivos de 1 GB de RAM (Fire TV Stick 3ª Gen):
-        // - Ventana de búfer contenida (15 s a 25 s máx.) y sin back-buffer.
-        // - setPrioritizeTimeOverSizeThresholds(false) para respetar estrictamente el límite de bytes en RAM
-        //   (6 MB en directo / 10 MB en VOD) y evitar agotar los buffers gráficos de MediaCodec.
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ if (isLive) 15_000 else 15_000,
-                /* maxBufferMs = */ if (isLive) 20_000 else 25_000,
-                /* bufferForPlaybackMs = */ if (isLive) 1_000 else 1_500,
-                /* bufferForPlaybackAfterRebufferMs = */ if (isLive) 2_000 else 3_000,
+                /* minBufferMs = */ 12_000,
+                /* maxBufferMs = */ 25_000,
+                /* bufferForPlaybackMs = */ 2_000,
+                /* bufferForPlaybackAfterRebufferMs = */ 4_000,
             )
-            .setPrioritizeTimeOverSizeThresholds(false)
-            .setTargetBufferBytes(if (isLive) 6 * 1024 * 1024 else 10 * 1024 * 1024)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .setTargetBufferBytes(if (isLive) 16 * 1024 * 1024 else 20 * 1024 * 1024)
             .setBackBuffer(0, false)
             .build()
 
@@ -445,10 +515,6 @@ class PlayerActivity : Activity() {
             .also { p ->
                 playerView.player = p
                 val listener = object : Player.Listener {
-                    override fun onRenderedFirstFrame() {
-                        scheduleFirstFrameFreezeCheck()
-                    }
-
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_READY) {
                             reconnectAttempts = 0
@@ -478,7 +544,7 @@ class PlayerActivity : Activity() {
                             return
                         }
 
-                        // 3. Fallback automático de códec Hardware -> Software
+                        // 3. Fallback automático de códec Hardware -> Software en variante standard
                         val isCodecError = error.errorCode in listOf(
                             PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
                             PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED,
@@ -488,12 +554,6 @@ class PlayerActivity : Activity() {
                         )
                         if (isCodecError && !forceSoftwareDecoder) {
                             forceSoftwareDecoder = true
-                            decoderButton.updateDecoderLabel()
-                            Toast.makeText(
-                                this@PlayerActivity,
-                                "Fallo en códec HW; cambiando a decodificación por software (SW)…",
-                                Toast.LENGTH_SHORT
-                            ).show()
                             initPlayer(startPositionMs = currentPos)
                             return
                         }
