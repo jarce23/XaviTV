@@ -23,9 +23,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -163,8 +165,6 @@ actual object PlatformStorage {
 
     actual fun saveCachedM3u(cacheKey: String, content: String) {
         if (content.isBlank()) return
-        // Se guarda en el directorio de caché en disco (no en NSUserDefaults, cuyo límite de 4 MB
-        // en iOS bloqueaba la sincronización de las listas guardadas por el usuario).
         writeUtf8File(m3uCacheFilePath(cacheKey), content)
         runCatching {
             NSUserDefaults.standardUserDefaults.removeObjectForKey(PREFS_M3U_FALLBACK_PREFIX + cacheKey)
@@ -173,9 +173,8 @@ actual object PlatformStorage {
 }
 
 actual fun createPlatformHttpClient(): HttpClient {
-    // Limita la caché en memoria de NSURLCache en iOS para evitar picos de RAM en iPhone/iPad
     runCatching {
-        NSURLCache.sharedURLCache.setMemoryCapacity(4UL * 1024UL * 1024UL) // Máx 4 MB RAM en NSURLCache
+        NSURLCache.sharedURLCache.setMemoryCapacity(4UL * 1024UL * 1024UL)
         NSURLCache.sharedURLCache.setDiskCapacity(24UL * 1024UL * 1024UL)
     }
 
@@ -203,11 +202,6 @@ actual fun createPlatformHttpClient(): HttpClient {
     }
 }
 
-/**
- * Decodifica y submuestrea la imagen a una dimensión máxima (maxDimension) liberando
- * de inmediato el buffer nativo original de Skia para evitar cierres por falta de memoria (OOM)
- * en iPhone e iPad al recorrer catálogos extensos.
- */
 actual fun decodeImageBytes(bytes: ByteArray, maxDimension: Int): ImageBitmap? {
     if (bytes.isEmpty() || bytes.size > 4 * 1024 * 1024) return null
     return try {
@@ -281,11 +275,22 @@ actual fun openStreamInExternalApp(url: String, title: String): Boolean {
     return false
 }
 
-/**
- * Construye la lista de URLs candidatas para el motor multimedia VLCKit / AVPlayer en iOS/iPadOS:
- * Prioriza la reproducción directa de flujos MPEG-TS (.ts) y HLS (.m3u8), soportando además
- * conversiones automáticas entre formatos para servidores Xtream Codes.
- */
+private fun formatIosPlayerTime(ms: Long): String {
+    if (ms <= 0L) return "00:00"
+    val totalSeconds = ms / 1000L
+    val s = totalSeconds % 60
+    val m = (totalSeconds / 60) % 60
+    val h = totalSeconds / 3600
+    val ss = if (s < 10) "0$s" else "$s"
+    val mm = if (m < 10) "0$m" else "$m"
+    return if (h > 0) {
+        val hh = if (h < 10) "0$h" else "$h"
+        "$hh:$mm:$ss"
+    } else {
+        "$mm:$ss"
+    }
+}
+
 private fun buildIosCandidateStreamUrls(originalUrl: String, isLive: Boolean): List<String> {
     val clean = originalUrl.trim()
     val candidates = mutableListOf<String>()
@@ -296,12 +301,10 @@ private fun buildIosCandidateStreamUrls(originalUrl: String, isLive: Boolean): L
         }
     }
 
-    // 1) Flujo original directo (máxima compatibilidad nativa con VLCKit)
     addUnique(clean)
 
     val isTsUrl = clean.endsWith(".ts", ignoreCase = true) || clean.contains(".ts?", ignoreCase = true)
     if (isTsUrl) {
-        // Variante .m3u8 para servidores Xtream Codes
         val m3u8Variant = clean.replace(Regex("\\.ts(\\?.*)?$", RegexOption.IGNORE_CASE), ".m3u8$1")
         addUnique(m3u8Variant)
         if (!clean.contains("/live/", ignoreCase = true)) {
@@ -335,9 +338,7 @@ private fun IsolatedIosVlcSurface(
             onViewCreated(view)
             view
         },
-        update = { _ ->
-            // Intencionalmente vacío: evita reasignar el reproductor o destruir el Surface en recomposiciones
-        },
+        update = { _ -> },
         modifier = modifier
     )
 }
@@ -354,7 +355,6 @@ actual fun NativeVideoPlayer(
     onSaveProgress: (positionMs: Long, durationMs: Long) -> Unit,
     onClose: () -> Unit
 ) {
-    // Configura la sesión de audio nativa de Apple para reproducción continua, en segundo plano y AirPlay
     LaunchedEffect(Unit) {
         runCatching {
             val session = AVAudioSession.sharedInstance()
@@ -370,31 +370,37 @@ actual fun NativeVideoPlayer(
     var isPlaying by remember(url) { mutableStateOf(true) }
     var currentAspectIndex by remember(url) { mutableStateOf(0) }
     val aspectRatios = remember { listOf("DEFAULT", "16:9", "4:3", "FILL") }
-    var statusLabel by remember(url) { mutableStateOf("VLCKit • Iniciando decodificador de baja latencia...") }
+    var statusLabel by remember(url) { mutableStateOf("VLCKit • Iniciando decodificador...") }
     var hasPlaybackError by remember(url) { mutableStateOf(false) }
     var showOverlayBar by remember { mutableStateOf(true) }
     var lastInteractionTick by remember { mutableStateOf(0) }
     var hostViewRef by remember { mutableStateOf<UIView?>(null) }
-    // Contenedor no observable para que las lecturas de tiempo cada 1s jamás recompongan NativeVideoPlayer
+
+    // Estados de reproducción VOD interactivos
+    var currentPosMs by remember(url) { mutableStateOf(if (!isLive && initialPositionMs > 0L) initialPositionMs else 0L) }
+    var totalDurationMs by remember(url) { mutableStateOf(0L) }
+    var isDraggingSlider by remember(url) { mutableStateOf(false) }
+    var sliderDragFraction by remember(url) { mutableStateOf(0f) }
     val playbackClockHolder = remember(url) { LongArray(2) } // [0] = timeMs, [1] = durationMs
     val seekAppliedHolder = remember(url) { BooleanArray(1) }
 
     val currentStreamUrl = candidates.getOrElse(candidateIndex) { url }
 
-    // Ocultación automática de la barra de controles tras 3.5 segundos sin interacción
-    LaunchedEffect(showOverlayBar, lastInteractionTick, hasPlaybackError) {
-        if (showOverlayBar && !hasPlaybackError) {
-            delay(3_500L)
+    // Ocultación automática tras 4 segundos sin interacción (solo si no se está arrastrando el slider)
+    LaunchedEffect(showOverlayBar, lastInteractionTick, hasPlaybackError, isDraggingSlider) {
+        if (showOverlayBar && !hasPlaybackError && !isDraggingSlider) {
+            delay(4_000L)
             showOverlayBar = false
         }
     }
 
-    // Carga o reinicia el flujo en el motor interno VLCKit (con fallback AVPlayer si la librería no está enlazada)
+    // Inicialización y carga del flujo
     LaunchedEffect(currentStreamUrl, reloadSalt, hostViewRef) {
         val hostView = hostViewRef ?: return@LaunchedEffect
         hasPlaybackError = false
         isPlaying = true
         showOverlayBar = true
+        seekAppliedHolder[0] = false
 
         val formatTag = when {
             currentStreamUrl.contains(".ts", ignoreCase = true) -> "MPEG-TS (.ts)"
@@ -415,24 +421,25 @@ actual fun NativeVideoPlayer(
             (hostView as? NSObject)?.performSelector(seekSel, withObject = nsSec)
         }
 
-        // Aplica relación de aspecto actual
         val aspectSel = NSSelectorFromString("setAspectRatio:")
         val safeRatio = aspectRatios.getOrNull(currentAspectIndex) ?: "DEFAULT"
         val nsRatio = NSString.create(string = safeRatio)
         (hostView as? NSObject)?.performSelector(aspectSel, withObject = nsRatio)
     }
 
-    // Supervisión periódica (cada 1s) para telemetría de estado y detección de fallos de reproducción
+    // Supervisión periódica cada 1s: telemetría, detección de errores, reanudación y guardado continuo
     LaunchedEffect(currentStreamUrl, reloadSalt, hostViewRef) {
         val hostView = hostViewRef ?: return@LaunchedEffect
         var tickCount = 0
         while (true) {
             delay(1000L)
             tickCount++
+
             val errSel = NSSelectorFromString("getHasErrorNumber")
             val hasErr = ((hostView as? NSObject)?.performSelector(errSel) as? NSNumber)?.boolValue
                 ?: ((hostView as? NSObject)?.valueForKey("currentHasError") as? NSNumber)?.boolValue
                 ?: false
+
             if (hasErr && !hasPlaybackError) {
                 if (candidateIndex + 1 < candidates.size) {
                     candidateIndex += 1
@@ -444,20 +451,23 @@ actual fun NativeVideoPlayer(
                     statusLabel = "Fallo de decodificación. Reintenta o abre en VLC externo"
                 }
             } else if (!hasPlaybackError) {
+                val isPlayingNum = (hostView as? NSObject)?.performSelector(NSSelectorFromString("getIsPlayingNumber")) as? NSNumber
+                val playingNow = isPlayingNum?.boolValue ?: isPlaying
+                if (isPlaying != playingNow) {
+                    isPlaying = playingNow
+                }
                 val formatTag = when {
                     currentStreamUrl.contains(".ts", ignoreCase = true) -> "MPEG-TS (.ts)"
                     currentStreamUrl.contains(".m3u8", ignoreCase = true) -> "HLS (.m3u8)"
                     else -> "Stream directo"
                 }
-                val nextStatus = if (isPlaying) {
+                statusLabel = if (isPlaying) {
                     if (isLive) "VLCKit • En directo ($formatTag)" else "VLCKit • Reproduciendo"
                 } else {
                     "VLCKit • En pausa"
                 }
-                if (statusLabel != nextStatus) {
-                    statusLabel = nextStatus
-                }
             }
+
             if (!isLive) {
                 val timeSel = NSSelectorFromString("getPlaybackTimeMs")
                 val durSel = NSSelectorFromString("getDurationMs")
@@ -465,38 +475,40 @@ actual fun NativeVideoPlayer(
                 val durNum = (hostView as? NSObject)?.performSelector(durSel) as? NSNumber
                 val timeMs = timeNum?.longLongValue ?: 0L
                 val durMs = durNum?.longLongValue ?: 0L
-                if (timeMs > 0L) playbackClockHolder[0] = timeMs
-                if (durMs > 0L) playbackClockHolder[1] = durMs
 
-                if (!seekAppliedHolder[0] && initialPositionMs > 3_000L && timeMs > 0L) {
-                    if (timeMs < initialPositionMs - 3_000L) {
-                        val sec = initialPositionMs.toDouble() / 1000.0
-                        val seekSel = NSSelectorFromString("seekToNumber:")
-                        val nsSec = NSNumber(double = sec)
-                        (hostView as? NSObject)?.performSelector(seekSel, withObject = nsSec)
+                if (timeMs > 0L) {
+                    playbackClockHolder[0] = timeMs
+                    if (!isDraggingSlider) {
+                        currentPosMs = timeMs
                     }
+                }
+                if (durMs > 0L) {
+                    playbackClockHolder[1] = durMs
+                    totalDurationMs = durMs
+                }
+
+                // Reanudación automática al segundo exacto en cuanto el reproductor esté activo
+                if (!seekAppliedHolder[0] && initialPositionMs > 3_000L && (timeMs > 0L || durMs > 0L || isPlaying)) {
+                    val sec = initialPositionMs.toDouble() / 1000.0
+                    val seekSel = NSSelectorFromString("seekToNumber:")
+                    val nsSec = NSNumber(double = sec)
+                    (hostView as? NSObject)?.performSelector(seekSel, withObject = nsSec)
                     seekAppliedHolder[0] = true
+                    if (!isDraggingSlider) {
+                        currentPosMs = initialPositionMs
+                    }
+                }
+
+                // Guardado periódico cada 5 segundos en background
+                if (tickCount % 5 == 0 && timeMs > 2_000L && isPlaying) {
+                    onSaveProgress(timeMs, durMs)
                 }
             }
         }
     }
 
     DisposableEffect(Unit) {
-        val observer = NSNotificationCenter.defaultCenter.addObserverForName(
-            name = "VLCPlayerToggleOverlayNotification",
-            `object` = null,
-            queue = NSOperationQueue.mainQueue
-        ) { _ ->
-            showOverlayBar = !showOverlayBar
-            lastInteractionTick++
-        }
-        vlcToggleOverlayHandler = {
-            showOverlayBar = !showOverlayBar
-            lastInteractionTick++
-        }
         onDispose {
-            vlcToggleOverlayHandler = null
-            NSNotificationCenter.defaultCenter.removeObserver(observer)
             val hostView = hostViewRef
             if (!isLive) {
                 val timeSel = NSSelectorFromString("getPlaybackTimeMs")
@@ -521,13 +533,12 @@ actual fun NativeVideoPlayer(
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // Vista nativa UIKit alojada en un @Composable aislado sin lectura de State:
         IsolatedIosVlcSurface(
             onViewCreated = { view -> hostViewRef = view },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Capa táctil transparente sobre el reproductor para alternar controles con un toque (tap to toggle)
+        // Capa táctil transparente para alternar la visibilidad de los controles
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -540,17 +551,17 @@ actual fun NativeVideoPlayer(
                 }
         )
 
-        // Barra superior de controles superpuesta con soporte de Safe Area
+        // Barra superior de controles superpuesta
         AnimatedVisibility(
             visible = showOverlayBar || hasPlaybackError,
-            enter = fadeIn(tween(300)) + slideInVertically(tween(300)) { -it },
-            exit = fadeOut(tween(350)) + slideOutVertically(tween(350)) { -it },
+            enter = fadeIn(tween(250)) + slideInVertically(tween(250)) { -it },
+            exit = fadeOut(tween(300)) + slideOutVertically(tween(300)) { -it },
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
         ) {
             Surface(
-                color = Color(0xFF0B1F15).copy(alpha = 0.90f),
+                color = Color(0xFF0B1F15).copy(alpha = 0.92f),
                 border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.35f))
             ) {
                 Row(
@@ -579,11 +590,7 @@ actual fun NativeVideoPlayer(
                     }
 
                     Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable {
-                                showOverlayBar = false
-                            }
+                        modifier = Modifier.weight(1f)
                     ) {
                         Text(
                             text = title,
@@ -602,7 +609,7 @@ actual fun NativeVideoPlayer(
                         )
                     }
 
-                    // Selector de relación de aspecto (DEFAULT, 16:9, 4:3, FILL)
+                    // Selector de relación de aspecto
                     OutlinedButton(
                         onClick = {
                             lastInteractionTick++
@@ -630,43 +637,7 @@ actual fun NativeVideoPlayer(
                         )
                     }
 
-                    // Botón Reproducir / Pausa
-                    IconButton(
-                        onClick = {
-                            lastInteractionTick++
-                            val hostView = hostViewRef
-                            if (hostView != null) {
-                                if (isPlaying && !isLive) {
-                                    val timeSel = NSSelectorFromString("getPlaybackTimeMs")
-                                    val durSel = NSSelectorFromString("getDurationMs")
-                                    val curPos = ((hostView as? NSObject)?.performSelector(timeSel) as? NSNumber)?.longLongValue ?: playbackClockHolder[0]
-                                    val curDur = ((hostView as? NSObject)?.performSelector(durSel) as? NSNumber)?.longLongValue ?: playbackClockHolder[1]
-                                    if (curPos > 2000L) {
-                                        onSaveProgress(curPos, curDur)
-                                    }
-                                }
-                                val sel = if (isPlaying) {
-                                    NSSelectorFromString("pauseStream")
-                                } else {
-                                    NSSelectorFromString("resumeStream")
-                                }
-                                (hostView as? NSObject)?.performSelector(sel)
-                                isPlaying = !isPlaying
-                                statusLabel = if (isPlaying) "VLCKit • Reproduciendo" else "VLCKit • En pausa"
-                            }
-                        },
-                        modifier = Modifier
-                            .size(38.dp)
-                            .background(SurfaceCard, RoundedCornerShape(10.dp))
-                    ) {
-                        Icon(
-                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = if (isPlaying) "Pausar" else "Reproducir",
-                            tint = GoldPrimary
-                        )
-                    }
-
-                    if (candidates.size > 1) {
+                    if (isLive && candidates.size > 1) {
                         OutlinedButton(
                             onClick = {
                                 lastInteractionTick++
@@ -684,20 +655,20 @@ actual fun NativeVideoPlayer(
                         }
                     }
 
-                    // Botón Recargar stream
-                    IconButton(
-                        onClick = {
-                            lastInteractionTick++
-                            reloadSalt += 1
-                        },
-                        modifier = Modifier
-                            .size(38.dp)
-                            .background(SurfaceCard, RoundedCornerShape(10.dp))
-                    ) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Recargar stream", tint = TextWhite)
+                    if (isLive) {
+                        IconButton(
+                            onClick = {
+                                lastInteractionTick++
+                                reloadSalt += 1
+                            },
+                            modifier = Modifier
+                                .size(38.dp)
+                                .background(SurfaceCard, RoundedCornerShape(10.dp))
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Recargar stream", tint = TextWhite)
+                        }
                     }
 
-                    // Botón Abrir en VLC externo
                     IconButton(
                         onClick = { openStreamInExternalApp(url, title) },
                         modifier = Modifier
@@ -710,6 +681,186 @@ actual fun NativeVideoPlayer(
                             contentDescription = "Abrir en VLC externo",
                             tint = GoldPrimary
                         )
+                    }
+                }
+            }
+        }
+
+        // Barra inferior de controles (VOD / Directo)
+        AnimatedVisibility(
+            visible = showOverlayBar || hasPlaybackError,
+            enter = fadeIn(tween(250)) + slideInVertically(tween(250)) { it },
+            exit = fadeOut(tween(300)) + slideOutVertically(tween(300)) { it },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+        ) {
+            Surface(
+                color = Color(0xFF0B1F15).copy(alpha = 0.94f),
+                border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.35f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .windowInsetsPadding(
+                            WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal)
+                        )
+                        .padding(horizontal = 18.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (!isLive && totalDurationMs > 0L) {
+                        val sliderVal = if (isDraggingSlider) {
+                            sliderDragFraction
+                        } else {
+                            (currentPosMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
+                        }
+                        Slider(
+                            value = sliderVal,
+                            onValueChange = { frac ->
+                                lastInteractionTick++
+                                isDraggingSlider = true
+                                sliderDragFraction = frac
+                            },
+                            onValueChangeFinished = {
+                                val targetMs = (sliderDragFraction * totalDurationMs).toLong()
+                                currentPosMs = targetMs
+                                isDraggingSlider = false
+                                val sec = targetMs.toDouble() / 1000.0
+                                val seekSel = NSSelectorFromString("seekToNumber:")
+                                (hostViewRef as? NSObject)?.performSelector(seekSel, withObject = NSNumber(double = sec))
+                                if (targetMs > 2000L) {
+                                    onSaveProgress(targetMs, totalDurationMs)
+                                    onSavePosition(targetMs)
+                                }
+                                lastInteractionTick++
+                            },
+                            colors = SliderDefaults.colors(
+                                thumbColor = GoldPrimary,
+                                activeTrackColor = GoldPrimary,
+                                inactiveTrackColor = BetisGreenLeaf.copy(alpha = 0.45f)
+                            ),
+                            modifier = Modifier.fillMaxWidth().height(26.dp)
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            if (!isLive) {
+                                IconButton(
+                                    onClick = {
+                                        lastInteractionTick++
+                                        val target = (currentPosMs - 10_000L).coerceAtLeast(0L)
+                                        currentPosMs = target
+                                        val sec = target.toDouble() / 1000.0
+                                        (hostViewRef as? NSObject)?.performSelector(NSSelectorFromString("seekToNumber:"), withObject = NSNumber(double = sec))
+                                        if (target > 2000L) {
+                                            onSaveProgress(target, totalDurationMs)
+                                            onSavePosition(target)
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .background(SurfaceCard, RoundedCornerShape(10.dp))
+                                ) {
+                                    Icon(
+                                        Icons.Default.Replay10,
+                                        contentDescription = "Retroceder 10s",
+                                        tint = GoldLight
+                                    )
+                                }
+                            }
+
+                            // Botón principal Reproducir / Pausa
+                            IconButton(
+                                onClick = {
+                                    lastInteractionTick++
+                                    val hostView = hostViewRef
+                                    if (hostView != null) {
+                                        if (isPlaying && !isLive) {
+                                            if (currentPosMs > 2000L) {
+                                                onSaveProgress(currentPosMs, totalDurationMs)
+                                                onSavePosition(currentPosMs)
+                                            }
+                                        }
+                                        val sel = if (isPlaying) NSSelectorFromString("pauseStream") else NSSelectorFromString("resumeStream")
+                                        (hostView as? NSObject)?.performSelector(sel)
+                                        isPlaying = !isPlaying
+                                        statusLabel = if (isPlaying) "VLCKit • Reproduciendo" else "VLCKit • En pausa"
+                                    }
+                                },
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clip(CircleShape)
+                                    .background(GreenBetis)
+                                    .border(1.5.dp, GoldPrimary, CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    contentDescription = if (isPlaying) "Pausar" else "Reproducir",
+                                    tint = GoldLight,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            }
+
+                            if (!isLive) {
+                                IconButton(
+                                    onClick = {
+                                        lastInteractionTick++
+                                        val target = if (totalDurationMs > 0) (currentPosMs + 10_000L).coerceAtMost(totalDurationMs) else currentPosMs + 10_000L
+                                        currentPosMs = target
+                                        val sec = target.toDouble() / 1000.0
+                                        (hostViewRef as? NSObject)?.performSelector(NSSelectorFromString("seekToNumber:"), withObject = NSNumber(double = sec))
+                                        if (target > 2000L) {
+                                            onSaveProgress(target, totalDurationMs)
+                                            onSavePosition(target)
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .background(SurfaceCard, RoundedCornerShape(10.dp))
+                                ) {
+                                    Icon(
+                                        Icons.Default.Forward10,
+                                        contentDescription = "Adelantar 10s",
+                                        tint = GoldLight
+                                    )
+                                }
+                            }
+                        }
+
+                        if (!isLive) {
+                            Text(
+                                text = "${formatIosPlayerTime(currentPosMs)} / ${formatIosPlayerTime(totalDurationMs)}",
+                                color = GoldLight,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        } else {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Box(
+                                    Modifier
+                                        .size(8.dp)
+                                        .clip(CircleShape)
+                                        .background(GoldPrimary)
+                                )
+                                Text(
+                                    text = "EN DIRECTO",
+                                    color = GoldPrimary,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+                        }
                     }
                 }
             }

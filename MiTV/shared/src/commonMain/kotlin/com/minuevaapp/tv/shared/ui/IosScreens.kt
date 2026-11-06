@@ -127,8 +127,9 @@ class SharedAppState {
         _refreshFeedback.value = "Actualizando catálogo de ${targetPlaylist.name}..."
 
         backgroundScope.launch(Dispatchers.IO) {
+            clearImageCache()
             val activeRepo = if (targetPlaylist == store.active()) repo() else createRepo(targetPlaylist)
-            val result = activeRepo.refreshAllXtream()
+            val result = activeRepo.refreshAllXtream(force = true)
             _isRefreshing.value = false
             _catalogRefreshVersion.value += 1L
             val feedback = if (result.success) {
@@ -417,7 +418,28 @@ fun IosXaviTVApp() {
                     onOpenSeries = { navigate(IosScreen.Catalog(CatalogKind.SERIES)) },
                     onOpenFavorites = { navigate(IosScreen.Catalog(CatalogKind.FAVORITES)) },
                     onOpenSearch = { navigate(IosScreen.Search) },
-                    onOpenPlaylists = { navigate(IosScreen.Playlists) }
+                    onOpenPlaylists = { navigate(IosScreen.Playlists) },
+                    onPlayLiveChannel = { ch ->
+                        appState.store.addRecentlyViewed("live", ch.streamId)
+                        val url = ch.directUrl?.takeIf { it.isNotBlank() }
+                            ?: appState.repo().liveUrl(ch.streamId, "ts")
+                        navigate(
+                            IosScreen.Player(
+                                url = url,
+                                title = ch.name ?: "Canal",
+                                subtitle = "TV en directo",
+                                isLive = true
+                            )
+                        )
+                    },
+                    onOpenMovieDetail = { movie ->
+                        appState.store.addRecentlyViewed("vod", movie.streamId)
+                        navigate(IosScreen.MovieDetail(movie))
+                    },
+                    onOpenSeriesDetail = { series ->
+                        appState.store.addRecentlyViewed("series", series.seriesId)
+                        navigate(IosScreen.SeriesDetail(series))
+                    }
                 )
                 is IosScreen.Catalog -> IosCatalogScreen(
                     kind = current.kind,
@@ -759,6 +781,34 @@ fun IosNetworkImage(
     }
 }
 
+internal fun String?.matchesSearch(query: String): Boolean {
+    val text = this ?: return false
+    val q = query.trim()
+    if (q.isEmpty()) return true
+    if (text.contains(q, ignoreCase = true)) return true
+    fun normalize(s: String): String {
+        return s.lowercase()
+            .replace('á', 'a').replace('é', 'e').replace('í', 'i')
+            .replace('ó', 'o').replace('ú', 'u').replace('ü', 'u')
+    }
+    return normalize(text).contains(normalize(q))
+}
+
+internal fun resolveVodProgressFraction(progressMap: Map<String, PlaybackProgress>, id: String): Float {
+    return (progressMap["vod:$id"] ?: progressMap["movie:$id"] ?: progressMap[id])?.progressFraction ?: 0f
+}
+
+internal fun resolveSeriesProgressFraction(progressMap: Map<String, PlaybackProgress>, id: String): Float {
+    return (progressMap["series_cover:$id"] ?: progressMap["series:$id"] ?: progressMap[id])?.progressFraction ?: 0f
+}
+
+internal fun resolveEpisodeProgressFraction(progressMap: Map<String, PlaybackProgress>, seriesId: String, epId: String): Float {
+    return (progressMap["series:$seriesId:ep:$epId"]
+        ?: progressMap["series:$epId"]
+        ?: progressMap["episode:$epId"]
+        ?: progressMap[epId])?.progressFraction ?: 0f
+}
+
 @Composable
 fun IosPosterCard(
     title: String?,
@@ -809,6 +859,23 @@ fun IosPosterCard(
                         contentDescription = "Favorito",
                         tint = GoldLight,
                         modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+            if (clampedProgress > 0.01f) {
+                Box(
+                    Modifier
+                        .align(Alignment.TopStart)
+                        .padding(6.dp)
+                        .background(DarkBackground.copy(alpha = 0.88f), RoundedCornerShape(5.dp))
+                        .border(1.dp, GoldAccent, RoundedCornerShape(5.dp))
+                        .padding(horizontal = 5.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = "${(clampedProgress * 100).toInt()}%",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = GoldLight
                     )
                 }
             }
@@ -1362,11 +1429,48 @@ fun IosHomeScreen(
     onOpenSeries: () -> Unit,
     onOpenFavorites: () -> Unit,
     onOpenSearch: () -> Unit,
-    onOpenPlaylists: () -> Unit
+    onOpenPlaylists: () -> Unit,
+    onPlayLiveChannel: (LiveStream) -> Unit = {},
+    onOpenMovieDetail: (VodStream) -> Unit = {},
+    onOpenSeriesDetail: (Series) -> Unit = {}
 ) {
     val appState = LocalSharedAppState.current
     val active = remember { appState.store.active() }
     val syncState by appState.m3uSyncState.collectAsState()
+    val store = remember { appState.store }
+    val repo = remember { appState.repo() }
+    val catalogVersion by appState.catalogRefreshVersion.collectAsState()
+    val progressMap by store.playbackProgressFlow.collectAsState()
+
+    val recentLiveIds = remember(catalogVersion) { store.getRecentlyViewed("live") }
+    val recentVodIds = remember(catalogVersion) { store.getRecentlyViewed("vod") }
+    val recentSeriesIds = remember(catalogVersion) { store.getRecentlyViewed("series") }
+
+    var recentLiveItems by remember { mutableStateOf<List<LiveStream>>(emptyList()) }
+    var recentMovieItems by remember { mutableStateOf<List<VodStream>>(emptyList()) }
+    var recentSeriesItems by remember { mutableStateOf<List<Series>>(emptyList()) }
+
+    LaunchedEffect(catalogVersion) {
+        if (recentLiveIds.isNotEmpty() || recentVodIds.isNotEmpty() || recentSeriesIds.isNotEmpty()) {
+            runCatching {
+                if (recentVodIds.isNotEmpty()) {
+                    val (_, vods) = repo.vod()
+                    val map = vods.associateBy { it.streamId }
+                    recentMovieItems = recentVodIds.mapNotNull { map[it] }
+                }
+                if (recentSeriesIds.isNotEmpty()) {
+                    val (_, series) = repo.series()
+                    val map = series.associateBy { it.seriesId }
+                    recentSeriesItems = recentSeriesIds.mapNotNull { map[it] }
+                }
+                if (recentLiveIds.isNotEmpty()) {
+                    val (_, lives) = repo.live()
+                    val map = lives.associateBy { it.streamId }
+                    recentLiveItems = recentLiveIds.mapNotNull { map[it] }
+                }
+            }
+        }
+    }
 
     val homeSubtitle = remember(active, syncState) {
         if (active.isM3u) {
@@ -1379,6 +1483,72 @@ fun IosHomeScreen(
 
     val isRefreshing by appState.isRefreshing.collectAsState()
     val refreshFeedback by appState.refreshFeedback.collectAsState()
+
+    @Composable
+    fun ContinueWatchingRow() {
+        if (recentMovieItems.isEmpty() && recentSeriesItems.isEmpty() && recentLiveItems.isEmpty()) return
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(bottom = 8.dp)
+            ) {
+                Icon(
+                    Icons.Default.History,
+                    contentDescription = null,
+                    tint = GoldAccent,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "Continuar viendo y recientes",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    color = GoldChampagne
+                )
+            }
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                contentPadding = PaddingValues(horizontal = 2.dp, vertical = 2.dp)
+            ) {
+                items(recentMovieItems, key = { "home_vod_${it.streamId}" }) { m ->
+                    val p = resolveVodProgressFraction(progressMap, m.streamId)
+                    IosPosterCard(
+                        title = m.name,
+                        image = m.icon,
+                        subtitle = m.rating ?: "Película",
+                        progress = p,
+                        modifier = Modifier.width(125.dp),
+                        onClick = { onOpenMovieDetail(m) }
+                    )
+                }
+                items(recentSeriesItems, key = { "home_ser_${it.seriesId}" }) { s ->
+                    val p = resolveSeriesProgressFraction(progressMap, s.seriesId)
+                    IosPosterCard(
+                        title = s.name,
+                        image = s.cover,
+                        subtitle = s.rating ?: "Serie",
+                        progress = p,
+                        modifier = Modifier.width(125.dp),
+                        onClick = { onOpenSeriesDetail(s) }
+                    )
+                }
+                items(recentLiveItems, key = { "home_live_${it.streamId}" }) { ch ->
+                    IosPosterCard(
+                        title = ch.name,
+                        image = ch.icon,
+                        subtitle = "TV en directo",
+                        progress = 0f,
+                        modifier = Modifier.width(125.dp),
+                        onClick = { onPlayLiveChannel(ch) }
+                    )
+                }
+            }
+        }
+    }
 
     IosAppScaffold(
         title = "XaviTV",
@@ -1454,17 +1624,18 @@ fun IosHomeScreen(
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
             val isTablet = maxWidth >= 700.dp
             if (isTablet) {
-                // Diseño expandido para iPad: 3 grandes bloques en paralelo + fila de accesos rápidos
+                // Diseño expandido para iPad: 3 grandes bloques en paralelo + Continuar viendo + accesos rápidos
                 Column(
                     Modifier
                         .fillMaxSize()
-                        .padding(24.dp),
+                        .padding(24.dp)
+                        .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(20.dp)
                 ) {
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .weight(1f),
+                            .height(210.dp),
                         horizontalArrangement = Arrangement.spacedBy(18.dp)
                     ) {
                         IosTabletHeroTile(
@@ -1492,6 +1663,9 @@ fun IosHomeScreen(
                             modifier = Modifier.weight(1f).fillMaxHeight()
                         )
                     }
+
+                    ContinueWatchingRow()
+
                     Row(
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(16.dp)
@@ -1581,6 +1755,9 @@ fun IosHomeScreen(
                             icon = Icons.Default.VideoLibrary,
                             onClick = onOpenSeries
                         )
+                    }
+                    item {
+                        ContinueWatchingRow()
                     }
                     item {
                         OutlinedButton(
@@ -1828,6 +2005,7 @@ fun IosCatalogScreen(
     val catalogVersion by appState.catalogRefreshVersion.collectAsState()
     val syncState by appState.m3uSyncState.collectAsState()
     val isRefreshing by appState.isRefreshing.collectAsState()
+    val refreshFeedback by appState.refreshFeedback.collectAsState()
     val progressMap by store.playbackProgressFlow.collectAsState()
 
     var categories by remember { mutableStateOf<List<Category>>(emptyList()) }
@@ -1857,10 +2035,11 @@ fun IosCatalogScreen(
         error = null
         val allCat = Category("ALL", "Todos")
         val recentCat = Category("RECENT", "⭐ Vistos recientemente")
+        val force = catalogVersion > 0
         runCatching {
             when (kind) {
                 CatalogKind.LIVE -> {
-                    val (cats, items) = repo.live()
+                    val (cats, items) = repo.live(forceRefresh = force)
                     categories = listOf(allCat, recentCat) + cats
                     liveItems = items
                     if (selectedLiveChannel == null || items.none { it.streamId == selectedLiveChannel?.streamId }) {
@@ -1870,19 +2049,19 @@ fun IosCatalogScreen(
                     }
                 }
                 CatalogKind.MOVIES -> {
-                    val (cats, items) = repo.vod()
+                    val (cats, items) = repo.vod(forceRefresh = force)
                     categories = listOf(allCat, recentCat) + cats
                     movieItems = items
                 }
                 CatalogKind.SERIES -> {
-                    val (cats, items) = repo.series()
+                    val (cats, items) = repo.series(forceRefresh = force)
                     categories = listOf(allCat, recentCat) + cats
                     seriesItems = items
                 }
                 CatalogKind.FAVORITES -> {
-                    liveItems = runCatching { repo.live().second }.getOrDefault(emptyList())
-                    movieItems = runCatching { repo.vod().second }.getOrDefault(emptyList())
-                    seriesItems = runCatching { repo.series().second }.getOrDefault(emptyList())
+                    liveItems = runCatching { repo.live(forceRefresh = force).second }.getOrDefault(emptyList())
+                    movieItems = runCatching { repo.vod(forceRefresh = force).second }.getOrDefault(emptyList())
+                    seriesItems = runCatching { repo.series(forceRefresh = force).second }.getOrDefault(emptyList())
                 }
             }
         }.onFailure { e ->
@@ -1924,7 +2103,7 @@ fun IosCatalogScreen(
             else -> liveItems.filter { it.categoryId == selectedCategory }
         }
         val q = searchQuery.trim()
-        if (q.isEmpty()) base else base.filter { it.name?.contains(q, ignoreCase = true) == true }
+        if (q.isEmpty()) base else base.filter { it.name.matchesSearch(q) }
     }
     val filteredMovies = remember(movieItems, selectedCategory, searchQuery, recentMovieList) {
         val base = when (selectedCategory) {
@@ -1933,7 +2112,7 @@ fun IosCatalogScreen(
             else -> movieItems.filter { it.categoryId == selectedCategory }
         }
         val q = searchQuery.trim()
-        if (q.isEmpty()) base else base.filter { it.name?.contains(q, ignoreCase = true) == true }
+        if (q.isEmpty()) base else base.filter { it.name.matchesSearch(q) }
     }
     val filteredSeries = remember(seriesItems, selectedCategory, searchQuery, recentSeriesList) {
         val base = when (selectedCategory) {
@@ -1942,7 +2121,7 @@ fun IosCatalogScreen(
             else -> seriesItems.filter { it.categoryId == selectedCategory }
         }
         val q = searchQuery.trim()
-        if (q.isEmpty()) base else base.filter { it.name?.contains(q, ignoreCase = true) == true }
+        if (q.isEmpty()) base else base.filter { it.name.matchesSearch(q) }
     }
 
     val title = when (kind) {
@@ -2073,6 +2252,33 @@ fun IosCatalogScreen(
             val isWideTablet = maxWidth >= 1020.dp
 
             Column(Modifier.fillMaxSize()) {
+                if (refreshFeedback != null) {
+                    Surface(
+                        color = BgCardSurface,
+                        border = BorderStroke(1.dp, GoldAccent),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+                    ) {
+                        Row(
+                            Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            if (isRefreshing) {
+                                CircularProgressIndicator(Modifier.size(16.dp), color = GoldAccent, strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                            }
+                            Text(
+                                text = refreshFeedback ?: "",
+                                fontSize = 12.sp,
+                                color = GoldChampagne,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
                 // Barra superior de búsqueda rápida en tiempo real
                 Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
                     IosGoldOutlinedTextField(
@@ -2465,7 +2671,7 @@ fun IosCatalogScreen(
                                                                 title = m.name,
                                                                 image = m.icon,
                                                                 subtitle = m.rating,
-                                                                progress = progressMap["vod:${m.streamId}"]?.progressFraction ?: 0f,
+                                                                progress = resolveVodProgressFraction(progressMap, m.streamId),
                                                                 modifier = Modifier.width(115.dp),
                                                                 onClick = {
                                                                     store.addRecentlyViewed("vod", m.streamId)
@@ -2499,7 +2705,7 @@ fun IosCatalogScreen(
                                                     image = m.icon,
                                                     subtitle = m.rating,
                                                     isFavorite = favVod.contains(m.streamId),
-                                                    progress = progressMap["vod:${m.streamId}"]?.progressFraction ?: 0f,
+                                                    progress = resolveVodProgressFraction(progressMap, m.streamId),
                                                     modifier = Modifier.fillMaxWidth(),
                                                     onClick = {
                                                         store.addRecentlyViewed("vod", m.streamId)
@@ -2553,7 +2759,7 @@ fun IosCatalogScreen(
                                                                 title = s.name,
                                                                 image = s.cover,
                                                                 subtitle = s.rating,
-                                                                progress = progressMap["series_cover:${s.seriesId}"]?.progressFraction ?: 0f,
+                                                                progress = resolveSeriesProgressFraction(progressMap, s.seriesId),
                                                                 modifier = Modifier.width(115.dp),
                                                                 onClick = {
                                                                     store.addRecentlyViewed("series", s.seriesId)
@@ -2587,7 +2793,7 @@ fun IosCatalogScreen(
                                                     image = s.cover,
                                                     subtitle = s.rating,
                                                     isFavorite = favSeries.contains(s.seriesId),
-                                                    progress = progressMap["series_cover:${s.seriesId}"]?.progressFraction ?: 0f,
+                                                    progress = resolveSeriesProgressFraction(progressMap, s.seriesId),
                                                     modifier = Modifier.fillMaxWidth(),
                                                     onClick = {
                                                         store.addRecentlyViewed("series", s.seriesId)
@@ -2660,8 +2866,8 @@ fun IosMovieDetailScreen(
     val ext = info?.movieData?.extension ?: movie.extension ?: "mp4"
     val streamUrl = movie.directUrl?.takeIf { it.isNotBlank() } ?: repo.movieUrl(movie.streamId, ext)
     val resumeKey = "vod:${movie.streamId}"
-    val movieProg = progressMap[resumeKey]
-    val progFraction = movieProg?.progressFraction ?: 0f
+    val movieProg = progressMap[resumeKey] ?: progressMap["movie:${movie.streamId}"] ?: progressMap[movie.streamId]
+    val progFraction = resolveVodProgressFraction(progressMap, movie.streamId)
     val resumeMs = movieProg?.resumePositionMs ?: 0L
 
     IosAppScaffold(title = movie.name ?: "Película", onBack = onBack) {
@@ -2905,9 +3111,7 @@ fun IosSeriesDetailScreen(
                         val ext = ep.extension ?: "mp4"
                         val url = ep.directUrl?.takeIf { it.isNotBlank() } ?: repo.episodeUrl(ep.id, ext)
                         val resumeKey = "series:${series.seriesId}:ep:${ep.id}"
-                        val epProg = progressMap["series:${ep.id}"]?.progressFraction
-                            ?: progressMap[resumeKey]?.progressFraction
-                            ?: 0f
+                        val epProg = resolveEpisodeProgressFraction(progressMap, series.seriesId, ep.id)
                         Column(
                             Modifier
                                 .fillMaxWidth()
@@ -2987,13 +3191,13 @@ fun IosSearchScreen(
 
     val q = query.trim()
     val liveMatches = remember(q, liveAll) {
-        if (q.length < 2) emptyList() else liveAll.filter { it.name?.contains(q, true) == true }.take(30)
+        if (q.length < 2) emptyList() else liveAll.filter { it.name.matchesSearch(q) }.take(30)
     }
     val vodMatches = remember(q, vodAll) {
-        if (q.length < 2) emptyList() else vodAll.filter { it.name?.contains(q, true) == true }.take(30)
+        if (q.length < 2) emptyList() else vodAll.filter { it.name.matchesSearch(q) }.take(30)
     }
     val seriesMatches = remember(q, seriesAll) {
-        if (q.length < 2) emptyList() else seriesAll.filter { it.name?.contains(q, true) == true }.take(30)
+        if (q.length < 2) emptyList() else seriesAll.filter { it.name.matchesSearch(q) }.take(30)
     }
 
     IosAppScaffold(title = "Búsqueda Global", onBack = onBack) {
@@ -3037,7 +3241,7 @@ fun IosSearchScreen(
                                     title = m.name,
                                     image = m.icon,
                                     subtitle = m.rating,
-                                    progress = progressMap["vod:${m.streamId}"]?.progressFraction ?: 0f,
+                                    progress = resolveVodProgressFraction(progressMap, m.streamId),
                                     onClick = { onOpenMovie(m) }
                                 )
                             }
@@ -3054,7 +3258,7 @@ fun IosSearchScreen(
                                     title = s.name,
                                     image = s.cover,
                                     subtitle = s.rating,
-                                    progress = progressMap["series_cover:${s.seriesId}"]?.progressFraction ?: 0f,
+                                    progress = resolveSeriesProgressFraction(progressMap, s.seriesId),
                                     onClick = { onOpenSeries(s) }
                                 )
                             }

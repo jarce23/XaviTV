@@ -497,7 +497,7 @@ class XtreamRepository(
      *   actualiza el almacenamiento local y emite el nuevo catálogo por StateFlow.
      * - Si el dispositivo no tiene internet o el servidor falla, activa el fallback local inmediatamente.
      */
-    suspend fun syncM3uWithRemote(): M3uSyncOutcome = withContext(Dispatchers.IO) {
+    suspend fun syncM3uWithRemote(force: Boolean = false): M3uSyncOutcome = withContext(Dispatchers.IO) {
         val url = playlist.effectiveM3uUrl
         val cacheKey = M3uParser.cacheKeyForUrl(url)
 
@@ -512,7 +512,7 @@ class XtreamRepository(
             val newSignature = M3uParser.computeContentSignature(remoteRawText)
             val hasChanged = previousSignature.isEmpty() || newSignature != previousSignature
 
-            if (!hasChanged && previousCatalog != null) {
+            if (!force && !hasChanged && previousCatalog != null) {
                 return@withContext M3uSyncOutcome(
                     catalog = previousCatalog,
                     changed = false,
@@ -529,7 +529,7 @@ class XtreamRepository(
 
             M3uSyncOutcome(
                 catalog = parsedRemote,
-                changed = hasChanged,
+                changed = hasChanged || force,
                 usedLocalFallback = false
             )
         } catch (networkError: Throwable) {
@@ -643,14 +643,15 @@ class XtreamRepository(
         }
     }
 
-    suspend fun refreshAllXtream(): RefreshResult = withContext(Dispatchers.IO) {
+    suspend fun refreshAllXtream(force: Boolean = true): RefreshResult = withContext(Dispatchers.IO) {
         liveMutex.withLock { liveCache = null }
         vodMutex.withLock { vodCache = null }
         seriesMutex.withLock { seriesCache = null }
+        m3uMutex.withLock { m3uCatalog = null }
 
         if (playlist.isM3u) {
             return@withContext runCatching {
-                val outcome = syncM3uWithRemote()
+                val outcome = syncM3uWithRemote(force = force)
                 RefreshResult(
                     success = true,
                     liveCount = outcome.catalog.liveStreams.size,

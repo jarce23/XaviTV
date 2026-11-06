@@ -9,7 +9,7 @@ import MobileVLCKit
  * Vista contenedora nativa del reproductor VLCKit (MobileVLCKit) para iOS y iPadOS.
  * Integra el motor multimedia LibVLC para decodificar flujos IPTV complejos
  * (MPEG-TS .ts, HLS .m3u8, Xtream Codes, RTSP, RTMP y códecs pesados como MPEG2/H.264/HEVC/AC3)
- * que el reproductor nativo AVPlayer no es capaz de procesar.
+ * con fallback secundario en AVPlayer.
  */
 @objc(VLCPlayerHostView)
 public class VLCPlayerHostView: UIView {
@@ -17,24 +17,21 @@ public class VLCPlayerHostView: UIView {
     // Superficie nativa sobre la que el motor LibVLC dibuja directamente los frames decodificados
     private let videoSurface = UIView()
 
-    // Instancia dinámica persistente del reproductor LibVLC (MobileVLCKit)
-    // Se reutiliza entre cambios de canales para evitar colisiones en hilos secundarios de LibVLC (vlc_getProxyUrl / CFNetwork)
+    // Instancia persistente del reproductor LibVLC (MobileVLCKit)
     private var vlcMediaPlayer: AnyObject? = nil
     private var vlcMedia: AnyObject? = nil
 
-    // Fallback secundario con AVPlayer en caso de que MobileVLCKit no esté enlazado
+    // Fallback secundario con AVPlayer en caso de que MobileVLCKit no esté disponible
     private var avPlayer: AVPlayer? = nil
     private var avPlayerLayer: AVPlayerLayer? = nil
 
-    // Gesto táctil para alternar controles (tap to toggle)
-    private var tapGesture: UITapGestureRecognizer? = nil
+    // Posición guardada para reanudar automáticamente una vez que el motor esté listo
+    private var pendingResumeSeconds: Double? = nil
 
-    // Almacenamiento seguro interno de textos accesible a nivel de archivo/módulo (internal)
+    // Almacenamiento seguro interno de textos accesible a nivel de módulo
     internal var _statusMsg: String = "Iniciando motor VLCKit..."
     internal var _currentUrl: String = ""
 
-    // Propiedades públicas expuestas a KVC / Kotlin: devuelven siempre NSMutableString (en memoria heap)
-    // para impedir que el runtime de Apple use NSIndirectTaggedPointerString (que crashea getCharacters:range: en Kotlin/Native)
     @objc public var currentStatusMessage: NSString {
         get { return NSMutableString(string: _statusMsg) }
         set { _statusMsg = String(newValue) }
@@ -63,14 +60,12 @@ public class VLCPlayerHostView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         setupViews()
-        setupGesture()
         configureAudioSession()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setupViews()
-        setupGesture()
         configureAudioSession()
     }
 
@@ -87,19 +82,6 @@ public class VLCPlayerHostView: UIView {
             videoSurface.topAnchor.constraint(equalTo: topAnchor),
             videoSurface.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
-    }
-
-    private func setupGesture() {
-        isUserInteractionEnabled = true
-        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTapGesture))
-        tap.cancelsTouchesInView = false
-        addGestureRecognizer(tap)
-        self.tapGesture = tap
-    }
-
-    @objc private func handleTapGesture() {
-        guard window != nil || superview != nil else { return }
-        NotificationCenter.default.post(name: NSNotification.Name("VLCPlayerToggleOverlayNotification"), object: nil)
     }
 
     public override func layoutSubviews() {
@@ -127,7 +109,6 @@ public class VLCPlayerHostView: UIView {
 
     /**
      * Inicia la decodificación y reproducción del flujo mediante LibVLC (MobileVLCKit).
-     * Garantiza la ejecución en el hilo principal y reutiliza la instancia de VLCMediaPlayer.
      */
     @objc(playStream:isLive:)
     public func playStream(urlString: String?, isLive: Bool) {
@@ -148,54 +129,38 @@ public class VLCPlayerHostView: UIView {
             self._currentUrl = clean
             self.currentHasError = false
 
-            // 1. Prioridad: Motor nativo VLCKit reutilizando la instancia base
+            // 1. Prioridad: Motor nativo VLCKit
             if self.startVlcEngine(url: url, isLive: isLive) {
                 let formatTag = clean.lowercased().contains(".ts") ? "MPEG-TS (.ts)" : "HLS (.m3u8)"
                 self._statusMsg = "VLCKit • Decodificando \(formatTag) nativo"
                 return
             }
 
-            // 2. Fallback: AVPlayer si la librería MobileVLCKit no está enlazada en el binario
+            // 2. Fallback: AVPlayer si la librería MobileVLCKit no está enlazada
             self._statusMsg = "Reproductor AVPlayer de respaldo activo"
             self.startAvPlayerFallback(url: url, isLive: isLive)
         }
     }
 
-    /**
-     * Entrada puenteada desde Kotlin con blindaje de tipo NSString?.
-     */
     @objc(playStreamUrl:)
     public func playStreamUrl(url: NSString?) {
         guard let raw = url else { return }
-        let safeUrl = String(raw)
-        playStream(urlString: safeUrl, isLive: true)
+        playStream(urlString: String(raw), isLive: true)
     }
 
-    /**
-     * Entrada puenteada desde Kotlin con blindaje de tipo NSString?.
-     */
     @objc(playVodUrl:)
     public func playVodUrl(url: NSString?) {
         guard let raw = url else { return }
-        let safeUrl = String(raw)
-        playStream(urlString: safeUrl, isLive: false)
+        playStream(urlString: String(raw), isLive: false)
     }
 
-    /**
-     * Obtiene la instancia viva de VLCMediaPlayer o la crea una sola vez para reutilizarla.
-     */
     private func getOrCreateMediaPlayer(isLive: Bool) -> NSObject? {
-        if let existing = self.vlcMediaPlayer as? NSObject {
+        #if canImport(MobileVLCKit)
+        if let existing = self.vlcMediaPlayer as? VLCMediaPlayer {
             return existing
         }
-        guard let vlcPlayerClass = NSClassFromString("VLCMediaPlayer") as? NSObject.Type else {
-            return nil
-        }
-
-        // Argumentos agresivos de optimización de búfer y compatibilidad IPTV para LibVLC
-        // Se añade :no-http-forward-cookies para evitar colisiones con CFNetworkCopySystemProxySettings en hilos secundarios
-        let vlcOptions: NSArray = [
-            "--network-caching=\(isLive ? 1500 : 2000)",
+        let vlcOptions: [String] = [
+            "--network-caching=\(isLive ? 1500 : 2500)",
             "--live-caching=1500",
             "--clock-jitter=0",
             "--clock-synchro=0",
@@ -207,7 +172,31 @@ public class VLCPlayerHostView: UIView {
             "--http-reconnect",
             ":no-http-forward-cookies"
         ]
-
+        let player = VLCMediaPlayer(options: vlcOptions)
+        player.drawable = videoSurface
+        player.delegate = self
+        self.vlcMediaPlayer = player
+        return player
+        #else
+        if let existing = self.vlcMediaPlayer as? NSObject {
+            return existing
+        }
+        guard let vlcPlayerClass = NSClassFromString("VLCMediaPlayer") as? NSObject.Type else {
+            return nil
+        }
+        let vlcOptions: NSArray = [
+            "--network-caching=\(isLive ? 1500 : 2500)",
+            "--live-caching=1500",
+            "--clock-jitter=0",
+            "--clock-synchro=0",
+            "--codec=all",
+            "--no-spu",
+            "--drop-late-frames",
+            "--skip-frames",
+            "--rtsp-tcp",
+            "--http-reconnect",
+            ":no-http-forward-cookies"
+        ]
         let player: NSObject
         let initWithOptionsSel = NSSelectorFromString("initWithOptions:")
         if vlcPlayerClass.instancesRespond(to: initWithOptionsSel) {
@@ -219,19 +208,13 @@ public class VLCPlayerHostView: UIView {
                 typealias InitWithOptsIMP = @convention(c) (AnyObject, Selector, NSArray) -> AnyObject?
                 let initImp = (alloced as! NSObject).method(for: initWithOptionsSel)
                 let initFn = unsafeBitCast(initImp, to: InitWithOptsIMP.self)
-                if let initObj = initFn(alloced, initWithOptionsSel, vlcOptions) as? NSObject {
-                    player = initObj
-                } else {
-                    player = vlcPlayerClass.init()
-                }
+                player = (initFn(alloced, initWithOptionsSel, vlcOptions) as? NSObject) ?? vlcPlayerClass.init()
             } else {
                 player = vlcPlayerClass.init()
             }
         } else {
             player = vlcPlayerClass.init()
         }
-
-        // Asignamos la vista de dibujo de vídeo a LibVLC (-setDrawable:)
         let setDrawableSel = NSSelectorFromString("setDrawable:")
         if player.responds(to: setDrawableSel) {
             typealias SetDrawableIMP = @convention(c) (AnyObject, Selector, AnyObject) -> Void
@@ -239,8 +222,6 @@ public class VLCPlayerHostView: UIView {
             let fn = unsafeBitCast(imp, to: SetDrawableIMP.self)
             fn(player, setDrawableSel, videoSurface)
         }
-
-        // Asignamos delegate para recibir cambios de estado de reproducción en tiempo real (-setDelegate:)
         let setDelegateSel = NSSelectorFromString("setDelegate:")
         if player.responds(to: setDelegateSel) {
             typealias SetDelegateIMP = @convention(c) (AnyObject, Selector, AnyObject) -> Void
@@ -248,18 +229,34 @@ public class VLCPlayerHostView: UIView {
             let fn = unsafeBitCast(imp, to: SetDelegateIMP.self)
             fn(player, setDelegateSel, self)
         }
-
         self.vlcMediaPlayer = player
         return player
+        #endif
     }
 
     private func startVlcEngine(url: URL, isLive: Bool) -> Bool {
+        #if canImport(MobileVLCKit)
+        guard let player = getOrCreateMediaPlayer(isLive: isLive) as? VLCMediaPlayer else {
+            return false
+        }
+        player.stop()
+        let media = VLCMedia(url: url)
+        media.addOptions([
+            "network-caching": isLive ? 1500 : 2500,
+            "live-caching": 1500,
+            "clock-jitter": 0,
+            "clock-synchro": 0,
+            ":no-http-forward-cookies": ""
+        ])
+        player.media = media
+        player.play()
+        self.vlcMedia = media
+        return true
+        #else
         guard let playerObj = getOrCreateMediaPlayer(isLive: isLive),
               let vlcMediaClass = NSClassFromString("VLCMedia") as? NSObject.Type else {
             return false
         }
-
-        // Detenemos el flujo actual en el reproductor reutilizado antes de asignar la nueva media
         let stopSel = NSSelectorFromString("stop")
         if playerObj.responds(to: stopSel) {
             typealias VoidIMP = @convention(c) (AnyObject, Selector) -> Void
@@ -267,8 +264,6 @@ public class VLCPlayerHostView: UIView {
             let fn = unsafeBitCast(imp, to: VoidIMP.self)
             fn(playerObj, stopSel)
         }
-
-        // Creamos la media pasando NSURL explícito (-mediaWithURL:)
         let mediaSel = NSSelectorFromString("mediaWithURL:")
         guard vlcMediaClass.responds(to: mediaSel) else { return false }
         typealias MediaWithUrlIMP = @convention(c) (AnyObject, Selector, NSURL) -> AnyObject?
@@ -277,12 +272,10 @@ public class VLCPlayerHostView: UIView {
         guard let media = mediaFn(vlcMediaClass, mediaSel, url as NSURL) as? NSObject else {
             return false
         }
-
-        // Opciones por stream
         let addOptionsSel = NSSelectorFromString("addOptions:")
         if media.responds(to: addOptionsSel) {
             let optionsDict: NSDictionary = [
-                "network-caching": isLive ? 1500 : 2000,
+                "network-caching": isLive ? 1500 : 2500,
                 "live-caching": 1500,
                 "clock-jitter": 0,
                 "clock-synchro": 0,
@@ -293,8 +286,6 @@ public class VLCPlayerHostView: UIView {
             let addOptFn = unsafeBitCast(addOptImp, to: AddOptionsIMP.self)
             addOptFn(media, addOptionsSel, optionsDict)
         }
-
-        // Asignamos la nueva media al reproductor (-setMedia:)
         let setMediaSel = NSSelectorFromString("setMedia:")
         if playerObj.responds(to: setMediaSel) {
             typealias SetMediaIMP = @convention(c) (AnyObject, Selector, AnyObject) -> Void
@@ -302,8 +293,6 @@ public class VLCPlayerHostView: UIView {
             let fn = unsafeBitCast(imp, to: SetMediaIMP.self)
             fn(playerObj, setMediaSel, media)
         }
-
-        // Comenzar decodificación (-play)
         let playSel = NSSelectorFromString("play")
         if playerObj.responds(to: playSel) {
             typealias VoidIMP = @convention(c) (AnyObject, Selector) -> Void
@@ -311,9 +300,9 @@ public class VLCPlayerHostView: UIView {
             let fn = unsafeBitCast(imp, to: VoidIMP.self)
             fn(playerObj, playSel)
         }
-
         self.vlcMedia = media
         return true
+        #endif
     }
 
     private func startAvPlayerFallback(url: URL, isLive: Bool) {
@@ -344,19 +333,26 @@ public class VLCPlayerHostView: UIView {
     public func pauseStream() {
         executeOnMainThread { [weak self] in
             guard let self = self else { return }
-            guard let playerObj = self.vlcMediaPlayer as? NSObject else {
-                self.avPlayer?.pause()
-                self._statusMsg = "En pausa"
+            #if canImport(MobileVLCKit)
+            if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
+                player.pause()
+                self._statusMsg = "VLCKit • En pausa"
                 return
             }
-            let sel = NSSelectorFromString("pause")
-            if playerObj.responds(to: sel) {
-                typealias VoidIMP = @convention(c) (AnyObject, Selector) -> Void
-                let imp = playerObj.method(for: sel)
-                let fn = unsafeBitCast(imp, to: VoidIMP.self)
-                fn(playerObj, sel)
+            #endif
+            if let playerObj = self.vlcMediaPlayer as? NSObject {
+                let sel = NSSelectorFromString("pause")
+                if playerObj.responds(to: sel) {
+                    typealias VoidIMP = @convention(c) (AnyObject, Selector) -> Void
+                    let imp = playerObj.method(for: sel)
+                    let fn = unsafeBitCast(imp, to: VoidIMP.self)
+                    fn(playerObj, sel)
+                }
+                self._statusMsg = "VLCKit • En pausa"
+                return
             }
-            self._statusMsg = "VLCKit • En pausa"
+            self.avPlayer?.pause()
+            self._statusMsg = "En pausa"
         }
     }
 
@@ -364,19 +360,35 @@ public class VLCPlayerHostView: UIView {
     public func resumeStream() {
         executeOnMainThread { [weak self] in
             guard let self = self else { return }
-            guard let playerObj = self.vlcMediaPlayer as? NSObject else {
-                self.avPlayer?.play()
-                self._statusMsg = "Reproduciendo"
+            #if canImport(MobileVLCKit)
+            if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
+                player.play()
+                self._statusMsg = "VLCKit • Reproduciendo"
                 return
             }
-            let sel = NSSelectorFromString("play")
-            if playerObj.responds(to: sel) {
-                typealias VoidIMP = @convention(c) (AnyObject, Selector) -> Void
-                let imp = playerObj.method(for: sel)
-                let fn = unsafeBitCast(imp, to: VoidIMP.self)
-                fn(playerObj, sel)
+            #endif
+            if let playerObj = self.vlcMediaPlayer as? NSObject {
+                let sel = NSSelectorFromString("play")
+                if playerObj.responds(to: sel) {
+                    typealias VoidIMP = @convention(c) (AnyObject, Selector) -> Void
+                    let imp = playerObj.method(for: sel)
+                    let fn = unsafeBitCast(imp, to: VoidIMP.self)
+                    fn(playerObj, sel)
+                }
+                self._statusMsg = "VLCKit • Reproduciendo"
+                return
             }
-            self._statusMsg = "VLCKit • Reproduciendo"
+            self.avPlayer?.play()
+            self._statusMsg = "Reproduciendo"
+        }
+    }
+
+    @objc(togglePlayPause)
+    public func togglePlayPause() {
+        if getIsPlaying() {
+            pauseStream()
+        } else {
+            resumeStream()
         }
     }
 
@@ -384,6 +396,12 @@ public class VLCPlayerHostView: UIView {
     public func stopStream() {
         executeOnMainThread { [weak self] in
             guard let self = self else { return }
+            self.pendingResumeSeconds = nil
+            #if canImport(MobileVLCKit)
+            if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
+                player.stop()
+            }
+            #endif
             if let playerObj = self.vlcMediaPlayer as? NSObject {
                 let sel = NSSelectorFromString("stop")
                 if playerObj.responds(to: sel) {
@@ -409,40 +427,142 @@ public class VLCPlayerHostView: UIView {
         seekToSeconds(seconds: num.doubleValue)
     }
 
-    @objc public func seekToSeconds(seconds: Double) {
-        guard seconds.isFinite && !seconds.isNaN else { return }
+    @objc(seekToSeconds:)
+    public func seekToSeconds(seconds: Double) {
+        guard seconds.isFinite && !seconds.isNaN && seconds >= 0 else { return }
         executeOnMainThread { [weak self] in
             guard let self = self else { return }
-            guard let playerObj = self.vlcMediaPlayer as? NSObject else {
-                if let player = self.avPlayer {
-                    let target = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1000)
-                    player.seek(to: target)
+
+            #if canImport(MobileVLCKit)
+            if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
+                let vlcTime = VLCTime(int: Int32(seconds * 1000.0))
+                player.time = vlcTime
+                if let len = player.media?.length.intValue, len > 0 {
+                    let pos = Float(seconds * 1000.0) / Float(len)
+                    player.position = min(max(pos, 0.0), 1.0)
                 }
                 return
             }
-            let timeClass = NSClassFromString("VLCTime") as? NSObject.Type
-            let setTimeSel = NSSelectorFromString("setTime:")
-            if let timeClass = timeClass, playerObj.responds(to: setTimeSel) {
-                let timeNumber = NSNumber(value: Int(seconds * 1000.0))
-                let timeWithNumberSel = NSSelectorFromString("timeWithNumber:")
-                if timeClass.responds(to: timeWithNumberSel) {
-                    typealias TimeWithNumIMP = @convention(c) (AnyObject, Selector, NSNumber) -> AnyObject?
-                    let imp = timeClass.method(for: timeWithNumberSel)
-                    let fn = unsafeBitCast(imp, to: TimeWithNumIMP.self)
-                    if let timeObj = fn(timeClass, timeWithNumberSel, timeNumber) {
-                        typealias SetTimeIMP = @convention(c) (AnyObject, Selector, AnyObject) -> Void
-                        let setTimeImp = playerObj.method(for: setTimeSel)
-                        let setTimeFn = unsafeBitCast(setTimeImp, to: SetTimeIMP.self)
-                        setTimeFn(playerObj, setTimeSel, timeObj)
+            #endif
+
+            if let player = self.avPlayer {
+                let target = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1000)
+                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+                return
+            }
+
+            guard let playerObj = self.vlcMediaPlayer as? NSObject else {
+                self.pendingResumeSeconds = seconds
+                return
+            }
+
+            // Reflexión alternativa para cuando MobileVLCKit se carga dinámicamente
+            let timeMs = Int32(seconds * 1000.0)
+            if let timeClass = NSClassFromString("VLCTime") as? NSObject.Type {
+                let allocSel = NSSelectorFromString("alloc")
+                let initSel = NSSelectorFromString("initWithInt:")
+                if let alloced = (timeClass as AnyObject).perform?(allocSel)?.takeUnretainedValue() {
+                    typealias InitIMP = @convention(c) (AnyObject, Selector, Int32) -> AnyObject?
+                    let imp = (alloced as AnyObject).method(for: initSel)
+                    let fn = unsafeBitCast(imp, to: InitIMP.self)
+                    if let timeObj = fn(alloced, initSel, timeMs) {
+                        let setTimeSel = NSSelectorFromString("setTime:")
+                        _ = (playerObj as AnyObject).perform?(setTimeSel, with: timeObj)
                     }
+                }
+            }
+            let durMs = self.getDurationMs().int64Value
+            if durMs > 0 {
+                let pos = Float(Double(timeMs) / Double(durMs))
+                let setPosSel = NSSelectorFromString("setPosition:")
+                if playerObj.responds(to: setPosSel) {
+                    typealias SetPosIMP = @convention(c) (AnyObject, Selector, Float) -> Void
+                    let imp = playerObj.method(for: setPosSel)
+                    let fn = unsafeBitCast(imp, to: SetPosIMP.self)
+                    fn(playerObj, setPosSel, min(max(pos, 0.0), 1.0))
                 }
             }
         }
     }
 
-    /**
-     * Entrada puenteada desde Kotlin con blindaje de tipo NSString?.
-     */
+    @objc(jumpForward:)
+    public func jumpForward(seconds: Int) {
+        executeOnMainThread { [weak self] in
+            guard let self = self else { return }
+            #if canImport(MobileVLCKit)
+            if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
+                player.jumpForward(Int32(seconds))
+                return
+            }
+            #endif
+            if let player = self.vlcMediaPlayer as? NSObject {
+                let sel = NSSelectorFromString("jumpForward:")
+                if player.responds(to: sel) {
+                    typealias JumpIMP = @convention(c) (AnyObject, Selector, Int32) -> Void
+                    let imp = player.method(for: sel)
+                    let fn = unsafeBitCast(imp, to: JumpIMP.self)
+                    fn(player, sel, Int32(seconds))
+                    return
+                }
+            }
+            let current = self.getPlaybackTimeMs().doubleValue / 1000.0
+            self.seekToSeconds(seconds: max(0, current + Double(seconds)))
+        }
+    }
+
+    @objc(jumpBackward:)
+    public func jumpBackward(seconds: Int) {
+        executeOnMainThread { [weak self] in
+            guard let self = self else { return }
+            #if canImport(MobileVLCKit)
+            if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
+                player.jumpBackward(Int32(seconds))
+                return
+            }
+            #endif
+            if let player = self.vlcMediaPlayer as? NSObject {
+                let sel = NSSelectorFromString("jumpBackward:")
+                if player.responds(to: sel) {
+                    typealias JumpIMP = @convention(c) (AnyObject, Selector, Int32) -> Void
+                    let imp = player.method(for: sel)
+                    let fn = unsafeBitCast(imp, to: JumpIMP.self)
+                    fn(player, sel, Int32(seconds))
+                    return
+                }
+            }
+            let current = self.getPlaybackTimeMs().doubleValue / 1000.0
+            self.seekToSeconds(seconds: max(0, current - Double(seconds)))
+        }
+    }
+
+    @objc(setPosition:)
+    public func setPosition(pos: Float) {
+        executeOnMainThread { [weak self] in
+            guard let self = self else { return }
+            let clamped = min(max(pos, 0.0), 1.0)
+            #if canImport(MobileVLCKit)
+            if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
+                player.position = clamped
+                return
+            }
+            #endif
+            if let player = self.vlcMediaPlayer as? NSObject {
+                let sel = NSSelectorFromString("setPosition:")
+                if player.responds(to: sel) {
+                    typealias SetPosIMP = @convention(c) (AnyObject, Selector, Float) -> Void
+                    let imp = player.method(for: sel)
+                    let fn = unsafeBitCast(imp, to: SetPosIMP.self)
+                    fn(player, sel, clamped)
+                    return
+                }
+            }
+            let dur = self.getDurationMs().doubleValue / 1000.0
+            if dur > 0 {
+                self.seekToSeconds(seconds: dur * Double(clamped))
+            }
+        }
+    }
+
     @objc(setAspectRatio:)
     public func setAspectRatio(ratio: NSString?) {
         executeOnMainThread { [weak self] in
@@ -457,6 +577,17 @@ public class VLCPlayerHostView: UIView {
 
     private func applyAspectRatio(_ safeRatio: String) {
         let upper = safeRatio.uppercased()
+        #if canImport(MobileVLCKit)
+        if let player = vlcMediaPlayer as? VLCMediaPlayer {
+            if !safeRatio.isEmpty && upper != "DEFAULT" && upper != "AUTO" {
+                safeRatio.withCString { cStr in
+                    player.videoAspectRatio = UnsafeMutablePointer(mutating: cStr)
+                }
+            } else {
+                player.videoAspectRatio = nil
+            }
+        }
+        #else
         if let playerObj = vlcMediaPlayer as? NSObject {
             let sel = NSSelectorFromString("setVideoAspectRatio:")
             if playerObj.responds(to: sel) {
@@ -472,6 +603,7 @@ public class VLCPlayerHostView: UIView {
                 }
             }
         }
+        #endif
         if let layer = avPlayerLayer {
             layer.videoGravity = (upper == "FILL") ? .resizeAspectFill : .resizeAspect
         }
@@ -479,6 +611,14 @@ public class VLCPlayerHostView: UIView {
 
     @objc(getPlaybackTimeMs)
     public func getPlaybackTimeMs() -> NSNumber {
+        #if canImport(MobileVLCKit)
+        if let player = vlcMediaPlayer as? VLCMediaPlayer {
+            if let time = player.time, let num = time.value {
+                return num
+            }
+            return NSNumber(value: 0)
+        }
+        #endif
         var ms: Int64 = 0
         guard let playerObj = vlcMediaPlayer as? NSObject else {
             if let player = avPlayer {
@@ -511,6 +651,14 @@ public class VLCPlayerHostView: UIView {
 
     @objc(getDurationMs)
     public func getDurationMs() -> NSNumber {
+        #if canImport(MobileVLCKit)
+        if let player = vlcMediaPlayer as? VLCMediaPlayer {
+            if let media = player.media, let len = media.length, let num = len.value {
+                return num
+            }
+            return NSNumber(value: 0)
+        }
+        #endif
         var ms: Int64 = 0
         guard let playerObj = vlcMediaPlayer as? NSObject else {
             if let player = avPlayer, let duration = player.currentItem?.duration {
@@ -556,6 +704,11 @@ public class VLCPlayerHostView: UIView {
 
     @objc(getIsPlaying)
     public func getIsPlaying() -> Bool {
+        #if canImport(MobileVLCKit)
+        if let player = vlcMediaPlayer as? VLCMediaPlayer {
+            return player.isPlaying
+        }
+        #endif
         guard let playerObj = vlcMediaPlayer as? NSObject else {
             if let player = avPlayer {
                 return player.rate > 0 && player.error == nil
@@ -573,15 +726,22 @@ public class VLCPlayerHostView: UIView {
     }
 
     @objc public func mediaPlayerStateChanged(_ aNotification: Notification) {
-        guard let playerObj = vlcMediaPlayer as? NSObject else { return }
-        let stateSel = NSSelectorFromString("state")
         var stateRaw: Int = -1
-        if playerObj.responds(to: stateSel) {
-            typealias StateIMP = @convention(c) (AnyObject, Selector) -> Int
-            let imp = playerObj.method(for: stateSel)
-            let fn = unsafeBitCast(imp, to: StateIMP.self)
-            stateRaw = fn(playerObj, stateSel)
+        #if canImport(MobileVLCKit)
+        if let player = vlcMediaPlayer as? VLCMediaPlayer {
+            stateRaw = player.state.rawValue
         }
+        #endif
+        if stateRaw == -1, let playerObj = vlcMediaPlayer as? NSObject {
+            let stateSel = NSSelectorFromString("state")
+            if playerObj.responds(to: stateSel) {
+                typealias StateIMP = @convention(c) (AnyObject, Selector) -> Int
+                let imp = playerObj.method(for: stateSel)
+                let fn = unsafeBitCast(imp, to: StateIMP.self)
+                stateRaw = fn(playerObj, stateSel)
+            }
+        }
+
         DispatchQueue.main.async { [weak self] in
             guard let self = self, self.vlcMediaPlayer != nil else { return }
             // VLCMediaPlayerState: 0=Stopped, 1=Opening, 2=Buffering, 3=Ended, 4=Error, 5=Playing, 6=Paused
@@ -596,6 +756,11 @@ public class VLCPlayerHostView: UIView {
                 let format = self._currentUrl.lowercased().contains(".ts") ? "MPEG-TS (.ts)" : "HLS (.m3u8)"
                 self._statusMsg = "VLCKit • En directo (\(format))"
                 self.currentHasError = false
+                // Reanuda automáticamente si había una posición pendiente de seek
+                if let pending = self.pendingResumeSeconds, pending > 2.0 {
+                    self.pendingResumeSeconds = nil
+                    self.seekToSeconds(seconds: pending)
+                }
             case 6:
                 self._statusMsg = "VLCKit • En pausa"
             case 4:
@@ -610,6 +775,17 @@ public class VLCPlayerHostView: UIView {
     }
 
     private func destroyEngine() {
+        pendingResumeSeconds = nil
+        #if canImport(MobileVLCKit)
+        if let player = vlcMediaPlayer as? VLCMediaPlayer {
+            player.delegate = nil
+            player.drawable = nil
+            player.stop()
+            self.vlcMediaPlayer = nil
+            self.vlcMedia = nil
+            return
+        }
+        #endif
         if let playerObj = vlcMediaPlayer as? NSObject {
             let setDelegateSel = NSSelectorFromString("setDelegate:")
             if playerObj.responds(to: setDelegateSel) {
@@ -646,11 +822,6 @@ public class VLCPlayerHostView: UIView {
     }
 
     deinit {
-        if let tap = tapGesture {
-            removeGestureRecognizer(tap)
-            tapGesture = nil
-        }
-        NotificationCenter.default.removeObserver(self)
         destroyEngine()
     }
 }
@@ -671,8 +842,7 @@ public class VLCPlayerBridge: NSObject {
 
     @objc public static func play(url: NSString?, isLive: Bool) {
         guard let raw = url else { return }
-        let safe = String(raw)
-        shared.currentHost?.playStream(urlString: safe, isLive: isLive)
+        shared.currentHost?.playStream(urlString: String(raw), isLive: isLive)
     }
 
     @objc public static func pause() {
@@ -689,6 +859,18 @@ public class VLCPlayerBridge: NSObject {
 
     @objc public static func seekTo(seconds: Double) {
         shared.currentHost?.seekToSeconds(seconds: seconds)
+    }
+
+    @objc public static func jumpForward(_ seconds: Int) {
+        shared.currentHost?.jumpForward(seconds: seconds)
+    }
+
+    @objc public static func jumpBackward(_ seconds: Int) {
+        shared.currentHost?.jumpBackward(seconds: seconds)
+    }
+
+    @objc public static func setPosition(_ pos: Float) {
+        shared.currentHost?.setPosition(pos: pos)
     }
 
     @objc public static func setAspectRatio(_ ratio: NSString?) {
