@@ -437,9 +437,12 @@ public class VLCPlayerHostView: UIView {
             if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
                 let vlcTime = VLCTime(int: Int32(seconds * 1000.0))
                 player.time = vlcTime
-                if let len = player.media?.length.intValue, len > 0 {
-                    let pos = Float(seconds * 1000.0) / Float(len)
-                    player.position = min(max(pos, 0.0), 1.0)
+                if let media = player.media {
+                    let len = media.length.intValue
+                    if len > 0 {
+                        let pos = Float(seconds * 1000.0) / Float(len)
+                        player.position = min(max(pos, 0.0), 1.0)
+                    }
                 }
                 return
             }
@@ -613,10 +616,10 @@ public class VLCPlayerHostView: UIView {
     public func getPlaybackTimeMs() -> NSNumber {
         #if canImport(MobileVLCKit)
         if let player = vlcMediaPlayer as? VLCMediaPlayer {
-            if let time = player.time, let num = time.value {
+            if let num = player.time.value {
                 return num
             }
-            return NSNumber(value: 0)
+            return NSNumber(value: max(0, Int64(player.time.intValue)))
         }
         #endif
         var ms: Int64 = 0
@@ -653,8 +656,11 @@ public class VLCPlayerHostView: UIView {
     public func getDurationMs() -> NSNumber {
         #if canImport(MobileVLCKit)
         if let player = vlcMediaPlayer as? VLCMediaPlayer {
-            if let media = player.media, let len = media.length, let num = len.value {
-                return num
+            if let media = player.media {
+                if let num = media.length.value {
+                    return num
+                }
+                return NSNumber(value: max(0, Int64(media.length.intValue)))
             }
             return NSNumber(value: 0)
         }
@@ -825,6 +831,10 @@ public class VLCPlayerHostView: UIView {
         destroyEngine()
     }
 }
+
+#if canImport(MobileVLCKit)
+extension VLCPlayerHostView: VLCMediaPlayerDelegate {}
+#endif
 
 /**
  * Puente estático para control directo de VLCKit desde Compose Multiplatform (Kotlin/Native).
