@@ -5,11 +5,14 @@ import io.ktor.client.HttpClient
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.isSuccess
 import io.ktor.util.date.getTimeMillis
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -233,8 +236,9 @@ class PlaylistStore {
     }
 
     /**
-     * Versión segura para invocarse desde `CoroutineScope(Dispatchers.IO).launch` en el guardado
-     * periódico cada 5 segundos sin bloquear jamás el hilo principal de iOS ni recomponer la UI.
+     * Versión segura para invocarse desde corrutinas en segundo plano en el guardado periódico
+     * cada 5 segundos sin bloquear el hilo principal ni generar race conditions sobre `data`:
+     * muta el estado en memoria en Main.immediate (nanosegundos) y persiste a disco en Dispatchers.IO bajo mutex.
      */
     suspend fun savePlaybackProgressBg(
         id: String,
@@ -245,14 +249,14 @@ class PlaylistStore {
         val cleanId = id.trim()
         if (cleanId.isEmpty() || positionMs < 0L) return
 
-        diskWriteMutex.withLock {
+        val snapToPersist: StoredAppState? = withContext(Dispatchers.Main.immediate) {
             val existing = getPlaybackProgress(cleanId)
             val effectiveDuration = when {
                 durationMs > 0L -> durationMs
                 existing != null && existing.durationMs > 0L -> existing.durationMs
                 else -> 0L
             }
-            if (effectiveDuration <= 0L && positionMs <= 0L) return@withLock
+            if (effectiveDuration <= 0L && positionMs <= 0L) return@withContext null
 
             val rawFraction = if (effectiveDuration > 0L) {
                 (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
@@ -260,7 +264,7 @@ class PlaylistStore {
                 0f
             }
             if (existing?.isCompleted == true && positionMs < 3_000L && rawFraction < 0.02f) {
-                return@withLock
+                return@withContext null
             }
 
             val finalPos = if (effectiveDuration > 0L && rawFraction >= 0.95f) effectiveDuration else positionMs
@@ -270,17 +274,33 @@ class PlaylistStore {
                 updatedAt = getTimeMillis()
             )
             storeProgressUnderAliases(cleanId, progress)
+            prunePlaybackProgressIfNeeded()
             data.resumePositions[cleanId] = progress.resumePositionMs
             if (notifyUi) {
                 _playbackProgressFlow.value = data.playbackProgress.toMap()
             }
-            if (!writeBlocked) {
-                val snap = snapshotState()
-                runCatching {
-                    PlatformStorage.saveStateJson(json.encodeToString(snap))
+            if (writeBlocked) null else snapshotState()
+        }
+
+        if (snapToPersist != null) {
+            withContext(Dispatchers.IO) {
+                diskWriteMutex.withLock {
+                    runCatching {
+                        PlatformStorage.saveStateJson(json.encodeToString(snapToPersist))
+                    }
                 }
             }
         }
+    }
+
+    private fun prunePlaybackProgressIfNeeded() {
+        if (data.playbackProgress.size <= MAX_PROGRESS_KEYS) return
+        val keepKeys = data.playbackProgress.entries
+            .sortedByDescending { it.value.updatedAt }
+            .take(PRUNED_PROGRESS_KEYS)
+            .map { it.key }
+            .toHashSet()
+        data.playbackProgress.keys.retainAll(keepKeys)
     }
 
     fun savePlaybackProgress(
@@ -328,6 +348,7 @@ class PlaylistStore {
             updatedAt = getTimeMillis()
         )
         storeProgressUnderAliases(cleanId, progress)
+        prunePlaybackProgressIfNeeded()
         data.resumePositions[cleanId] = progress.resumePositionMs
         if (notifyUi) {
             _playbackProgressFlow.value = data.playbackProgress.toMap()
@@ -428,6 +449,8 @@ class PlaylistStore {
     }
 
     companion object {
+        private const val MAX_PROGRESS_KEYS = 450
+        private const val PRUNED_PROGRESS_KEYS = 300
         const val DEFAULT_TDT_URL = "https://www.tdtchannels.com/lists/tvradio.m3u"
 
         val defaultTdtPlaylist = Playlist(
@@ -457,11 +480,13 @@ class XtreamRepository(
     private val vodMutex = Mutex()
     private val seriesMutex = Mutex()
     private val m3uMutex = Mutex()
+    private val epgMutex = Mutex()
 
     private var liveCache: Pair<List<Category>, List<LiveStream>>? = null
     private var vodCache: Pair<List<Category>, List<VodStream>>? = null
     private var seriesCache: Pair<List<Category>, List<Series>>? = null
     private var m3uCatalog: M3uCatalog? = null
+    private val epgCache = LinkedHashMap<String, Pair<Long, List<EpgListing>>>()
 
     private val _m3uCatalogFlow = MutableStateFlow<M3uCatalog?>(null)
     val m3uCatalogFlow: StateFlow<M3uCatalog?> = _m3uCatalogFlow.asStateFlow()
@@ -573,14 +598,21 @@ class XtreamRepository(
         action: String? = null,
         extraParams: Map<String, String> = emptyMap()
     ): T {
-        val respText = httpClient.get("$base/player_api.php") {
+        val response = httpClient.get("$base/player_api.php") {
             parameter("username", u)
             parameter("password", p)
             if (action != null) {
                 parameter("action", action)
             }
             extraParams.forEach { (k, v) -> parameter(k, v) }
-        }.bodyAsText()
+        }
+        if (!response.status.isSuccess()) {
+            throw IllegalStateException("El servidor respondió HTTP ${response.status.value}")
+        }
+        val respText = response.bodyAsText()
+        if (respText.isBlank()) {
+            throw IllegalStateException("Respuesta vacía del servidor Xtream")
+        }
         return json.decodeFromString(respText)
     }
 
@@ -611,9 +643,14 @@ class XtreamRepository(
         }
         return liveMutex.withLock {
             if (!forceRefresh) liveCache?.let { return@withLock it }
-            val cats = callPlayerApi<List<Category>>("get_live_categories")
-            val streams = callPlayerApi<List<LiveStream>>("get_live_streams")
-            (cats to streams).also { liveCache = it }
+            val result = withContext(Dispatchers.IO) {
+                coroutineScope {
+                    val catsDeferred = async { callPlayerApi<List<Category>>("get_live_categories") }
+                    val streamsDeferred = async { callPlayerApi<List<LiveStream>>("get_live_streams") }
+                    catsDeferred.await() to streamsDeferred.await()
+                }
+            }
+            result.also { liveCache = it }
         }
     }
 
@@ -624,9 +661,14 @@ class XtreamRepository(
         }
         return vodMutex.withLock {
             if (!forceRefresh) vodCache?.let { return@withLock it }
-            val cats = callPlayerApi<List<Category>>("get_vod_categories")
-            val streams = callPlayerApi<List<VodStream>>("get_vod_streams")
-            (cats to streams).also { vodCache = it }
+            val result = withContext(Dispatchers.IO) {
+                coroutineScope {
+                    val catsDeferred = async { callPlayerApi<List<Category>>("get_vod_categories") }
+                    val streamsDeferred = async { callPlayerApi<List<VodStream>>("get_vod_streams") }
+                    catsDeferred.await() to streamsDeferred.await()
+                }
+            }
+            result.also { vodCache = it }
         }
     }
 
@@ -637,18 +679,18 @@ class XtreamRepository(
         }
         return seriesMutex.withLock {
             if (!forceRefresh) seriesCache?.let { return@withLock it }
-            val cats = callPlayerApi<List<Category>>("get_series_categories")
-            val items = callPlayerApi<List<Series>>("get_series")
-            (cats to items).also { seriesCache = it }
+            val result = withContext(Dispatchers.IO) {
+                coroutineScope {
+                    val catsDeferred = async { callPlayerApi<List<Category>>("get_series_categories") }
+                    val itemsDeferred = async { callPlayerApi<List<Series>>("get_series") }
+                    catsDeferred.await() to itemsDeferred.await()
+                }
+            }
+            result.also { seriesCache = it }
         }
     }
 
     suspend fun refreshAllXtream(force: Boolean = true): RefreshResult = withContext(Dispatchers.IO) {
-        liveMutex.withLock { liveCache = null }
-        vodMutex.withLock { vodCache = null }
-        seriesMutex.withLock { seriesCache = null }
-        m3uMutex.withLock { m3uCatalog = null }
-
         if (playlist.isM3u) {
             return@withContext runCatching {
                 val outcome = syncM3uWithRemote(force = force)
@@ -663,11 +705,16 @@ class XtreamRepository(
             }
         }
 
+        // Refresco atómico y paralelo: nunca borra la caché previa si la red falla
         try {
             login()
-            val (_, liveItems) = live(forceRefresh = true)
-            val (_, vodItems) = vod(forceRefresh = true)
-            val (_, seriesItems) = series(forceRefresh = true)
+            epgMutex.withLock { epgCache.clear() }
+            val (liveItems, vodItems, seriesItems) = coroutineScope {
+                val liveDef = async { live(forceRefresh = true).second }
+                val vodDef = async { vod(forceRefresh = true).second }
+                val seriesDef = async { series(forceRefresh = true).second }
+                Triple(liveDef.await(), vodDef.await(), seriesDef.await())
+            }
             RefreshResult(
                 success = true,
                 liveCount = liveItems.size,
@@ -849,10 +896,24 @@ class XtreamRepository(
 
     suspend fun shortEpg(streamId: String): List<EpgListing> {
         if (playlist.isM3u) return emptyList()
-        return runCatching {
+        val now = getTimeMillis()
+        epgMutex.withLock {
+            val cached = epgCache[streamId]
+            if (cached != null && now - cached.first < EPG_CACHE_TTL_MS) {
+                return cached.second
+            }
+        }
+        val fresh = runCatching {
             callPlayerApi<EpgResponse>("get_short_epg", mapOf("stream_id" to streamId, "limit" to "10"))
                 .listings.orEmpty()
         }.getOrDefault(emptyList())
+        epgMutex.withLock {
+            if (epgCache.size >= 64) {
+                epgCache.keys.firstOrNull()?.let { epgCache.remove(it) }
+            }
+            epgCache[streamId] = getTimeMillis() to fresh
+        }
+        return fresh
     }
 
     private fun resolveDirectUrl(id: String): String? {
@@ -880,6 +941,8 @@ class XtreamRepository(
         resolveDirectUrl(episodeId) ?: "$base/series/$u/$p/$episodeId.${ext?.ifBlank { "mp4" } ?: "mp4"}"
 
     companion object {
+        private const val EPG_CACHE_TTL_MS = 120_000L
+
         @OptIn(ExperimentalEncodingApi::class)
         fun decodeB64(s: String?): String =
             if (s.isNullOrEmpty()) "" else runCatching {

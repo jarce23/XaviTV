@@ -36,16 +36,36 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
 import coil.request.CachePolicy
 import coil.request.ImageRequest
 import coil.size.Precision
-import coil.size.Size
+import com.minuevaapp.tv.BuildConfig
 import com.minuevaapp.tv.MiTVApp
 import com.minuevaapp.tv.R
+import com.minuevaapp.tv.data.PlaybackProgress
 import com.minuevaapp.tv.data.XtreamRepository
 import com.minuevaapp.tv.ui.theme.*
 import kotlinx.coroutines.CancellationException
+
+/**
+ * Resuelve el progreso de reproducción directamente desde el snapshot inmutable de Compose
+ * sin adquirir locks @Synchronized en cada tarjeta de LazyVerticalGrid / LazyColumn.
+ */
+fun resolveMovieProgressFraction(progressMap: Map<String, PlaybackProgress>, id: String): Float {
+    return (progressMap["movie:$id"] ?: progressMap["vod:$id"] ?: progressMap[id])?.progressFraction ?: 0f
+}
+
+fun resolveSeriesProgressFraction(progressMap: Map<String, PlaybackProgress>, id: String): Float {
+    return (progressMap["series_cover:$id"] ?: progressMap["series:$id"] ?: progressMap[id])?.progressFraction ?: 0f
+}
+
+fun resolveEpisodeProgressFraction(progressMap: Map<String, PlaybackProgress>, seriesId: String, epId: String): Float {
+    return (progressMap["series:$seriesId:ep:$epId"]
+        ?: progressMap["episode:$epId"]
+        ?: progressMap["series:$epId"]
+        ?: progressMap[epId])?.progressFraction ?: 0f
+}
 
 /** Estado de carga genérico con soporte de reintento. */
 sealed interface Load<out T> {
@@ -187,9 +207,6 @@ fun AppScaffold(
                         )
                     )
                 )
-                .windowInsetsPadding(
-                    WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
-                )
         ) {
             content(pad)
         }
@@ -276,7 +293,8 @@ fun Modifier.tvClickable(
 }
 
 /**
- * Imagen de red con Coil y placeholders de carga y de error integrados en tonos verdes y dorados.
+ * Imagen de red optimizada con Coil `AsyncImage` (sin SubcomposeAsyncImage) y tamaño explícito
+ * para garantizar 60 fps fluidos y mínimo consumo de RAM en Fire TV Stick y Android TV.
  */
 @Composable
 fun NetworkImage(
@@ -286,6 +304,8 @@ fun NetworkImage(
     contentScale: ContentScale = ContentScale.Crop,
     fallbackIcon: ImageVector = Icons.Default.Movie,
     alpha: Float = 1f,
+    targetWidthPx: Int = 200,
+    targetHeightPx: Int = 300,
 ) {
     val cleanUrl = url?.trim()?.takeIf { it.isNotEmpty() }
     if (cleanUrl == null) {
@@ -297,55 +317,52 @@ fun NetworkImage(
                 imageVector = fallbackIcon,
                 contentDescription = contentDescription,
                 tint = GoldPrimary.copy(alpha = 0.45f),
-                modifier = Modifier.size(34.dp),
+                modifier = Modifier.size(30.dp),
             )
         }
         return
     }
 
     val context = LocalContext.current
-    val request = remember(cleanUrl) {
+    var loadFailed by remember(cleanUrl) { mutableStateOf(false) }
+    val request = remember(cleanUrl, targetWidthPx, targetHeightPx) {
         ImageRequest.Builder(context)
             .data(cleanUrl)
-            .size(240, 360)
+            .size(targetWidthPx, targetHeightPx)
             .precision(Precision.INEXACT)
             .allowRgb565(true)
             .memoryCachePolicy(CachePolicy.ENABLED)
             .diskCachePolicy(CachePolicy.ENABLED)
-            .crossfade(true)
+            .crossfade(if (BuildConfig.FORCE_SOFTWARE_DECODER) 0 else 120)
             .build()
     }
 
-    SubcomposeAsyncImage(
-        model = request,
-        contentDescription = contentDescription,
-        contentScale = contentScale,
-        alpha = alpha,
+    Box(
         modifier = modifier.background(DarkSurfaceVariant),
-        loading = {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(22.dp),
-                    strokeWidth = 2.dp,
-                    color = GoldPrimary.copy(alpha = 0.65f),
-                )
-            }
-        },
-        error = {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Icon(
-                    imageVector = Icons.Default.BrokenImage,
-                    contentDescription = contentDescription,
-                    tint = GoldPrimary.copy(alpha = 0.45f),
-                    modifier = Modifier.size(28.dp),
-                )
-            }
-        },
-    )
+        contentAlignment = Alignment.Center,
+    ) {
+        if (loadFailed) {
+            Icon(
+                imageVector = Icons.Default.BrokenImage,
+                contentDescription = contentDescription,
+                tint = GoldPrimary.copy(alpha = 0.45f),
+                modifier = Modifier.size(26.dp),
+            )
+        } else {
+            AsyncImage(
+                model = request,
+                contentDescription = contentDescription,
+                contentScale = contentScale,
+                alpha = alpha,
+                onError = { loadFailed = true },
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+    }
 }
 
 /**
- * Tarjeta de cartel (Película / Serie / Canal) con marco elegante, sombra suave e indicador dorado de favorito.
+ * Tarjeta de cartel (Película / Serie / Canal) optimizada para listas largas sin sombras GPU pesadas.
  */
 @Composable
 fun PosterCard(
@@ -354,15 +371,14 @@ fun PosterCard(
     subtitle: String? = null,
     isFavorite: Boolean = false,
     progress: Float = 0f,
+    modifier: Modifier = Modifier.width(140.dp),
     onClick: () -> Unit,
 ) {
     val cardShape = RoundedCornerShape(12.dp)
     val clampedProgress = progress.coerceIn(0f, 1f)
     val showProgress = clampedProgress > 0.01f
     Column(
-        Modifier
-            .width(140.dp)
-            .shadow(elevation = 6.dp, shape = cardShape)
+        modifier
             .tvClickable(
                 shape = cardShape,
                 idleBorderColor = if (isFavorite) GoldPrimary.copy(alpha = 0.55f) else GoldPrimary.copy(alpha = 0.22f),
@@ -379,6 +395,8 @@ fun PosterCard(
                 url = image,
                 contentDescription = title,
                 contentScale = ContentScale.Crop,
+                targetWidthPx = 200,
+                targetHeightPx = 300,
                 modifier = Modifier.fillMaxSize(),
             )
             // Sombra degradada inferior para dar profundidad al cartel

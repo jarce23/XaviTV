@@ -5,6 +5,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.isSuccess
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.withContext
@@ -24,12 +25,12 @@ class M3uCatalog(
 )
 
 object M3uParser {
-    private val attrRegex = Regex("""([a-zA-Z0-9_-]+)\s*=\s*"([^"]*)"""")
     private val sePattern1 = Regex("""(?i)^(.*?)[\s._-]*S(\d{1,2})[\s._-]*E(\d{1,3})\b""")
     private val sePattern2 = Regex("""(?i)^(.*?)[\s._-]*(\d{1,2})x(\d{1,3})\b""")
     private val sePattern3 = Regex("""(?i)^(.*?)[\s._-]*(?:Temp(?:orada)?|T)\s*(\d{1,2})[\s._-]*(?:Cap(?:[íi]tulo)?|Ep(?:isodio)?|E)\s*(\d{1,3})\b""")
-    private val vodExtRegex = Regex("""(?i)\.(mp4|mkv|avi|mov|wmv|flv|webm)(\?.*)?$""")
-    private val liveManifestOrAudioExtRegex = Regex("""(?i)\.(m3u8|ts|mpd|aac|mp3|ogg|m4a)(\?.*)?$""")
+
+    private val vodExtensions = setOf("mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v")
+    private val liveExtensions = setOf("m3u8", "ts", "mpd", "aac", "mp3", "ogg", "m4a", "pls")
 
     private val seriesGroupKeywords = listOf(
         "serie", "series", "temporada", "season", "novela", "telenovela", "anime", "dorama", "miniserie"
@@ -48,6 +49,20 @@ object M3uParser {
         val categoryName: String,
         val episodesBySeason: MutableMap<String, MutableList<Episode>> = linkedMapOf()
     )
+
+    private class ExtInfBuffer {
+        var title: String? = null
+        var logo: String? = null
+        var group: String? = null
+        var tvgId: String? = null
+
+        fun reset() {
+            title = null
+            logo = null
+            group = null
+            tvgId = null
+        }
+    }
 
     /**
      * Genera una clave determinista de almacenamiento local para cada URL M3U.
@@ -82,11 +97,14 @@ object M3uParser {
     }
 
     /**
-     * Descarga el texto bruto de la lista M3U en segundo plano (Dispatchers.IO).
+     * Descarga el texto bruto de la lista M3U en segundo plano (Dispatchers.IO) validando el estado HTTP.
      */
     suspend fun fetchRawText(url: String, client: HttpClient): String = withContext(Dispatchers.IO) {
         val response = client.get(url.trim()) {
             header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X; XaviTV/1.1)")
+        }
+        if (!response.status.isSuccess()) {
+            throw IllegalStateException("No se pudo descargar la lista M3U (HTTP ${response.status.value})")
         }
         val text = response.bodyAsText()
         if (text.isBlank()) {
@@ -131,62 +149,152 @@ object M3uParser {
         }
     }
 
+    /**
+     * Parser lineal de etiquetas #EXTINF sin crear mapas ni regex por línea.
+     * Localiza la primera coma fuera de comillas para preservar títulos que contienen comas.
+     */
+    private fun parseExtInfLine(line: String, out: ExtInfBuffer) {
+        out.reset()
+        val len = line.length
+        var inQuotes = false
+        var commaIdx = -1
+        for (i in 8 until len) {
+            val c = line[i]
+            if (c == '"') {
+                inQuotes = !inQuotes
+            } else if (c == ',' && !inQuotes) {
+                commaIdx = i
+                break
+            }
+        }
+
+        val headerEnd = if (commaIdx >= 0) commaIdx else len
+        var tvgName: String? = null
+
+        var i = 8
+        while (i < headerEnd) {
+            while (i < headerEnd && line[i] <= ' ') i++
+            val keyStart = i
+            while (i < headerEnd && line[i] != '=' && line[i] > ' ') i++
+            val keyEnd = i
+            while (i < headerEnd && line[i] <= ' ') i++
+            if (i < headerEnd && line[i] == '=') {
+                i++
+                while (i < headerEnd && line[i] <= ' ') i++
+                if (i < headerEnd && line[i] == '"') {
+                    val valStart = ++i
+                    while (i < headerEnd && line[i] != '"') i++
+                    val valEnd = i
+                    if (i < headerEnd) i++ // consumir comilla de cierre
+
+                    val keyLen = keyEnd - keyStart
+                    if (valEnd > valStart && keyLen in 6..11) {
+                        when {
+                            keyLen == 8 && line.regionMatches(keyStart, "tvg-logo", 0, 8, ignoreCase = true) ->
+                                out.logo = line.substring(valStart, valEnd).trim().takeIf { it.isNotEmpty() }
+                            keyLen == 11 && line.regionMatches(keyStart, "group-title", 0, 11, ignoreCase = true) ->
+                                out.group = line.substring(valStart, valEnd).trim().takeIf { it.isNotEmpty() }
+                            keyLen == 8 && line.regionMatches(keyStart, "tvg-name", 0, 8, ignoreCase = true) ->
+                                tvgName = line.substring(valStart, valEnd).trim().takeIf { it.isNotEmpty() }
+                            keyLen == 6 && line.regionMatches(keyStart, "tvg-id", 0, 6, ignoreCase = true) ->
+                                out.tvgId = line.substring(valStart, valEnd).trim().takeIf { it.isNotEmpty() }
+                        }
+                    }
+                } else {
+                    while (i < headerEnd && line[i] > ' ') i++
+                }
+            }
+        }
+
+        val titleAfterComma = if (commaIdx >= 0 && commaIdx + 1 < len) {
+            line.substring(commaIdx + 1).trim()
+        } else {
+            ""
+        }
+        out.title = titleAfterComma.ifBlank { tvgName.orEmpty() }
+    }
+
+    private fun hasDigit(s: String): Boolean {
+        for (i in s.indices) {
+            if (s[i] in '0'..'9') return true
+        }
+        return false
+    }
+
+    private fun extractLowerExtension(url: String): String {
+        val queryIdx = url.indexOf('?')
+        val end = if (queryIdx >= 0) queryIdx else url.length
+        val slashIdx = url.lastIndexOf('/', end - 1)
+        val dotIdx = url.lastIndexOf('.', end - 1)
+        if (dotIdx <= slashIdx || dotIdx < 0 || dotIdx + 1 >= end) return ""
+        return url.substring(dotIdx + 1, end).lowercase()
+    }
+
     fun parseText(content: String, isFromLocalCache: Boolean = false): M3uCatalog {
         val liveCatMap = linkedMapOf<String, Category>()
         val vodCatMap = linkedMapOf<String, Category>()
         val seriesCatMap = linkedMapOf<String, Category>()
 
-        val liveStreams = mutableListOf<LiveStream>()
-        val vodStreams = mutableListOf<VodStream>()
-        val vodDetails = mutableMapOf<String, VodInfoResponse>()
+        val liveStreams = ArrayList<LiveStream>(256)
+        val vodStreams = ArrayList<VodStream>(64)
+        val vodDetails = HashMap<String, VodInfoResponse>(64)
         val seriesAccMap = linkedMapOf<String, SeriesAcc>()
-        val directUrls = mutableMapOf<String, String>()
+        val directUrls = HashMap<String, String>(320)
 
-        var currentTitle: String? = null
-        var currentLogo: String? = null
-        var currentGroup: String? = null
-        var currentTvgId: String? = null
+        val extInf = ExtInfBuffer()
         var itemIndex = 0
 
+        // Cálculo de firma en una sola pasada simultánea al parsing
+        var sigHash = -3750763034362895579L
+        var nonEmptyLines = 0
+
         for (rawLine in content.lineSequence()) {
-            val trimmed = rawLine.trim().removePrefix("\uFEFF")
-            if (trimmed.startsWith("#EXTINF:", ignoreCase = true)) {
-                val attrs = mutableMapOf<String, String>()
-                attrRegex.findAll(trimmed).forEach { m ->
-                    attrs[m.groupValues[1].lowercase()] = m.groupValues[2].trim()
+            val rawTrimmed = rawLine.trim()
+            if (rawTrimmed.isEmpty()) continue
+            nonEmptyLines++
+            for (i in rawTrimmed.indices) {
+                sigHash = sigHash xor rawTrimmed[i].code.toLong()
+                sigHash *= 1099511628211L
+            }
+
+            val trimmed = if (rawTrimmed[0] == '\uFEFF') rawTrimmed.substring(1) else rawTrimmed
+            if (trimmed.isEmpty()) continue
+
+            if (trimmed[0] == '#') {
+                if (trimmed.startsWith("#EXTINF:", ignoreCase = true)) {
+                    parseExtInfLine(trimmed, extInf)
+                } else if (trimmed.startsWith("#EXTGRP:", ignoreCase = true)) {
+                    val grp = trimmed.substringAfter(':').trim()
+                    if (grp.isNotEmpty() && extInf.group.isNullOrBlank()) {
+                        extInf.group = grp
+                    }
                 }
-                val commaIdx = trimmed.lastIndexOf(',')
-                val titleAfterComma = if (commaIdx >= 0 && commaIdx + 1 < trimmed.length) {
-                    trimmed.substring(commaIdx + 1).trim()
-                } else {
-                    ""
-                }
-                currentTitle = titleAfterComma.ifBlank { attrs["tvg-name"].orEmpty() }
-                currentLogo = attrs["tvg-logo"]?.takeIf { it.isNotBlank() }
-                currentGroup = attrs["group-title"]?.takeIf { it.isNotBlank() }
-                currentTvgId = attrs["tvg-id"]?.takeIf { it.isNotBlank() }
-            } else if (trimmed.startsWith("#EXTGRP:", ignoreCase = true)) {
-                val grp = trimmed.substringAfter(":").trim()
-                if (grp.isNotEmpty() && currentGroup.isNullOrBlank()) {
-                    currentGroup = grp
-                }
-            } else if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
+            } else {
                 if (isStreamUrl(trimmed)) {
                     itemIndex++
                     val streamUrl = trimmed
-                    val rawTitle = currentTitle?.takeIf { it.isNotBlank() } ?: "Canal $itemIndex"
-                    val groupName = currentGroup?.takeIf { it.isNotBlank() } ?: "General"
-                    val logo = currentLogo
+                    val rawTitle = extInf.title?.takeIf { it.isNotBlank() } ?: "Canal $itemIndex"
+                    val groupName = extInf.group?.takeIf { it.isNotBlank() } ?: "General"
+                    val logo = extInf.logo
 
-                    val seMatch = sePattern1.find(rawTitle)
-                        ?: sePattern2.find(rawTitle)
-                        ?: sePattern3.find(rawTitle)
+                    val lowerUrl = streamUrl.lowercase()
+                    val lowerGroup = groupName.lowercase()
+                    val extLower = extractLowerExtension(streamUrl)
 
-                    val kind = classifyStream(streamUrl, groupName, seMatch != null)
+                    val isLiveExt = extLower.isNotEmpty() && extLower in liveExtensions
+                    val seMatch = if (!isLiveExt && hasDigit(rawTitle)) {
+                        sePattern1.find(rawTitle)
+                            ?: sePattern2.find(rawTitle)
+                            ?: sePattern3.find(rawTitle)
+                    } else {
+                        null
+                    }
+
+                    val kind = classifyStream(lowerUrl, lowerGroup, extLower, seMatch != null)
 
                     when (kind) {
                         Kind.LIVE -> {
-                            val catId = "live_cat_${groupName.lowercase().hashCode()}"
+                            val catId = "live_cat_${lowerGroup.hashCode()}"
                             liveCatMap.getOrPut(catId) { Category(catId, groupName) }
                             val id = "m3u_live_$itemIndex"
                             directUrls[id] = streamUrl
@@ -195,17 +303,17 @@ object M3uParser {
                                     name = rawTitle,
                                     streamId = id,
                                     icon = logo,
-                                    epgChannelId = currentTvgId,
+                                    epgChannelId = extInf.tvgId,
                                     categoryId = catId,
                                     directUrl = streamUrl
                                 )
                             )
                         }
                         Kind.MOVIE -> {
-                            val catId = "vod_cat_${groupName.lowercase().hashCode()}"
+                            val catId = "vod_cat_${lowerGroup.hashCode()}"
                             vodCatMap.getOrPut(catId) { Category(catId, groupName) }
                             val id = "m3u_vod_$itemIndex"
-                            val ext = extractExtension(streamUrl)
+                            val ext = extLower.ifBlank { "mp4" }
                             directUrls[id] = streamUrl
                             vodStreams.add(
                                 VodStream(
@@ -232,7 +340,7 @@ object M3uParser {
                             )
                         }
                         Kind.SERIES -> {
-                            val catId = "ser_cat_${groupName.lowercase().hashCode()}"
+                            val catId = "ser_cat_${lowerGroup.hashCode()}"
                             seriesCatMap.getOrPut(catId) { Category(catId, groupName) }
 
                             val seriesTitle: String
@@ -261,9 +369,9 @@ object M3uParser {
                             if (acc.cover == null && logo != null) acc.cover = logo
 
                             val epId = "m3u_ep_$itemIndex"
-                            val ext = extractExtension(streamUrl)
+                            val ext = extLower.ifBlank { "mp4" }
                             directUrls[epId] = streamUrl
-                            val seasonList = acc.episodesBySeason.getOrPut(seasonNum) { mutableListOf() }
+                            val seasonList = acc.episodesBySeason.getOrPut(seasonNum) { ArrayList() }
                             val resolvedEpNum = if (seMatch != null) epNum else (seasonList.size + 1).toString()
                             seasonList.add(
                                 Episode(
@@ -282,10 +390,7 @@ object M3uParser {
                         }
                     }
                 }
-                currentTitle = null
-                currentLogo = null
-                currentGroup = null
-                currentTvgId = null
+                extInf.reset()
             }
         }
 
@@ -293,8 +398,8 @@ object M3uParser {
             throw IllegalStateException("No se encontraron canales ni streams válidos en la URL M3U proporcionada")
         }
 
-        val seriesList = mutableListOf<Series>()
-        val seriesDetails = mutableMapOf<String, Pair<SeriesDetails, Map<String, List<Episode>>>>()
+        val seriesList = ArrayList<Series>(seriesAccMap.size)
+        val seriesDetails = HashMap<String, Pair<SeriesDetails, Map<String, List<Episode>>>>(seriesAccMap.size)
         for (acc in seriesAccMap.values) {
             seriesList.add(
                 Series(
@@ -324,7 +429,7 @@ object M3uParser {
             seriesList = seriesList,
             seriesDetails = seriesDetails,
             directUrls = directUrls,
-            contentSignature = computeContentSignature(content),
+            contentSignature = "${sigHash.toULong().toString(16)}_${nonEmptyLines}",
             isFromLocalCache = isFromLocalCache
         )
     }
@@ -337,26 +442,20 @@ object M3uParser {
             line.startsWith("mms://", ignoreCase = true)
     }
 
-    private fun classifyStream(url: String, groupName: String, hasSeasonEpisodePattern: Boolean): Kind {
-        val lowerUrl = url.lowercase()
-        val lowerGroup = groupName.lowercase()
-        val isVodFile = vodExtRegex.containsMatchIn(lowerUrl)
-        val isLiveStreamFormat = liveManifestOrAudioExtRegex.containsMatchIn(lowerUrl)
-
+    private fun classifyStream(
+        lowerUrl: String,
+        lowerGroup: String,
+        extLower: String,
+        hasSeasonEpisodePattern: Boolean
+    ): Kind {
         if (hasSeasonEpisodePattern || lowerUrl.contains("/series/")) return Kind.SERIES
         if (lowerUrl.contains("/movie/") || lowerUrl.contains("/movies/") || lowerUrl.contains("/vod/")) return Kind.MOVIE
-        if (isVodFile) {
+        if (extLower.isNotEmpty() && extLower in vodExtensions) {
             return if (seriesGroupKeywords.any { lowerGroup.contains(it) }) Kind.SERIES else Kind.MOVIE
         }
-        if (isLiveStreamFormat) return Kind.LIVE
+        if (extLower.isNotEmpty() && extLower in liveExtensions) return Kind.LIVE
         if (seriesGroupKeywords.any { lowerGroup.contains(it) }) return Kind.SERIES
         if (movieGroupKeywords.any { lowerGroup.contains(it) }) return Kind.MOVIE
         return Kind.LIVE
-    }
-
-    private fun extractExtension(url: String): String {
-        val clean = url.substringBefore('?').substringAfterLast('/')
-        val ext = clean.substringAfterLast('.', "")
-        return ext.ifBlank { "mp4" }
     }
 }

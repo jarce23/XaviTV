@@ -70,7 +70,9 @@ compose.desktop {
                 iconFile.set(rootProject.file("logo.ico"))
                 shortcut = true
                 dirChooser = true
+                perUserInstall = true
                 menuGroup = "XaviTV"
+                upgradeUuid = "7e8c9d41-4a2b-4f10-8e33-9b1f6a20c84d"
             }
         }
     }

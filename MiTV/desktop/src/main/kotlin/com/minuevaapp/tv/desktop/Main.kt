@@ -9,9 +9,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.*
 import com.minuevaapp.tv.data.Series
 import com.minuevaapp.tv.data.VodStream
+import com.minuevaapp.tv.player.ActiveDesktopPlayerBridge
 import com.minuevaapp.tv.player.DesktopPlayerScreen
+import com.minuevaapp.tv.player.VlcRuntimeManager
 import com.minuevaapp.tv.ui.*
 import com.minuevaapp.tv.ui.theme.MiTVTheme
+import java.awt.Dimension
 
 sealed class DesktopScreen {
     data object Playlists : DesktopScreen()
@@ -78,12 +81,55 @@ fun main() {
         }
 
         Window(
-            onCloseRequest = ::exitApplication,
+            onCloseRequest = {
+                ActiveDesktopPlayerBridge.shortcuts?.onSaveBeforeExit?.invoke()
+                appState.store.flushPendingSavesSync()
+                VlcRuntimeManager.shutdown()
+                exitApplication()
+            },
             state = windowState,
             title = "XaviTV",
             icon = painterResource("app_logo.png"),
             onPreviewKeyEvent = { event ->
-                if (event.type == KeyEventType.KeyUp) {
+                val isPlayerActive = stack.lastOrNull() is DesktopScreen.Player
+                if (event.type == KeyEventType.KeyDown && isPlayerActive) {
+                    val shortcuts = ActiveDesktopPlayerBridge.shortcuts
+                    when (event.key) {
+                        Key.Spacebar -> {
+                            shortcuts?.onTogglePlayPause?.invoke()
+                            true
+                        }
+                        Key.DirectionLeft -> {
+                            shortcuts?.onSeekByMs?.invoke(-10_000L)
+                            true
+                        }
+                        Key.DirectionRight -> {
+                            shortcuts?.onSeekByMs?.invoke(10_000L)
+                            true
+                        }
+                        Key.DirectionUp -> {
+                            shortcuts?.onAdjustVolume?.invoke(0.05f)
+                            true
+                        }
+                        Key.DirectionDown -> {
+                            shortcuts?.onAdjustVolume?.invoke(-0.05f)
+                            true
+                        }
+                        Key.M -> {
+                            shortcuts?.onToggleMute?.invoke()
+                            true
+                        }
+                        Key.F -> {
+                            toggleFullscreen()
+                            true
+                        }
+                        Key.R -> {
+                            shortcuts?.onReconnect?.invoke()
+                            true
+                        }
+                        else -> false
+                    }
+                } else if (event.type == KeyEventType.KeyUp) {
                     when (event.key) {
                         Key.F11 -> {
                             toggleFullscreen()
@@ -104,6 +150,9 @@ fun main() {
                 }
             }
         ) {
+            LaunchedEffect(window) {
+                window.minimumSize = Dimension(960, 620)
+            }
             CompositionLocalProvider(LocalAppState provides appState) {
                 MiTVTheme {
                     when (val current = stack.last()) {

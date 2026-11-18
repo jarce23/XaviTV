@@ -10,6 +10,8 @@ import java.lang.reflect.Type
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -233,19 +235,26 @@ class PlaylistStore(context: Context) {
         prefs.edit().putString("selected_cat_$type", categoryId).apply()
     }
 
+    private val scrollMemoryCache = HashMap<String, Pair<Int, Int>>()
+
+    @Synchronized
     fun getScrollPosition(key: String): Pair<Int, Int> {
+        scrollMemoryCache[key]?.let { return it }
         val idx = prefs.getInt("scroll_idx_$key", 0)
         val off = prefs.getInt("scroll_off_$key", 0)
-        return idx to off
+        return (idx to off).also { scrollMemoryCache[key] = it }
     }
 
+    @Synchronized
     fun saveScrollPosition(key: String, index: Int, offset: Int) {
-        if (index >= 0 && offset >= 0) {
-            prefs.edit()
-                .putInt("scroll_idx_$key", index)
-                .putInt("scroll_off_$key", offset)
-                .apply()
-        }
+        if (index < 0 || offset < 0) return
+        val next = index to offset
+        if (scrollMemoryCache[key] == next) return
+        scrollMemoryCache[key] = next
+        prefs.edit()
+            .putInt("scroll_idx_$key", index)
+            .putInt("scroll_off_$key", offset)
+            .apply()
     }
 
     private val progressMap: MutableMap<String, PlaybackProgress> = readPlaybackProgressFromDisk().toMutableMap()
@@ -355,11 +364,22 @@ class PlaylistStore(context: Context) {
             )
 
             storeProgressUnderAliases(cleanId, progress)
+            prunePlaybackProgressIfNeeded()
             true
         }
         if (shouldPersist) {
             persistPlaybackProgress(commitSync = commitSync, notifyUi = notifyUi)
         }
+    }
+
+    private fun prunePlaybackProgressIfNeeded() {
+        if (progressMap.size <= MAX_PROGRESS_KEYS) return
+        val keepKeys = progressMap.entries
+            .sortedByDescending { it.value.updatedAt }
+            .take(PRUNED_PROGRESS_KEYS)
+            .map { it.key }
+            .toHashSet()
+        progressMap.keys.retainAll(keepKeys)
     }
 
     private fun removeProgressKeys(cleanId: String) {
@@ -436,6 +456,8 @@ class PlaylistStore(context: Context) {
     }
 
     companion object {
+        private const val MAX_PROGRESS_KEYS = 450
+        private const val PRUNED_PROGRESS_KEYS = 300
         private const val KEY_DEFAULT_TDT_SEEDED = "default_tdt_seeded_v1"
         private const val KEY_LIST = "list"
         private const val KEY_LIST_BACKUP = "list_backup"
@@ -478,6 +500,7 @@ class XtreamRepository(
     private val vodMutex = Mutex()
     private val seriesMutex = Mutex()
     private val m3uMutex = Mutex()
+    private val epgMutex = Mutex()
 
     @Volatile
     private var liveCache: Pair<List<Category>, List<LiveStream>>? = null
@@ -487,12 +510,13 @@ class XtreamRepository(
     private var seriesCache: Pair<List<Category>, List<Series>>? = null
     @Volatile
     private var m3uCatalog: M3uCatalog? = null
+    private val epgCache = LinkedHashMap<String, Pair<Long, List<EpgListing>>>()
 
     private suspend fun ensureM3uLoaded(forceRefresh: Boolean = false): M3uCatalog =
         m3uMutex.withLock {
             if (!forceRefresh) m3uCatalog?.let { return@withLock it }
             withContext(Dispatchers.IO) {
-                M3uParser.fetchAndParse(playlist.effectiveM3uUrl, httpClient).also {
+                M3uParser.fetchAndParse(playlist.effectiveM3uUrl, httpClient, forceRefresh).also {
                     m3uCatalog = it
                 }
             }
@@ -531,7 +555,11 @@ class XtreamRepository(
         return liveMutex.withLock {
             if (!forceRefresh) liveCache?.let { return@withLock it }
             withContext(Dispatchers.IO) {
-                (api.liveCategories(u, p) to api.liveStreams(u, p)).also { liveCache = it }
+                coroutineScope {
+                    val catsDeferred = async { api.liveCategories(u, p) }
+                    val streamsDeferred = async { api.liveStreams(u, p) }
+                    (catsDeferred.await() to streamsDeferred.await()).also { liveCache = it }
+                }
             }
         }
     }
@@ -544,7 +572,11 @@ class XtreamRepository(
         return vodMutex.withLock {
             if (!forceRefresh) vodCache?.let { return@withLock it }
             withContext(Dispatchers.IO) {
-                (api.vodCategories(u, p) to api.vodStreams(u, p)).also { vodCache = it }
+                coroutineScope {
+                    val catsDeferred = async { api.vodCategories(u, p) }
+                    val streamsDeferred = async { api.vodStreams(u, p) }
+                    (catsDeferred.await() to streamsDeferred.await()).also { vodCache = it }
+                }
             }
         }
     }
@@ -557,16 +589,16 @@ class XtreamRepository(
         return seriesMutex.withLock {
             if (!forceRefresh) seriesCache?.let { return@withLock it }
             withContext(Dispatchers.IO) {
-                (api.seriesCategories(u, p) to api.series(u, p)).also { seriesCache = it }
+                coroutineScope {
+                    val catsDeferred = async { api.seriesCategories(u, p) }
+                    val itemsDeferred = async { api.series(u, p) }
+                    (catsDeferred.await() to itemsDeferred.await()).also { seriesCache = it }
+                }
             }
         }
     }
 
     suspend fun refreshAllXtream(): RefreshResult = withContext(Dispatchers.IO) {
-        liveMutex.withLock { liveCache = null }
-        vodMutex.withLock { vodCache = null }
-        seriesMutex.withLock { seriesCache = null }
-
         if (playlist.isM3u) {
             return@withContext runCatching {
                 val catalog = ensureM3uLoaded(forceRefresh = true)
@@ -581,11 +613,16 @@ class XtreamRepository(
             }
         }
 
+        // Refresco atómico y paralelo: conserva cachés previos si la red falla
         try {
             login()
-            val (_, liveItems) = live(forceRefresh = true)
-            val (_, vodItems) = vod(forceRefresh = true)
-            val (_, seriesItems) = series(forceRefresh = true)
+            epgMutex.withLock { epgCache.clear() }
+            val (liveItems, vodItems, seriesItems) = coroutineScope {
+                val liveDef = async { live(forceRefresh = true).second }
+                val vodDef = async { vod(forceRefresh = true).second }
+                val seriesDef = async { series(forceRefresh = true).second }
+                Triple(liveDef.await(), vodDef.await(), seriesDef.await())
+            }
             RefreshResult(
                 success = true,
                 liveCount = liveItems.size,
@@ -768,7 +805,21 @@ class XtreamRepository(
 
     suspend fun shortEpg(streamId: String): List<EpgListing> = withContext(Dispatchers.IO) {
         if (playlist.isM3u) return@withContext emptyList()
-        runCatching { api.shortEpg(u, p, streamId).listings.orEmpty() }.getOrDefault(emptyList())
+        val now = System.currentTimeMillis()
+        epgMutex.withLock {
+            val cached = epgCache[streamId]
+            if (cached != null && now - cached.first < EPG_CACHE_TTL_MS) {
+                return@withContext cached.second
+            }
+        }
+        val fresh = runCatching { api.shortEpg(u, p, streamId).listings.orEmpty() }.getOrDefault(emptyList())
+        epgMutex.withLock {
+            if (epgCache.size >= 64) {
+                epgCache.keys.firstOrNull()?.let { epgCache.remove(it) }
+            }
+            epgCache[streamId] = System.currentTimeMillis() to fresh
+        }
+        fresh
     }
 
     private fun resolveDirectUrl(id: String): String? {
@@ -796,6 +847,8 @@ class XtreamRepository(
         "$base/timeshift/$u/$p/$durationMin/$start/$streamId.ts"
 
     companion object {
+        private const val EPG_CACHE_TTL_MS = 120_000L
+
         fun decodeB64(s: String?): String =
             if (s.isNullOrEmpty()) "" else runCatching {
                 String(Base64.decode(s, Base64.DEFAULT), Charsets.UTF_8).trim()

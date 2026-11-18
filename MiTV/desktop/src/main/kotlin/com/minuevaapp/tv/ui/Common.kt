@@ -45,26 +45,57 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.minuevaapp.tv.data.PlaybackProgress
 import com.minuevaapp.tv.data.Playlist
 import com.minuevaapp.tv.data.PlaylistStore
 import com.minuevaapp.tv.data.XtreamRepository
 import com.minuevaapp.tv.ui.theme.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.jetbrains.skia.FilterMipmap
+import org.jetbrains.skia.FilterMode
 import org.jetbrains.skia.Image as SkiaImage
+import org.jetbrains.skia.MipmapMode
+import org.jetbrains.skia.Paint
+import org.jetbrains.skia.Rect
+import org.jetbrains.skia.SamplingMode
+import org.jetbrains.skia.Surface
 import java.awt.Cursor
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+fun resolveDesktopMovieProgressFraction(progressMap: Map<String, PlaybackProgress>, id: String): Float {
+    return (progressMap["vod:$id"] ?: progressMap["movie:$id"] ?: progressMap[id])?.progressFraction ?: 0f
+}
+
+fun resolveDesktopSeriesProgressFraction(progressMap: Map<String, PlaybackProgress>, id: String): Float {
+    return (progressMap["series_cover:$id"] ?: progressMap["series:$id"] ?: progressMap[id])?.progressFraction ?: 0f
+}
 
 class DesktopAppState {
+    companion object {
+        private const val MAX_IMAGE_CACHE_ENTRIES = 160
+        private const val MAX_IMAGE_CACHE_BYTES = 48 * 1024 * 1024 // 48 MB en RAM para carátulas
+    }
+
+    private data class CachedImageEntry(
+        val image: ImageBitmap,
+        val sizeInBytes: Int
+    )
+
     val store: PlaylistStore = PlaylistStore()
     private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -77,18 +108,23 @@ class DesktopAppState {
 
     fun refreshCurrentPlaylistAsync() {
         if (isRefreshing) return
+        val current = store.active()
+        isRefreshing = true
+        refreshFeedback = "Actualizando catálogo de ${current.name}..."
         backgroundScope.launch {
-            isRefreshing = true
-            val current = store.active()
-            refreshFeedback = "Actualizando catálogo de ${current.name}..."
             val result = repo().refreshAllXtream()
-            isRefreshing = false
-            catalogRefreshVersion++
-            refreshFeedback = if (result.success) {
+            val feedback = if (result.success) {
                 if (current.isM3u) "Lista M3U actualizada (${result.liveCount} canales)"
                 else "Lista actualizada (${result.liveCount} TV, ${result.vodCount} Películas, ${result.seriesCount} Series)"
             } else {
                 result.error ?: "Error al actualizar la lista"
+            }
+            withContext(Dispatchers.Main) {
+                isRefreshing = false
+                if (result.success) {
+                    catalogRefreshVersion++
+                }
+                refreshFeedback = feedback
             }
         }
     }
@@ -97,7 +133,7 @@ class DesktopAppState {
         refreshFeedback = null
     }
 
-    // Inicialización perezosa de OkHttpClient para no penalizar el arranque del primer frame de UI
+    // Inicialización perezosa de OkHttpClient con timeouts robustos para listas Xtream grandes
     val okHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .dispatcher(
@@ -107,14 +143,19 @@ class DesktopAppState {
                 }
             )
             .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(20, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .writeTimeout(20, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
     }
 
-    private val imageCache = ConcurrentHashMap<String, ImageBitmap>()
+    private val imageCacheMutex = Mutex()
+    private val imageCache = LinkedHashMap<String, CachedImageEntry>(64, 0.75f, true)
+    private val inFlightImages = HashMap<String, Deferred<ImageBitmap?>>()
+    private var currentCacheBytes = 0
 
     @Volatile
     private var currentRepoPlaylist: Playlist? = null
@@ -122,10 +163,6 @@ class DesktopAppState {
     @Volatile
     private var currentRepo: XtreamRepository? = null
 
-    /**
-     * Inicializa en segundo plano (Dispatchers.IO) la base de datos local y precarga la lista M3U
-     * activa (ej. TDTChannels) sin bloquear jamás el hilo principal de interfaz.
-     */
     fun initializeInBackground() {
         backgroundScope.launch {
             store.initializeAsync()
@@ -159,36 +196,127 @@ class DesktopAppState {
     fun createRepo(playlist: Playlist): XtreamRepository =
         XtreamRepository(playlist, okHttpClient)
 
+    fun clearImageCache() {
+        backgroundScope.launch {
+            imageCacheMutex.withLock {
+                imageCache.clear()
+                inFlightImages.clear()
+                currentCacheBytes = 0
+            }
+        }
+    }
+
     fun invalidateRepo() {
         synchronized(this) {
             currentRepoPlaylist = null
             currentRepo = null
         }
+        clearImageCache()
         warmUpActiveCatalogAsync()
     }
 
-    suspend fun loadImage(url: String): ImageBitmap? {
+    private fun decodeScaledBitmap(bytes: ByteArray, maxDimension: Int): ImageBitmap? {
+        if (bytes.isEmpty() || bytes.size > 6 * 1024 * 1024) return null
+        return runCatching {
+            val rawImage = SkiaImage.makeFromEncoded(bytes)
+            try {
+                val srcW = rawImage.width
+                val srcH = rawImage.height
+                if (srcW <= 0 || srcH <= 0) return@runCatching null
+
+                val largestSide = max(srcW, srcH)
+                if (largestSide <= maxDimension) {
+                    rawImage.toComposeImageBitmap()
+                } else {
+                    val scale = maxDimension.toFloat() / largestSide.toFloat()
+                    val dstW = (srcW * scale).roundToInt().coerceAtLeast(1)
+                    val dstH = (srcH * scale).roundToInt().coerceAtLeast(1)
+                    val surface = Surface.makeRasterN32Premul(dstW, dstH)
+                    try {
+                        val paint = Paint().apply { isAntiAlias = true }
+                        surface.canvas.drawImageRect(
+                            rawImage,
+                            Rect.makeWH(srcW.toFloat(), srcH.toFloat()),
+                            Rect.makeWH(dstW.toFloat(), dstH.toFloat()),
+                            FilterMipmap(FilterMode.LINEAR, MipmapMode.NONE) as SamplingMode,
+                            paint,
+                            true
+                        )
+                        val scaled = surface.makeImageSnapshot()
+                        try {
+                            scaled.toComposeImageBitmap()
+                        } finally {
+                            scaled.close()
+                        }
+                    } finally {
+                        surface.close()
+                    }
+                }
+            } finally {
+                rawImage.close()
+            }
+        }.getOrNull()
+    }
+
+    suspend fun loadImage(url: String, maxDimension: Int = 320): ImageBitmap? {
         val clean = url.trim()
         if (clean.isEmpty()) return null
-        imageCache[clean]?.let { return it }
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                val req = Request.Builder()
-                    .url(clean)
-                    .header("User-Agent", "XaviTV/2.0 (Windows Desktop)")
-                    .build()
-                okHttpClient.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use null
-                    val bytes = resp.body?.bytes() ?: return@use null
-                    if (bytes.isEmpty()) return@use null
-                    val bitmap = SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap()
-                    if (imageCache.size > 300) {
-                        imageCache.clear()
+        val cacheKey = "${maxDimension}_$clean"
+
+        val existingOrDeferred: Pair<ImageBitmap?, Deferred<ImageBitmap?>?> = imageCacheMutex.withLock {
+            imageCache[cacheKey]?.let { return@withLock it.image to null }
+            val inFlight = inFlightImages[cacheKey]
+            if (inFlight != null && inFlight.isActive) {
+                return@withLock null to inFlight
+            }
+            val created = backgroundScope.async(Dispatchers.IO) {
+                runCatching {
+                    val req = Request.Builder()
+                        .url(clean)
+                        .header("User-Agent", "XaviTV/2.0 (Windows Desktop)")
+                        .build()
+                    val bytes = okHttpClient.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) return@use null
+                        resp.body?.bytes()
+                    } ?: return@runCatching null
+
+                    val bitmap = withContext(Dispatchers.Default) {
+                        decodeScaledBitmap(bytes, maxDimension)
+                    } ?: return@runCatching null
+                    val estBytes = (bitmap.width * bitmap.height * 4).coerceAtLeast(1024)
+
+                    imageCacheMutex.withLock {
+                        while (
+                            imageCache.isNotEmpty() &&
+                            (imageCache.size >= MAX_IMAGE_CACHE_ENTRIES ||
+                                currentCacheBytes + estBytes > MAX_IMAGE_CACHE_BYTES)
+                        ) {
+                            val oldestKey = imageCache.keys.firstOrNull() ?: break
+                            val removed = imageCache.remove(oldestKey)
+                            if (removed != null) {
+                                currentCacheBytes = (currentCacheBytes - removed.sizeInBytes).coerceAtLeast(0)
+                            }
+                        }
+                        imageCache[cacheKey] = CachedImageEntry(bitmap, estBytes)
+                        currentCacheBytes += estBytes
                     }
-                    imageCache[clean] = bitmap
                     bitmap
+                }.getOrNull()
+            }
+            inFlightImages[cacheKey] = created
+            null to created
+        }
+
+        existingOrDeferred.first?.let { return it }
+        val deferred = existingOrDeferred.second ?: return null
+        return try {
+            deferred.await()
+        } finally {
+            imageCacheMutex.withLock {
+                if (inFlightImages[cacheKey] === deferred) {
+                    inFlightImages.remove(cacheKey)
                 }
-            }.getOrNull()
+            }
         }
     }
 }
@@ -440,19 +568,20 @@ fun NetworkImage(
     contentScale: ContentScale = ContentScale.Crop,
     fallbackIcon: ImageVector = Icons.Default.Movie,
     alpha: Float = 1f,
+    maxDimension: Int = 320,
 ) {
     val appState = LocalAppState.current
     val cleanUrl = url?.trim()?.takeIf { it.isNotEmpty() }
-    var bitmap by remember(cleanUrl) { mutableStateOf<ImageBitmap?>(null) }
-    var failed by remember(cleanUrl) { mutableStateOf(false) }
+    var bitmap by remember(cleanUrl, maxDimension) { mutableStateOf<ImageBitmap?>(null) }
+    var failed by remember(cleanUrl, maxDimension) { mutableStateOf(false) }
 
-    LaunchedEffect(cleanUrl) {
+    LaunchedEffect(cleanUrl, maxDimension) {
         if (cleanUrl == null) {
             failed = true
             return@LaunchedEffect
         }
         failed = false
-        val loaded = appState.loadImage(cleanUrl)
+        val loaded = appState.loadImage(cleanUrl, maxDimension = maxDimension)
         if (loaded != null) {
             bitmap = loaded
         } else {

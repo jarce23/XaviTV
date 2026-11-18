@@ -35,8 +35,10 @@ import androidx.compose.ui.unit.dp
 import com.minuevaapp.tv.MiTVApp
 import com.minuevaapp.tv.player.PlayerActivity
 import com.minuevaapp.tv.ui.theme.*
+import kotlinx.coroutines.delay
 
-/** Ficha de película (MovieInfoActivity). */
+/** Ficha de película (MovieInfoActivity) responsive para móvil vertical y TV panorámico. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun MovieDetailScreen(id: String, onBack: () -> Unit) {
     val app = MiTVApp.instance
@@ -45,7 +47,7 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
     val state = rememberLoad(id, repo) { repo.vodInfo(id) }
     var isFav by remember(id) { mutableStateOf(id in app.store.favorites("movie")) }
     val progressMap by app.store.playbackProgressFlow.collectAsState()
-    val movieProgress = remember(id, progressMap) { app.store.getPlaybackProgress("movie:$id") }
+    val movieProgress = progressMap["movie:$id"] ?: progressMap["vod:$id"] ?: progressMap[id]
     val movieFraction = movieProgress?.progressFraction ?: 0f
     val movieResumeMs = movieProgress?.resumePositionMs ?: 0L
 
@@ -78,7 +80,9 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                     }
                 }
             }
-            Box(Modifier.padding(pad).fillMaxSize()) {
+            BoxWithConstraints(Modifier.padding(pad).fillMaxSize()) {
+                val isCompact = maxWidth < 600.dp
+
                 if (!backdrop.isNullOrBlank() || !info?.image.isNullOrBlank()) {
                     NetworkImage(
                         url = backdrop ?: info?.image,
@@ -86,6 +90,8 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Crop,
                         alpha = 0.25f,
+                        targetWidthPx = 640,
+                        targetHeightPx = 360,
                     )
                     Box(
                         Modifier
@@ -100,11 +106,11 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                             )
                     )
                 }
-                Row(Modifier.fillMaxSize().padding(24.dp)) {
+
+                val posterBlock: @Composable (Modifier) -> Unit = { posterMod ->
                     val posterShape = RoundedCornerShape(14.dp)
                     Box(
-                        modifier = Modifier
-                            .width(210.dp)
+                        modifier = posterMod
                             .aspectRatio(2f / 3f)
                             .shadow(10.dp, posterShape)
                             .clip(posterShape)
@@ -115,6 +121,8 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                             contentDescription = info?.name,
                             modifier = Modifier.fillMaxSize(),
                             contentScale = ContentScale.Crop,
+                            targetWidthPx = 320,
+                            targetHeightPx = 480,
                         )
                         if (movieFraction > 0.01f) {
                             Box(
@@ -133,12 +141,14 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                             }
                         }
                     }
-                    Spacer(Modifier.width(28.dp))
-                    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                }
+
+                val detailsColumn: @Composable (Modifier) -> Unit = { colMod ->
+                    Column(colMod) {
                         val title = info?.name?.ifBlank { null } ?: r.movieData?.name.orEmpty()
                         Text(
                             text = title,
-                            style = MaterialTheme.typography.headlineMedium,
+                            style = if (isCompact) MaterialTheme.typography.headlineSmall else MaterialTheme.typography.headlineMedium,
                             fontWeight = FontWeight.ExtraBold,
                             color = TextPrimaryWhite,
                         )
@@ -154,8 +164,11 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                             fontWeight = FontWeight.Medium,
                             style = MaterialTheme.typography.bodyMedium,
                         )
-                        Spacer(Modifier.height(18.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Spacer(Modifier.height(16.dp))
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
                             Button(
                                 onClick = {
                                     val sid = r.movieData?.streamId?.takeIf { it.isNotBlank() } ?: id
@@ -206,7 +219,7 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                                 Text(if (isFav) "En favoritos" else "Añadir a favoritos")
                             }
                         }
-                        Spacer(Modifier.height(18.dp))
+                        Spacer(Modifier.height(16.dp))
                         info?.plot?.takeIf { it.isNotBlank() }?.let {
                             Text(it, style = MaterialTheme.typography.bodyMedium, color = TextPrimaryWhite)
                             Spacer(Modifier.height(14.dp))
@@ -228,6 +241,26 @@ fun MovieDetailScreen(id: String, onBack: () -> Unit) {
                         }
                     }
                 }
+
+                if (isCompact) {
+                    Column(
+                        Modifier
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState())
+                            .padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        posterBlock(Modifier.width(175.dp))
+                        Spacer(Modifier.height(18.dp))
+                        detailsColumn(Modifier.fillMaxWidth())
+                    }
+                } else {
+                    Row(Modifier.fillMaxSize().padding(24.dp)) {
+                        posterBlock(Modifier.width(210.dp))
+                        Spacer(Modifier.width(28.dp))
+                        detailsColumn(Modifier.weight(1f).verticalScroll(rememberScrollState()))
+                    }
+                }
             }
         }
     }
@@ -243,9 +276,7 @@ fun SeriesDetailScreen(id: String, onBack: () -> Unit) {
     var season by rememberSaveable(id) { mutableStateOf<String?>(null) }
     var isFav by remember(id) { mutableStateOf(id in app.store.favorites("series")) }
     val progressMap by app.store.playbackProgressFlow.collectAsState()
-    val seriesCoverProgress = remember(id, progressMap) {
-        app.store.getPlaybackProgress("series_cover:$id")?.progressFraction ?: 0f
-    }
+    val seriesCoverProgress = resolveSeriesProgressFraction(progressMap, id)
 
     AppScaffold(
         title = "Ficha de serie",
@@ -370,9 +401,7 @@ fun SeriesDetailScreen(id: String, onBack: () -> Unit) {
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(episodes, key = { it.id }) { ep ->
                             val epShape = RoundedCornerShape(10.dp)
-                            val epProgress = remember(ep.id, progressMap) {
-                                app.store.getPlaybackProgress("episode:${ep.id}")?.progressFraction ?: 0f
-                            }
+                            val epProgress = resolveEpisodeProgressFraction(progressMap, id, ep.id)
                             Column(
                                 Modifier
                                     .fillMaxWidth()
@@ -410,6 +439,8 @@ fun SeriesDetailScreen(id: String, onBack: () -> Unit) {
                                             url = ep.info?.image ?: info?.cover,
                                             contentDescription = ep.title,
                                             fallbackIcon = Icons.Default.VideoLibrary,
+                                            targetWidthPx = 240,
+                                            targetHeightPx = 135,
                                             modifier = Modifier.fillMaxSize(),
                                             contentScale = ContentScale.Crop,
                                         )
@@ -488,6 +519,15 @@ fun SearchScreen(onMovie: (String) -> Unit, onSeries: (String) -> Unit, onBack: 
     val repo = app.repo ?: return
     val ctx = LocalContext.current
     var query by rememberSaveable { mutableStateOf("") }
+    var debouncedQuery by remember { mutableStateOf(query) }
+    LaunchedEffect(query) {
+        if (query.isBlank()) {
+            debouncedQuery = ""
+        } else {
+            delay(150L)
+            debouncedQuery = query
+        }
+    }
     val data = rememberLoad(repo) {
         Triple(repo.live().second, repo.vod().second, repo.series().second)
     }
@@ -507,7 +547,7 @@ fun SearchScreen(onMovie: (String) -> Unit, onSeries: (String) -> Unit, onBack: 
             )
             Spacer(Modifier.height(14.dp))
             LoadContent(data) { (lives, movies, series) ->
-                val q = query.trim().lowercase()
+                val q = debouncedQuery.trim().lowercase()
                 val results = remember(q, lives, movies, series) {
                     if (q.length < 2) {
                         emptyList()
@@ -529,13 +569,13 @@ fun SearchScreen(onMovie: (String) -> Unit, onSeries: (String) -> Unit, onBack: 
                 }
                 if (q.length >= 2 && results.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("No se encontraron resultados para «$query».", color = TextSecondaryGray)
+                        Text("No se encontraron resultados para «$debouncedQuery».", color = TextSecondaryGray)
                     }
                 } else {
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(140.dp),
-                        horizontalArrangement = Arrangement.spacedBy(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                        columns = GridCells.Adaptive(130.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         items(results, key = { it.first }) { (key, name, img) ->
                             val id = key.drop(1)
@@ -549,12 +589,10 @@ fun SearchScreen(onMovie: (String) -> Unit, onSeries: (String) -> Unit, onBack: 
                                 'm' -> id in favMovies
                                 else -> id in favSeries
                             }
-                            val itemProg = remember(key, progressMap) {
-                                when (key[0]) {
-                                    'm' -> app.store.getPlaybackProgress("movie:$id")?.progressFraction ?: 0f
-                                    's' -> app.store.getPlaybackProgress("series_cover:$id")?.progressFraction ?: 0f
-                                    else -> 0f
-                                }
+                            val itemProg = when (key[0]) {
+                                'm' -> resolveMovieProgressFraction(progressMap, id)
+                                's' -> resolveSeriesProgressFraction(progressMap, id)
+                                else -> 0f
                             }
                             PosterCard(
                                 title = name,
@@ -562,6 +600,7 @@ fun SearchScreen(onMovie: (String) -> Unit, onSeries: (String) -> Unit, onBack: 
                                 subtitle = typeTag,
                                 isFavorite = isFav,
                                 progress = itemProg,
+                                modifier = Modifier.fillMaxWidth(),
                             ) {
                                 when (key[0]) {
                                     'l' -> {

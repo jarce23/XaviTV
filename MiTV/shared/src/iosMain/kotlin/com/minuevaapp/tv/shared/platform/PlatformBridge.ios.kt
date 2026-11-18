@@ -152,7 +152,6 @@ actual object PlatformStorage {
         writeUtf8File(stateBackupFilePath(), json)
         runCatching {
             NSUserDefaults.standardUserDefaults.setObject(json, forKey = PREFS_STATE_KEY)
-            NSUserDefaults.standardUserDefaults.synchronize()
         }
     }
 
@@ -186,9 +185,9 @@ actual fun createPlatformHttpClient(): HttpClient {
             }
         }
         install(HttpTimeout) {
-            requestTimeoutMillis = 20_000
-            connectTimeoutMillis = 12_000
-            socketTimeoutMillis = 20_000
+            requestTimeoutMillis = 60_000
+            connectTimeoutMillis = 15_000
+            socketTimeoutMillis = 45_000
         }
         install(ContentNegotiation) {
             json(
@@ -268,7 +267,7 @@ actual fun openStreamInExternalApp(url: String, title: String): Boolean {
     for (candidate in candidates) {
         val nsUrl = NSURL.URLWithString(candidate) ?: continue
         if (app.canOpenURL(nsUrl)) {
-            app.openURL(nsUrl)
+            app.openURL(nsUrl, options = emptyMap<Any?, Any?>(), completionHandler = null)
             return true
         }
     }
@@ -367,6 +366,7 @@ actual fun NativeVideoPlayer(
     val candidates = remember(url, isLive) { buildIosCandidateStreamUrls(url, isLive) }
     var candidateIndex by remember(url) { mutableStateOf(0) }
     var reloadSalt by remember(url) { mutableStateOf(0) }
+    var autoReconnectAttempts by remember(url) { mutableStateOf(0) }
     var isPlaying by remember(url) { mutableStateOf(true) }
     var currentAspectIndex by remember(url) { mutableStateOf(0) }
     val aspectRatios = remember { listOf("DEFAULT", "16:9", "4:3", "FILL") }
@@ -375,6 +375,10 @@ actual fun NativeVideoPlayer(
     var showOverlayBar by remember { mutableStateOf(true) }
     var lastInteractionTick by remember { mutableStateOf(0) }
     var hostViewRef by remember { mutableStateOf<UIView?>(null) }
+
+    val latestOnSavePosition by rememberUpdatedState(onSavePosition)
+    val latestOnSaveProgress by rememberUpdatedState(onSaveProgress)
+    val latestIsLive by rememberUpdatedState(isLive)
 
     // Estados de reproducción VOD interactivos
     var currentPosMs by remember(url) { mutableStateOf(if (!isLive && initialPositionMs > 0L) initialPositionMs else 0L) }
@@ -414,20 +418,13 @@ actual fun NativeVideoPlayer(
         val nsUrl = NSString.create(string = safeUrl)
         (hostView as? NSObject)?.performSelector(playSel, withObject = nsUrl)
 
-        if (!isLive && initialPositionMs > 3_000L) {
-            val sec = initialPositionMs.toDouble() / 1000.0
-            val seekSel = NSSelectorFromString("seekToNumber:")
-            val nsSec = NSNumber(double = sec)
-            (hostView as? NSObject)?.performSelector(seekSel, withObject = nsSec)
-        }
-
         val aspectSel = NSSelectorFromString("setAspectRatio:")
         val safeRatio = aspectRatios.getOrNull(currentAspectIndex) ?: "DEFAULT"
         val nsRatio = NSString.create(string = safeRatio)
         (hostView as? NSObject)?.performSelector(aspectSel, withObject = nsRatio)
     }
 
-    // Supervisión periódica cada 1s: telemetría, detección de errores, reanudación y guardado continuo
+    // Supervisión periódica cada 1s: telemetría, reconexión automática, reanudación VOD y guardado continuo
     LaunchedEffect(currentStreamUrl, reloadSalt, hostViewRef) {
         val hostView = hostViewRef ?: return@LaunchedEffect
         var tickCount = 0
@@ -445,6 +442,14 @@ actual fun NativeVideoPlayer(
                     candidateIndex += 1
                     statusLabel = "Conmutando variante (${candidateIndex + 1}/${candidates.size})..."
                     break
+                } else if (isLive && autoReconnectAttempts < 3) {
+                    val nextAttempt = autoReconnectAttempts + 1
+                    autoReconnectAttempts = nextAttempt
+                    statusLabel = "Reconectando señal ($nextAttempt/3)..."
+                    delay(1_500L * nextAttempt)
+                    candidateIndex = 0
+                    reloadSalt += 1
+                    break
                 } else {
                     hasPlaybackError = true
                     showOverlayBar = true
@@ -453,6 +458,9 @@ actual fun NativeVideoPlayer(
             } else if (!hasPlaybackError) {
                 val isPlayingNum = (hostView as? NSObject)?.performSelector(NSSelectorFromString("getIsPlayingNumber")) as? NSNumber
                 val playingNow = isPlayingNum?.boolValue ?: isPlaying
+                if (playingNow && autoReconnectAttempts > 0) {
+                    autoReconnectAttempts = 0
+                }
                 if (isPlaying != playingNow) {
                     isPlaying = playingNow
                 }
@@ -487,8 +495,8 @@ actual fun NativeVideoPlayer(
                     totalDurationMs = durMs
                 }
 
-                // Reanudación automática al segundo exacto en cuanto el reproductor esté activo
-                if (!seekAppliedHolder[0] && initialPositionMs > 3_000L && (timeMs > 0L || durMs > 0L || isPlaying)) {
+                // Reanudación automática al segundo exacto una sola vez cuando el motor ha abierto el VOD
+                if (!seekAppliedHolder[0] && initialPositionMs > 3_000L && (durMs > 0L || timeMs > 0L)) {
                     val sec = initialPositionMs.toDouble() / 1000.0
                     val seekSel = NSSelectorFromString("seekToNumber:")
                     val nsSec = NSNumber(double = sec)
@@ -501,16 +509,16 @@ actual fun NativeVideoPlayer(
 
                 // Guardado periódico cada 5 segundos en background
                 if (tickCount % 5 == 0 && timeMs > 2_000L && isPlaying) {
-                    onSaveProgress(timeMs, durMs)
+                    latestOnSaveProgress(timeMs, durMs)
                 }
             }
         }
     }
 
-    DisposableEffect(Unit) {
+    DisposableEffect(url) {
         onDispose {
             val hostView = hostViewRef
-            if (!isLive) {
+            if (!latestIsLive) {
                 val timeSel = NSSelectorFromString("getPlaybackTimeMs")
                 val durSel = NSSelectorFromString("getDurationMs")
                 val curPos = ((hostView as? NSObject)?.performSelector(timeSel) as? NSNumber)?.longLongValue ?: 0L
@@ -518,8 +526,8 @@ actual fun NativeVideoPlayer(
                 val finalPos = if (curPos > 0L) curPos else playbackClockHolder[0]
                 val finalDur = if (curDur > 0L) curDur else playbackClockHolder[1]
                 if (finalPos > 2000L) {
-                    onSaveProgress(finalPos, finalDur)
-                    onSavePosition(finalPos)
+                    latestOnSaveProgress(finalPos, finalDur)
+                    latestOnSavePosition(finalPos)
                 }
             }
             (hostView as? NSObject)?.performSelector(NSSelectorFromString("stopStream"))

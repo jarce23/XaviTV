@@ -68,6 +68,7 @@ import java.io.File
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
 import kotlin.math.abs
@@ -75,10 +76,26 @@ import kotlin.math.abs
 private const val VLC_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-private const val LIVE_CACHING_MS = 300
-private const val VOD_CACHING_MS = 600
+private const val LIVE_CACHING_MS = 600
+private const val VOD_CACHING_MS = 1200
 private const val MAX_AUTO_RETRIES = 3
 private const val FULLSCREEN_CONTROLS_HIDE_DELAY_MS = 3_000L
+private const val PERIODIC_VOD_SAVE_MS = 10_000L
+
+/** Controlador ligero para atajos de teclado de escritorio desde Window.onPreviewKeyEvent. */
+class DesktopPlayerShortcuts(
+    val onTogglePlayPause: () -> Unit,
+    val onSeekByMs: (Long) -> Unit,
+    val onAdjustVolume: (Float) -> Unit,
+    val onToggleMute: () -> Unit,
+    val onReconnect: () -> Unit,
+    val onSaveBeforeExit: () -> Unit,
+)
+
+object ActiveDesktopPlayerBridge {
+    @Volatile
+    var shortcuts: DesktopPlayerShortcuts? = null
+}
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
@@ -110,7 +127,13 @@ fun DesktopPlayerScreen(
     var videoResolutionText by remember { mutableStateOf("") }
     var currentPosMs by remember { mutableLongStateOf(0L) }
     var totalDurationMs by remember { mutableLongStateOf(0L) }
+    var isDraggingSlider by remember { mutableStateOf(false) }
+    var sliderDragFraction by remember { mutableFloatStateOf(0f) }
     var seekApplied by remember { mutableStateOf(false) }
+
+    val latestPosMsRef = remember(url) { AtomicLong(0L) }
+    val latestDurMsRef = remember(url) { AtomicLong(0L) }
+    val lastUiTimeUpdateRef = remember(url) { AtomicLong(0L) }
 
     // Estado de visibilidad de controles para el modo inmersivo en pantalla completa
     var controlsVisible by remember { mutableStateOf(true) }
@@ -250,6 +273,94 @@ fun DesktopPlayerScreen(
         }
     }
 
+    fun saveCurrentVodProgress(persistImmediately: Boolean, notifyUi: Boolean) {
+        if (isLive || resumeKey.isEmpty()) return
+        val pos = latestPosMsRef.get().coerceAtLeast(currentPosMs)
+        val dur = latestDurMsRef.get().coerceAtLeast(totalDurationMs)
+        if (pos > 2_000L) {
+            appState.store.savePlaybackProgress(
+                id = resumeKey,
+                positionMs = pos,
+                durationMs = dur,
+                persistImmediately = persistImmediately,
+                notifyUi = notifyUi
+            )
+        }
+    }
+
+    // Guardado periódico pasivo en segundo plano cada 10s para VOD
+    LaunchedEffect(url, isLive) {
+        if (isLive || resumeKey.isEmpty()) return@LaunchedEffect
+        while (true) {
+            delay(PERIODIC_VOD_SAVE_MS)
+            if (isPlaying) {
+                saveCurrentVodProgress(persistImmediately = false, notifyUi = false)
+            }
+        }
+    }
+
+    // Registro de atajos de teclado globales de ventana (funciona incluso con foco sobre SwingPanel/LibVLC)
+    DisposableEffect(url, isLive) {
+        val handler = DesktopPlayerShortcuts(
+            onTogglePlayPause = {
+                notifyMouseActivity()
+                val mp = vlcComponentRef.value?.mediaPlayer()
+                if (mp != null) {
+                    if (isPlaying) {
+                        mp.controls().pause()
+                        saveCurrentVodProgress(persistImmediately = false, notifyUi = true)
+                    } else {
+                        mp.controls().play()
+                    }
+                }
+            },
+            onSeekByMs = { deltaMs ->
+                if (!isLive) {
+                    notifyMouseActivity()
+                    val dur = latestDurMsRef.get().coerceAtLeast(totalDurationMs)
+                    val base = latestPosMsRef.get().coerceAtLeast(currentPosMs)
+                    val target = if (dur > 0L) (base + deltaMs).coerceIn(0L, dur) else (base + deltaMs).coerceAtLeast(0L)
+                    latestPosMsRef.set(target)
+                    currentPosMs = target
+                    runCatching { vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(target) }
+                }
+            },
+            onAdjustVolume = { delta ->
+                notifyMouseActivity()
+                val nextVol = (volume + delta).coerceIn(0f, 1f)
+                volume = nextVol
+                isMuted = nextVol == 0f
+                runCatching {
+                    vlcComponentRef.value?.mediaPlayer()?.audio()?.setMute(isMuted)
+                    vlcComponentRef.value?.mediaPlayer()?.audio()?.setVolume((nextVol * 100).toInt())
+                }
+            },
+            onToggleMute = {
+                notifyMouseActivity()
+                isMuted = !isMuted
+                runCatching {
+                    vlcComponentRef.value?.mediaPlayer()?.audio()?.setMute(isMuted)
+                }
+            },
+            onReconnect = {
+                notifyMouseActivity()
+                autoRetryCount = 0
+                errorMessage = null
+                statusBanner = "Reconectando stream..."
+                reloadTrigger++
+            },
+            onSaveBeforeExit = {
+                saveCurrentVodProgress(persistImmediately = true, notifyUi = false)
+            }
+        )
+        ActiveDesktopPlayerBridge.shortcuts = handler
+        onDispose {
+            if (ActiveDesktopPlayerBridge.shortcuts === handler) {
+                ActiveDesktopPlayerBridge.shortcuts = null
+            }
+        }
+    }
+
     // Ocultar aviso de reproductor externo tras 4 segundos
     LaunchedEffect(externalNotice) {
         if (externalNotice != null) {
@@ -327,49 +438,55 @@ fun DesktopPlayerScreen(
                         mediaPlayer().events().addMediaPlayerEventListener(
                             object : MediaPlayerEventAdapter() {
                                 override fun opening(mediaPlayer: MediaPlayer) {
-                                    isBuffering = true
+                                    SwingUtilities.invokeLater { isBuffering = true }
                                 }
 
                                 override fun buffering(mediaPlayer: MediaPlayer, newCache: Float) {
-                                    if (newCache < 100f) {
-                                        isBuffering = true
-                                        statusBanner = "Búfer rápido (${newCache.toInt()}%)..."
-                                    } else {
-                                        isBuffering = false
-                                        statusBanner = null
+                                    SwingUtilities.invokeLater {
+                                        if (newCache < 100f) {
+                                            isBuffering = true
+                                            statusBanner = "Búfer rápido (${newCache.toInt()}%)..."
+                                        } else {
+                                            isBuffering = false
+                                            statusBanner = null
+                                        }
                                     }
                                 }
 
                                 override fun playing(mediaPlayer: MediaPlayer) {
-                                    isBuffering = false
-                                    isPlaying = true
-                                    statusBanner = null
-                                    errorMessage = null
-                                    autoRetryCount = 0
+                                    SwingUtilities.invokeLater {
+                                        isBuffering = false
+                                        isPlaying = true
+                                        statusBanner = null
+                                        errorMessage = null
+                                        autoRetryCount = 0
 
-                                    if (!isLive && !seekApplied && resumeKey.isNotEmpty()) {
-                                        seekApplied = true
-                                        val savedProg = appState.store.getPlaybackProgress(resumeKey)
-                                        val savedPos = savedProg?.resumePositionMs
-                                            ?: appState.store.getResumePosition(resumeKey)
-                                        if (savedPos > 0L) {
-                                            runCatching { mediaPlayer.controls().setTime(savedPos) }
+                                        if (!isLive && !seekApplied && resumeKey.isNotEmpty()) {
+                                            seekApplied = true
+                                            val savedProg = appState.store.getPlaybackProgress(resumeKey)
+                                            val savedPos = savedProg?.resumePositionMs
+                                                ?: appState.store.getResumePosition(resumeKey)
+                                            if (savedPos > 0L) {
+                                                latestPosMsRef.set(savedPos)
+                                                currentPosMs = savedPos
+                                                runCatching { mediaPlayer.controls().setTime(savedPos) }
+                                            }
                                         }
                                     }
                                 }
 
                                 override fun paused(mediaPlayer: MediaPlayer) {
-                                    isPlaying = false
+                                    SwingUtilities.invokeLater { isPlaying = false }
                                 }
 
                                 override fun videoOutput(mediaPlayer: MediaPlayer, newCount: Int) {
-                                    isBuffering = false
-                                    statusBanner = null
                                     val dim = runCatching { mediaPlayer.video().videoDimension() }.getOrNull()
-                                    if (dim != null && dim.width > 0 && dim.height > 0) {
-                                        videoResolutionText = "${dim.width}×${dim.height}"
-                                    }
                                     SwingUtilities.invokeLater {
+                                        isBuffering = false
+                                        statusBanner = null
+                                        if (dim != null && dim.width > 0 && dim.height > 0) {
+                                            videoResolutionText = "${dim.width}×${dim.height}"
+                                        }
                                         swingContainerRef.value?.let { container ->
                                             container.revalidate()
                                             container.repaint()
@@ -378,21 +495,45 @@ fun DesktopPlayerScreen(
                                 }
 
                                 override fun timeChanged(mediaPlayer: MediaPlayer, newTime: Long) {
-                                    currentPosMs = newTime.coerceAtLeast(0L)
-                                    if (isBuffering && newTime > 0L) {
-                                        isBuffering = false
-                                        statusBanner = null
+                                    val safeTime = newTime.coerceAtLeast(0L)
+                                    latestPosMsRef.set(safeTime)
+                                    val now = System.currentTimeMillis()
+                                    val prevUpdate = lastUiTimeUpdateRef.get()
+                                    // Evita 4+ recomposiciones/seg cuando las barras están ocultas en pantalla completa
+                                    val minInterval = if (controlsVisible || !isFullscreen) 400L else 1_200L
+                                    if (now - prevUpdate >= minInterval && lastUiTimeUpdateRef.compareAndSet(prevUpdate, now)) {
+                                        SwingUtilities.invokeLater {
+                                            if (!isDraggingSlider) {
+                                                currentPosMs = safeTime
+                                            }
+                                            if (isBuffering && safeTime > 0L) {
+                                                isBuffering = false
+                                                statusBanner = null
+                                            }
+                                        }
                                     }
                                 }
 
                                 override fun lengthChanged(mediaPlayer: MediaPlayer, newLength: Long) {
                                     if (newLength > 0L && newLength < Long.MAX_VALUE / 2) {
-                                        totalDurationMs = newLength
+                                        latestDurMsRef.set(newLength)
+                                        SwingUtilities.invokeLater { totalDurationMs = newLength }
+                                    }
+                                }
+
+                                override fun finished(mediaPlayer: MediaPlayer) {
+                                    SwingUtilities.invokeLater {
+                                        if (isLive) {
+                                            handleStreamFailure("Corte de emisión en directo")
+                                        } else {
+                                            isPlaying = false
+                                            saveCurrentVodProgress(persistImmediately = true, notifyUi = true)
+                                        }
                                     }
                                 }
 
                                 override fun error(mediaPlayer: MediaPlayer) {
-                                    scope.launch {
+                                    SwingUtilities.invokeLater {
                                         handleStreamFailure("Error de flujo o contenedor en LibVLC")
                                     }
                                 }
@@ -458,21 +599,13 @@ fun DesktopPlayerScreen(
         }
     }
 
-    // Guardado de progreso totalmente desacoplado: sólo se ejecuta pasivamente al salir del reproductor (onDispose)
+    // Guardado síncrono seguro y liberación de recursos nativos LibVLC al salir del reproductor
     DisposableEffect(Unit) {
         onDispose {
+            saveCurrentVodProgress(persistImmediately = true, notifyUi = true)
             val comp = vlcComponentRef.value
             vlcComponentRef.value = null
             if (comp != null) {
-                if (!isLive && resumeKey.isNotEmpty() && currentPosMs > 0L) {
-                    appState.store.savePlaybackProgress(
-                        id = resumeKey,
-                        positionMs = currentPosMs,
-                        durationMs = totalDurationMs,
-                        persistImmediately = false,
-                        notifyUi = true
-                    )
-                }
                 Thread {
                     runCatching {
                         comp.mediaPlayer().controls().stop()
@@ -838,15 +971,28 @@ fun DesktopPlayerScreen(
                     }
 
                     if (!isLive && totalDurationMs > 0L) {
+                        val sliderFraction = if (isDraggingSlider) {
+                            sliderDragFraction
+                        } else {
+                            (currentPosMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
+                        }
                         Slider(
-                            value = (currentPosMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f),
+                            value = sliderFraction,
                             onValueChange = { fraction ->
                                 notifyMouseActivity()
-                                val targetMs = (fraction * totalDurationMs).toLong()
+                                isDraggingSlider = true
+                                sliderDragFraction = fraction
+                            },
+                            onValueChangeFinished = {
+                                val targetMs = (sliderDragFraction * totalDurationMs).toLong().coerceIn(0L, totalDurationMs)
+                                latestPosMsRef.set(targetMs)
                                 currentPosMs = targetMs
+                                isDraggingSlider = false
                                 runCatching {
                                     vlcComponentRef.value?.mediaPlayer()?.controls()?.setTime(targetMs)
                                 }
+                                saveCurrentVodProgress(persistImmediately = false, notifyUi = true)
+                                notifyMouseActivity()
                             },
                             colors = SliderDefaults.colors(
                                 thumbColor = GoldAccent,
@@ -1007,6 +1153,15 @@ object VlcRuntimeManager {
                     sharedFactory = it
                 }
             }
+        }
+    }
+
+    /** Libera la factoría nativa de LibVLC al cerrar la ventana de la aplicación. */
+    fun shutdown() {
+        val factory = sharedFactory
+        sharedFactory = null
+        if (factory != null) {
+            runCatching { factory.release() }
         }
     }
 

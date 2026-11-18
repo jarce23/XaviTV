@@ -42,13 +42,19 @@ import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.statement.readBytes
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -150,7 +156,25 @@ class SharedAppState {
 
     private val cacheMutex = Mutex()
     private val imageCache: MutableMap<String, CachedImageEntry> = linkedMapOf()
+    private val inFlightImages: MutableMap<String, Deferred<ImageBitmap?>> = hashMapOf()
     private var currentCacheBytes: Int = 0
+
+    fun savePlaybackProgressAsync(
+        id: String,
+        positionMs: Long,
+        durationMs: Long,
+        notifyUi: Boolean = false
+    ) {
+        if (id.isBlank() || positionMs <= 2_000L) return
+        backgroundScope.launch(Dispatchers.IO) {
+            store.savePlaybackProgressBg(
+                id = id,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                notifyUi = notifyUi
+            )
+        }
+    }
 
     private var currentRepoPlaylist: Playlist? = null
     private var currentRepo: XtreamRepository? = null
@@ -309,55 +333,79 @@ class SharedAppState {
     }
 
     fun clearImageCache() {
-        imageCache.clear()
-        currentCacheBytes = 0
-        trimPlatformMemory()
+        backgroundScope.launch(Dispatchers.Default) {
+            cacheMutex.withLock {
+                imageCache.clear()
+                inFlightImages.clear()
+                currentCacheBytes = 0
+            }
+            trimPlatformMemory()
+        }
     }
 
     suspend fun loadImage(url: String, maxDimension: Int = 280): ImageBitmap? {
         val clean = url.trim()
         if (clean.isEmpty()) return null
 
-        cacheMutex.withLock {
+        val existingOrDeferred: Pair<ImageBitmap?, Deferred<ImageBitmap?>?> = cacheMutex.withLock {
             val existing: CachedImageEntry? = imageCache.remove(clean)
             if (existing != null) {
                 imageCache[clean] = existing
-                return existing.image
+                return@withLock existing.image to null
             }
-        }
+            val inFlight = inFlightImages[clean]
+            if (inFlight != null && inFlight.isActive) {
+                return@withLock null to inFlight
+            }
+            val created = backgroundScope.async(Dispatchers.IO) {
+                runCatching {
+                    val bytes = httpClient.get(clean) {
+                        header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X; XaviTV/1.1)")
+                    }.readBytes()
+                    if (bytes.isEmpty() || bytes.size > 4 * 1024 * 1024) return@runCatching null
 
-        return withContext(Dispatchers.Default) {
-            runCatching {
-                val bytes = httpClient.get(clean) {
-                    header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X; XaviTV/1.1)")
-                }.readBytes()
-                if (bytes.isEmpty() || bytes.size > 4 * 1024 * 1024) return@runCatching null
+                    val decodedImage = withContext(Dispatchers.Default) {
+                        decodeImageBytes(bytes, maxDimension)
+                    } ?: return@runCatching null
+                    val estimatedBytes = (decodedImage.width * decodedImage.height * 4).coerceAtLeast(1024)
 
-                val decodedImage = decodeImageBytes(bytes, maxDimension) ?: return@runCatching null
-                val estimatedBytes = (decodedImage.width * decodedImage.height * 4).coerceAtLeast(1024)
-
-                cacheMutex.withLock {
-                    var evictedAny = false
-                    while (
-                        imageCache.isNotEmpty() &&
-                        (imageCache.size >= MAX_IMAGE_CACHE_ENTRIES ||
-                            currentCacheBytes + estimatedBytes > MAX_IMAGE_CACHE_BYTES)
-                    ) {
-                        val oldestKey: String = imageCache.keys.firstOrNull() ?: break
-                        val removed: CachedImageEntry? = imageCache.remove(oldestKey)
-                        if (removed != null) {
-                            currentCacheBytes = (currentCacheBytes - removed.sizeInBytes).coerceAtLeast(0)
-                            evictedAny = true
+                    cacheMutex.withLock {
+                        var evictedAny = false
+                        while (
+                            imageCache.isNotEmpty() &&
+                            (imageCache.size >= MAX_IMAGE_CACHE_ENTRIES ||
+                                currentCacheBytes + estimatedBytes > MAX_IMAGE_CACHE_BYTES)
+                        ) {
+                            val oldestKey: String = imageCache.keys.firstOrNull() ?: break
+                            val removed: CachedImageEntry? = imageCache.remove(oldestKey)
+                            if (removed != null) {
+                                currentCacheBytes = (currentCacheBytes - removed.sizeInBytes).coerceAtLeast(0)
+                                evictedAny = true
+                            }
+                        }
+                        imageCache[clean] = CachedImageEntry(decodedImage, estimatedBytes)
+                        currentCacheBytes += estimatedBytes
+                        if (evictedAny && imageCache.size % 12 == 0) {
+                            trimPlatformMemory()
                         }
                     }
-                    imageCache[clean] = CachedImageEntry(decodedImage, estimatedBytes)
-                    currentCacheBytes += estimatedBytes
-                    if (evictedAny && imageCache.size % 12 == 0) {
-                        trimPlatformMemory()
-                    }
+                    decodedImage
+                }.getOrNull()
+            }
+            inFlightImages[clean] = created
+            null to created
+        }
+
+        existingOrDeferred.first?.let { return it }
+        val deferred = existingOrDeferred.second ?: return null
+        return try {
+            deferred.await()
+        } finally {
+            cacheMutex.withLock {
+                if (inFlightImages[clean] === deferred) {
+                    inFlightImages.remove(clean)
                 }
-                decodedImage
-            }.getOrNull()
+            }
         }
     }
 }
@@ -530,7 +578,6 @@ fun IosXaviTVApp() {
                             else -> appState.store.getResumePosition(current.resumeKey)
                         }
                     }
-                    val playerIoScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
                     NativeVideoPlayer(
                         url = current.url,
                         title = current.title,
@@ -541,26 +588,22 @@ fun IosXaviTVApp() {
                         onSavePosition = { posMs ->
                             if (!current.isLive && current.resumeKey.isNotEmpty() && posMs > 2_000L) {
                                 val existingDur = appState.store.getPlaybackProgress(current.resumeKey)?.durationMs ?: 0L
-                                playerIoScope.launch(Dispatchers.IO) {
-                                    appState.store.savePlaybackProgressBg(
-                                        id = current.resumeKey,
-                                        positionMs = posMs,
-                                        durationMs = existingDur,
-                                        notifyUi = true,
-                                    )
-                                }
+                                appState.savePlaybackProgressAsync(
+                                    id = current.resumeKey,
+                                    positionMs = posMs,
+                                    durationMs = existingDur,
+                                    notifyUi = true,
+                                )
                             }
                         },
                         onSaveProgress = { posMs, durMs ->
                             if (!current.isLive && current.resumeKey.isNotEmpty() && posMs > 2_000L) {
-                                playerIoScope.launch(Dispatchers.IO) {
-                                    appState.store.savePlaybackProgressBg(
-                                        id = current.resumeKey,
-                                        positionMs = posMs,
-                                        durationMs = durMs,
-                                        notifyUi = false,
-                                    )
-                                }
+                                appState.savePlaybackProgressAsync(
+                                    id = current.resumeKey,
+                                    positionMs = posMs,
+                                    durationMs = durMs,
+                                    notifyUi = false,
+                                )
                             }
                         },
                         onClose = { popBack() }
@@ -1023,6 +1066,9 @@ fun IosPlaylistsScreen(onConnected: () -> Unit) {
         }
     }
 
+    val isRefreshing by appState.isRefreshing.collectAsState()
+    val refreshFeedback by appState.refreshFeedback.collectAsState()
+
     @Composable
     fun PlaylistItemRow(pl: Playlist) {
         val isCurrent = activeName == pl.name
@@ -1093,7 +1139,7 @@ fun IosPlaylistsScreen(onConnected: () -> Unit) {
             }
             IconButton(
                 onClick = { appState.refreshActivePlaylist(pl) },
-                enabled = !appState.isRefreshing.value
+                enabled = !isRefreshing
             ) {
                 Icon(
                     Icons.Default.Refresh,
@@ -1302,9 +1348,6 @@ fun IosPlaylistsScreen(onConnected: () -> Unit) {
             }
         }
     }
-
-    val isRefreshing by appState.isRefreshing.collectAsState()
-    val refreshFeedback by appState.refreshFeedback.collectAsState()
 
     IosAppScaffold(
         title = "XaviTV · iOS / iPadOS",
@@ -1640,7 +1683,7 @@ fun IosHomeScreen(
                     ) {
                         IosTabletHeroTile(
                             title = "TV en directo",
-                            subtitle = "Canales TDT e IPTV con AVPlayer, PiP y zapping rápido",
+                            subtitle = "Canales TDT e IPTV con VLCKit nativo y zapping rápido",
                             badge = "LIVE TV",
                             icon = Icons.Default.LiveTv,
                             onClick = onOpenLive,
@@ -1732,7 +1775,7 @@ fun IosHomeScreen(
                     item {
                         IosHomeCard(
                             title = "TV en directo",
-                            subtitle = "Canales TDT e IPTV con reproductor nativo AVPlayer y PiP",
+                            subtitle = "Canales TDT e IPTV con reproductor nativo VLCKit",
                             badge = "LIVE TV",
                             icon = Icons.Default.LiveTv,
                             onClick = onOpenLive
@@ -1991,6 +2034,7 @@ private fun RecentLiveChannelCard(
 }
 
 // ─── 3. CATÁLOGO RESPONSIVE (Doble Panel y Grids Multi-Columna en iPad) ─
+@OptIn(FlowPreview::class)
 @Composable
 fun IosCatalogScreen(
     kind: CatalogKind,
@@ -2011,6 +2055,15 @@ fun IosCatalogScreen(
     var categories by remember { mutableStateOf<List<Category>>(emptyList()) }
     var selectedCategory by remember(kind) { mutableStateOf(appState.getSelectedCategory(kind)) }
     var searchQuery by remember { mutableStateOf("") }
+    var debouncedQuery by remember { mutableStateOf("") }
+    LaunchedEffect(searchQuery) {
+        if (searchQuery.isBlank()) {
+            debouncedQuery = ""
+        } else {
+            delay(150L)
+            debouncedQuery = searchQuery
+        }
+    }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -2021,7 +2074,7 @@ fun IosCatalogScreen(
     var favRefresh by remember { mutableIntStateOf(0) }
 
     // Refresco reactivo transparente: observa catalogVersion (StateFlow) para repintar automáticamente
-    // el catálogo cuando la sincronización en segundo plano detecta cambios sin bloquear ni parpadear la UI.
+    // el catálogo leyendo desde la caché ya actualizada en memoria (sin forzar descargas redundantes).
     LaunchedEffect(kind, catalogVersion) {
         val hasExistingContent = when (kind) {
             CatalogKind.LIVE -> liveItems.isNotEmpty()
@@ -2035,11 +2088,10 @@ fun IosCatalogScreen(
         error = null
         val allCat = Category("ALL", "Todos")
         val recentCat = Category("RECENT", "⭐ Vistos recientemente")
-        val force = catalogVersion > 0
         runCatching {
             when (kind) {
                 CatalogKind.LIVE -> {
-                    val (cats, items) = repo.live(forceRefresh = force)
+                    val (cats, items) = repo.live(forceRefresh = false)
                     categories = listOf(allCat, recentCat) + cats
                     liveItems = items
                     if (selectedLiveChannel == null || items.none { it.streamId == selectedLiveChannel?.streamId }) {
@@ -2049,19 +2101,19 @@ fun IosCatalogScreen(
                     }
                 }
                 CatalogKind.MOVIES -> {
-                    val (cats, items) = repo.vod(forceRefresh = force)
+                    val (cats, items) = repo.vod(forceRefresh = false)
                     categories = listOf(allCat, recentCat) + cats
                     movieItems = items
                 }
                 CatalogKind.SERIES -> {
-                    val (cats, items) = repo.series(forceRefresh = force)
+                    val (cats, items) = repo.series(forceRefresh = false)
                     categories = listOf(allCat, recentCat) + cats
                     seriesItems = items
                 }
                 CatalogKind.FAVORITES -> {
-                    liveItems = runCatching { repo.live(forceRefresh = force).second }.getOrDefault(emptyList())
-                    movieItems = runCatching { repo.vod(forceRefresh = force).second }.getOrDefault(emptyList())
-                    seriesItems = runCatching { repo.series(forceRefresh = force).second }.getOrDefault(emptyList())
+                    liveItems = runCatching { repo.live(forceRefresh = false).second }.getOrDefault(emptyList())
+                    movieItems = runCatching { repo.vod(forceRefresh = false).second }.getOrDefault(emptyList())
+                    seriesItems = runCatching { repo.series(forceRefresh = false).second }.getOrDefault(emptyList())
                 }
             }
         }.onFailure { e ->
@@ -2096,31 +2148,31 @@ fun IosCatalogScreen(
         recentSeriesIds.mapNotNull { map[it] }
     }
 
-    val filteredLive = remember(liveItems, selectedCategory, searchQuery, recentLiveList) {
+    val filteredLive = remember(liveItems, selectedCategory, debouncedQuery, recentLiveList) {
         val base = when (selectedCategory) {
             "ALL" -> liveItems
             "RECENT" -> recentLiveList
             else -> liveItems.filter { it.categoryId == selectedCategory }
         }
-        val q = searchQuery.trim()
+        val q = debouncedQuery.trim()
         if (q.isEmpty()) base else base.filter { it.name.matchesSearch(q) }
     }
-    val filteredMovies = remember(movieItems, selectedCategory, searchQuery, recentMovieList) {
+    val filteredMovies = remember(movieItems, selectedCategory, debouncedQuery, recentMovieList) {
         val base = when (selectedCategory) {
             "ALL" -> movieItems
             "RECENT" -> recentMovieList
             else -> movieItems.filter { it.categoryId == selectedCategory }
         }
-        val q = searchQuery.trim()
+        val q = debouncedQuery.trim()
         if (q.isEmpty()) base else base.filter { it.name.matchesSearch(q) }
     }
-    val filteredSeries = remember(seriesItems, selectedCategory, searchQuery, recentSeriesList) {
+    val filteredSeries = remember(seriesItems, selectedCategory, debouncedQuery, recentSeriesList) {
         val base = when (selectedCategory) {
             "ALL" -> seriesItems
             "RECENT" -> recentSeriesList
             else -> seriesItems.filter { it.categoryId == selectedCategory }
         }
-        val q = searchQuery.trim()
+        val q = debouncedQuery.trim()
         if (q.isEmpty()) base else base.filter { it.name.matchesSearch(q) }
     }
 
@@ -2176,7 +2228,7 @@ fun IosCatalogScreen(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    "LIVE • Pulsa para abrir en AVPlayer",
+                    "LIVE • Pulsa para reproducir con VLCKit",
                     fontSize = 11.sp,
                     color = GoldChampagne,
                     maxLines = 1,
@@ -2397,6 +2449,8 @@ fun IosCatalogScreen(
                                             )
                                             LaunchedEffect(gridState) {
                                                 snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                                    .distinctUntilChanged()
+                                                    .debounce(400L)
                                                     .collect { (idx, off) ->
                                                         appState.saveScrollPosition(kind, selectedCategory, idx, off)
                                                     }
@@ -2503,7 +2557,7 @@ fun IosCatalogScreen(
                                                         overflow = TextOverflow.Ellipsis
                                                     )
                                                     Text(
-                                                        "Reproducción nativa AVPlayer con Picture-in-Picture (PiP) y AirPlay",
+                                                        "Reproducción nativa VLCKit de baja latencia (MPEG-TS y HLS)",
                                                         fontSize = 12.sp,
                                                         color = TextSilverGray
                                                     )
@@ -2563,6 +2617,8 @@ fun IosCatalogScreen(
                                         )
                                         LaunchedEffect(listState) {
                                             snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+                                                .distinctUntilChanged()
+                                                .debounce(400L)
                                                 .collect { (idx, off) ->
                                                     appState.saveScrollPosition(kind, selectedCategory, idx, off)
                                                 }
@@ -2640,6 +2696,8 @@ fun IosCatalogScreen(
                                     )
                                     LaunchedEffect(gridState) {
                                         snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                            .distinctUntilChanged()
+                                            .debounce(400L)
                                             .collect { (idx, off) ->
                                                 appState.saveScrollPosition(kind, selectedCategory, idx, off)
                                             }
@@ -2728,6 +2786,8 @@ fun IosCatalogScreen(
                                     )
                                     LaunchedEffect(gridState) {
                                         snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                            .distinctUntilChanged()
+                                            .debounce(400L)
                                             .collect { (idx, off) ->
                                                 appState.saveScrollPosition(kind, selectedCategory, idx, off)
                                             }
@@ -2808,33 +2868,89 @@ fun IosCatalogScreen(
                             }
                             kind == CatalogKind.FAVORITES -> {
                                 val favLiveIds = remember(favRefresh) { store.favorites("live") }
-                                val favLiveList = filteredLive.filter { favLiveIds.contains(it.streamId) }
-                                key(kind, selectedCategory) {
-                                    val savedScroll = remember { appState.getScrollPosition(kind, selectedCategory) }
-                                    val gridState = rememberLazyGridState(
-                                        initialFirstVisibleItemIndex = savedScroll.first,
-                                        initialFirstVisibleItemScrollOffset = savedScroll.second
-                                    )
-                                    LaunchedEffect(gridState) {
-                                        snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
-                                            .collect { (idx, off) ->
-                                                appState.saveScrollPosition(kind, selectedCategory, idx, off)
-                                            }
-                                    }
-                                    LazyVerticalGrid(
-                                        state = gridState,
-                                        columns = GridCells.Adaptive(if (isTablet) 240.dp else 160.dp),
-                                        contentPadding = PaddingValues(14.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                                    ) {
-                                        items(favLiveList, key = { it.streamId }) { ch ->
-                                            LiveChannelCard(
-                                                ch = ch,
-                                                isFav = true,
-                                                isSelected = false,
-                                                isTablet = isTablet
+                                val favVodIds = remember(favRefresh) { store.favorites("vod") }
+                                val favSeriesIds = remember(favRefresh) { store.favorites("series") }
+                                val favLiveList = remember(filteredLive, favLiveIds) { filteredLive.filter { favLiveIds.contains(it.streamId) } }
+                                val favVodList = remember(filteredMovies, favVodIds) { filteredMovies.filter { favVodIds.contains(it.streamId) } }
+                                val favSeriesList = remember(filteredSeries, favSeriesIds) { filteredSeries.filter { favSeriesIds.contains(it.seriesId) } }
+
+                                if (favLiveList.isEmpty() && favVodList.isEmpty() && favSeriesList.isEmpty()) {
+                                    Box(Modifier.fillMaxSize().padding(28.dp), contentAlignment = Alignment.Center) {
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Icon(Icons.Default.StarBorder, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(44.dp))
+                                            Text(
+                                                "Todavía no tienes favoritos guardados",
+                                                color = TextPureWhite,
+                                                fontWeight = FontWeight.Bold
                                             )
+                                            Text(
+                                                "Marca canales, películas o series con la estrella ★ para acceder rápidamente aquí.",
+                                                color = TextSilverGray,
+                                                fontSize = 12.sp,
+                                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    LazyColumn(
+                                        contentPadding = PaddingValues(14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(18.dp),
+                                        modifier = Modifier.fillMaxSize()
+                                    ) {
+                                        if (favLiveList.isNotEmpty()) {
+                                            item(key = "fav_live_section") {
+                                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                    Text("Canales en directo (${favLiveList.size})", fontWeight = FontWeight.Bold, color = GoldChampagne)
+                                                    favLiveList.forEach { ch ->
+                                                        LiveChannelCard(
+                                                            ch = ch,
+                                                            isFav = true,
+                                                            isSelected = false,
+                                                            isTablet = isTablet
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (favVodList.isNotEmpty()) {
+                                            item(key = "fav_vod_section") {
+                                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                    Text("Películas (${favVodList.size})", fontWeight = FontWeight.Bold, color = GoldChampagne)
+                                                    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                                        items(favVodList, key = { "fav_vod_${it.streamId}" }) { m ->
+                                                            IosPosterCard(
+                                                                title = m.name,
+                                                                image = m.icon,
+                                                                subtitle = m.rating,
+                                                                isFavorite = true,
+                                                                progress = resolveVodProgressFraction(progressMap, m.streamId),
+                                                                modifier = Modifier.width(if (isTablet) 145.dp else 120.dp),
+                                                                onClick = { onOpenMovie(m) }
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (favSeriesList.isNotEmpty()) {
+                                            item(key = "fav_series_section") {
+                                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                    Text("Series (${favSeriesList.size})", fontWeight = FontWeight.Bold, color = GoldChampagne)
+                                                    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                                        items(favSeriesList, key = { "fav_ser_${it.seriesId}" }) { s ->
+                                                            IosPosterCard(
+                                                                title = s.name,
+                                                                image = s.cover,
+                                                                subtitle = s.rating,
+                                                                isFavorite = true,
+                                                                progress = resolveSeriesProgressFraction(progressMap, s.seriesId),
+                                                                modifier = Modifier.width(if (isTablet) 145.dp else 120.dp),
+                                                                onClick = { onOpenSeries(s) }
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -2858,6 +2974,7 @@ fun IosMovieDetailScreen(
     val store = remember { appState.store }
     val progressMap by store.playbackProgressFlow.collectAsState()
     var info by remember { mutableStateOf<VodInfoResponse?>(null) }
+    var isFav by remember(movie.streamId) { mutableStateOf(store.favorites("vod").contains(movie.streamId)) }
 
     LaunchedEffect(movie.streamId) {
         runCatching { repo.vodInfo(movie.streamId) }.onSuccess { info = it }
@@ -2940,14 +3057,14 @@ fun IosMovieDetailScreen(
                                 Icon(Icons.Default.PlayArrow, contentDescription = null)
                                 Spacer(Modifier.width(6.dp))
                                 Text(
-                                    if (resumeMs > 0L) "Continuar (${resumeMs / 60000} min)" else "Reproducir con AVPlayer (PiP)",
+                                    if (resumeMs > 0L) "Continuar (${resumeMs / 60000} min)" else "Reproducir con VLCKit",
                                     fontWeight = FontWeight.ExtraBold
                                 )
                             }
                             if (resumeMs > 0L) {
                                 OutlinedButton(
                                     onClick = {
-                                        store.savePlaybackProgress(resumeKey, 0L, movieProg?.durationMs ?: 0L)
+                                        store.savePlaybackProgress(resumeKey, 0L, 0L)
                                         onPlay(streamUrl, movie.name ?: "Película", resumeKey)
                                     },
                                     border = BorderStroke(1.dp, GoldAccent),
@@ -2961,15 +3078,18 @@ fun IosMovieDetailScreen(
                                 }
                             }
                             OutlinedButton(
-                                onClick = { store.toggleFavorite("vod", movie.streamId) },
+                                onClick = {
+                                    store.toggleFavorite("vod", movie.streamId)
+                                    isFav = store.favorites("vod").contains(movie.streamId)
+                                },
                                 border = BorderStroke(1.dp, GoldAccent),
                                 shape = RoundedCornerShape(12.dp),
                                 colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldChampagne),
                                 modifier = Modifier.height(48.dp)
                             ) {
-                                Icon(Icons.Default.Star, contentDescription = null, tint = GoldAccent)
+                                Icon(if (isFav) Icons.Default.Star else Icons.Default.StarBorder, contentDescription = null, tint = GoldAccent)
                                 Spacer(Modifier.width(6.dp))
-                                Text("Guardar en Favoritos")
+                                Text(if (isFav) "En Favoritos" else "Guardar en Favoritos")
                             }
                         }
                     }
@@ -3018,14 +3138,14 @@ fun IosMovieDetailScreen(
                         Icon(Icons.Default.PlayArrow, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            if (resumeMs > 0L) "Continuar (${resumeMs / 60000} min)" else "Reproducir con AVPlayer",
+                            if (resumeMs > 0L) "Continuar (${resumeMs / 60000} min)" else "Reproducir con VLCKit",
                             fontWeight = FontWeight.ExtraBold
                         )
                     }
                     if (resumeMs > 0L) {
                         OutlinedButton(
                             onClick = {
-                                store.savePlaybackProgress(resumeKey, 0L, movieProg?.durationMs ?: 0L)
+                                store.savePlaybackProgress(resumeKey, 0L, 0L)
                                 onPlay(streamUrl, movie.name ?: "Película", resumeKey)
                             },
                             border = BorderStroke(1.dp, GoldAccent),
@@ -3039,15 +3159,18 @@ fun IosMovieDetailScreen(
                         }
                     }
                     OutlinedButton(
-                        onClick = { store.toggleFavorite("vod", movie.streamId) },
+                        onClick = {
+                            store.toggleFavorite("vod", movie.streamId)
+                            isFav = store.favorites("vod").contains(movie.streamId)
+                        },
                         border = BorderStroke(1.dp, GoldAccent),
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldChampagne),
                         modifier = Modifier.fillMaxWidth().height(46.dp)
                     ) {
-                        Icon(Icons.Default.Star, contentDescription = null, tint = GoldAccent)
+                        Icon(if (isFav) Icons.Default.Star else Icons.Default.StarBorder, contentDescription = null, tint = GoldAccent)
                         Spacer(Modifier.width(6.dp))
-                        Text("Guardar en Favoritos")
+                        Text(if (isFav) "En Favoritos" else "Guardar en Favoritos")
                     }
                 }
             }
@@ -3179,6 +3302,15 @@ fun IosSearchScreen(
     val progressMap by store.playbackProgressFlow.collectAsState()
     val catalogVersion by appState.catalogRefreshVersion.collectAsState()
     var query by remember { mutableStateOf("") }
+    var debouncedQuery by remember { mutableStateOf("") }
+    LaunchedEffect(query) {
+        if (query.isBlank()) {
+            debouncedQuery = ""
+        } else {
+            delay(150L)
+            debouncedQuery = query
+        }
+    }
     var liveAll by remember { mutableStateOf<List<LiveStream>>(emptyList()) }
     var vodAll by remember { mutableStateOf<List<VodStream>>(emptyList()) }
     var seriesAll by remember { mutableStateOf<List<Series>>(emptyList()) }
@@ -3189,7 +3321,7 @@ fun IosSearchScreen(
         runCatching { repo.series() }.onSuccess { seriesAll = it.second }
     }
 
-    val q = query.trim()
+    val q = debouncedQuery.trim()
     val liveMatches = remember(q, liveAll) {
         if (q.length < 2) emptyList() else liveAll.filter { it.name.matchesSearch(q) }.take(30)
     }

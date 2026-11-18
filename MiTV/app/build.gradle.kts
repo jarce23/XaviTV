@@ -41,6 +41,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // Para pruebas se firma con la clave debug. Sustituir por tu keystore para publicar.
             signingConfig = signingConfigs.getByName("debug")

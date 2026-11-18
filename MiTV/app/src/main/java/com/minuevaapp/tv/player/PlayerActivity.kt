@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.SurfaceView
 import android.view.WindowManager
@@ -78,6 +79,8 @@ class PlayerActivity : Activity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var reconnectRunnable: Runnable? = null
+    private var bufferingWatchdogRunnable: Runnable? = null
+    private var progressSaveRunnable: Runnable? = null
     private var reconnectAttempts = 0
 
     private val prefs by lazy { applicationContext.getSharedPreferences("resume", MODE_PRIVATE) }
@@ -117,11 +120,7 @@ class PlayerActivity : Activity() {
         useHlsFallback = url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        WindowInsetsControllerCompat(window, window.decorView).apply {
-            hide(WindowInsetsCompat.Type.systemBars())
-            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        }
+        applyImmersiveSystemBars()
 
         val density = resources.displayMetrics.density
         val padH = (14 * density).toInt()
@@ -256,9 +255,105 @@ class PlayerActivity : Activity() {
         }
     }
 
+    private fun applyImmersiveSystemBars() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        applyImmersiveSystemBars()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val p = player
+        if (event.action == KeyEvent.ACTION_DOWN && p != null) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                    if (p.isPlaying) p.pause() else p.play()
+                    playerView.showController()
+                    return true
+                }
+                KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                    p.play()
+                    playerView.showController()
+                    return true
+                }
+                KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                    p.pause()
+                    playerView.showController()
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
+                    if (!isLive && !playerView.isControllerFullyVisible) {
+                        val dur = p.duration.takeIf { it > 0L && it != C.TIME_UNSET } ?: Long.MAX_VALUE
+                        p.seekTo((p.currentPosition + 10_000L).coerceAtMost(dur))
+                        playerView.showController()
+                        return true
+                    }
+                }
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MEDIA_REWIND -> {
+                    if (!isLive && !playerView.isControllerFullyVisible) {
+                        p.seekTo((p.currentPosition - 10_000L).coerceAtLeast(0L))
+                        playerView.showController()
+                        return true
+                    }
+                }
+                KeyEvent.KEYCODE_BACK -> {
+                    if (playerView.isControllerFullyVisible) {
+                        playerView.hideController()
+                        return true
+                    }
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     private fun cancelPendingCallbacks() {
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         reconnectRunnable = null
+        bufferingWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        bufferingWatchdogRunnable = null
+        progressSaveRunnable?.let { mainHandler.removeCallbacks(it) }
+        progressSaveRunnable = null
+    }
+
+    private fun startPeriodicProgressSaver() {
+        progressSaveRunnable?.let { mainHandler.removeCallbacks(it) }
+        if (isLive) return
+        val task = object : Runnable {
+            override fun run() {
+                if (isFinishing || isDestroyed) return
+                val p = player
+                if (p != null && p.isPlaying) {
+                    saveResumePosition(commitSync = false, notifyUi = false)
+                }
+                mainHandler.postDelayed(this, PERIODIC_PROGRESS_SAVE_MS)
+            }
+        }
+        progressSaveRunnable = task
+        mainHandler.postDelayed(task, PERIODIC_PROGRESS_SAVE_MS)
+    }
+
+    private fun armBufferingWatchdog() {
+        bufferingWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        if (!isLive) return
+        val watchdog = Runnable {
+            if (!isFinishing && !isDestroyed && player?.playbackState == Player.STATE_BUFFERING) {
+                scheduleReconnect(0L, "Stream bloqueado en buffering")
+            }
+        }
+        bufferingWatchdogRunnable = watchdog
+        mainHandler.postDelayed(watchdog, BUFFERING_STALL_TIMEOUT_MS)
+    }
+
+    private fun clearBufferingWatchdog() {
+        bufferingWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        bufferingWatchdogRunnable = null
     }
 
     private fun scheduleReconnect(resumePositionMs: Long, reason: String) {
@@ -292,6 +387,8 @@ class PlayerActivity : Activity() {
         cancelPendingCallbacks()
         player?.let { p ->
             playerListener?.let { p.removeListener(it) }
+            runCatching { p.stop() }
+            runCatching { p.clearVideoSurface() }
             p.release()
         }
         playerListener = null
@@ -489,13 +586,13 @@ class PlayerActivity : Activity() {
 
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 12_000,
-                /* maxBufferMs = */ 25_000,
-                /* bufferForPlaybackMs = */ 2_000,
-                /* bufferForPlaybackAfterRebufferMs = */ 4_000,
+                /* minBufferMs = */ if (isLive) 10_000 else 12_000,
+                /* maxBufferMs = */ if (isLive) 20_000 else 25_000,
+                /* bufferForPlaybackMs = */ if (isLive) 1_500 else 2_000,
+                /* bufferForPlaybackAfterRebufferMs = */ if (isLive) 3_500 else 4_000,
             )
             .setPrioritizeTimeOverSizeThresholds(true)
-            .setTargetBufferBytes(if (isLive) 16 * 1024 * 1024 else 20 * 1024 * 1024)
+            .setTargetBufferBytes(if (isLive) 14 * 1024 * 1024 else 20 * 1024 * 1024)
             .setBackBuffer(0, false)
             .build()
 
@@ -515,19 +612,48 @@ class PlayerActivity : Activity() {
             .also { p ->
                 playerView.player = p
                 val listener = object : Player.Listener {
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        if (isPlaying) {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            playerView.keepScreenOn = true
+                        } else if (!isLive) {
+                            // Ahorro de batería en móvil cuando un vídeo VOD queda en pausa
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            playerView.keepScreenOn = false
+                            saveResumePosition(commitSync = false, notifyUi = true)
+                        }
+                    }
+
                     override fun onPlaybackStateChanged(playbackState: Int) {
-                        if (playbackState == Player.STATE_READY) {
-                            reconnectAttempts = 0
-                        } else if (playbackState == Player.STATE_ENDED && isLive) {
-                            scheduleReconnect(0L, "Corte de emisión")
+                        when (playbackState) {
+                            Player.STATE_READY -> {
+                                reconnectAttempts = 0
+                                clearBufferingWatchdog()
+                            }
+                            Player.STATE_BUFFERING -> {
+                                armBufferingWatchdog()
+                            }
+                            Player.STATE_ENDED -> {
+                                clearBufferingWatchdog()
+                                if (isLive) {
+                                    scheduleReconnect(0L, "Corte de emisión")
+                                } else {
+                                    saveResumePosition(commitSync = true, notifyUi = true)
+                                }
+                            }
+                            else -> clearBufferingWatchdog()
                         }
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
+                        clearBufferingWatchdog()
                         val currentPos = p.currentPosition
 
                         // 1. Si estaba en modo HLS y dio error de manifiesto, volver a ProgressiveMediaSource
-                        if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED && useHlsFallback) {
+                        if ((error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED ||
+                                error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED) &&
+                            useHlsFallback
+                        ) {
                             useHlsFallback = false
                             initPlayer(startPositionMs = currentPos)
                             return
@@ -586,6 +712,8 @@ class PlayerActivity : Activity() {
                 if (!isLive && startPositionMs > 0L) p.seekTo(startPositionMs)
                 p.prepare()
                 p.playWhenReady = true
+                startPeriodicProgressSaver()
+                armBufferingWatchdog()
             }
     }
 
@@ -598,7 +726,7 @@ class PlayerActivity : Activity() {
             name.contains(".sw.")
     }
 
-    private fun saveResumePosition() {
+    private fun saveResumePosition(commitSync: Boolean = true, notifyUi: Boolean = true) {
         player?.let { p ->
             if (!isLive && url.isNotBlank()) {
                 val pos = p.currentPosition.coerceAtLeast(0L)
@@ -610,8 +738,8 @@ class PlayerActivity : Activity() {
                         id = progressKey,
                         positionMs = pos,
                         durationMs = dur,
-                        commitSync = false,
-                        notifyUi = true,
+                        commitSync = commitSync,
+                        notifyUi = notifyUi,
                     )
                 }
             }
@@ -621,12 +749,12 @@ class PlayerActivity : Activity() {
     override fun onStop() {
         super.onStop()
         cancelPendingCallbacks()
-        saveResumePosition()
+        saveResumePosition(commitSync = true, notifyUi = true)
         player?.pause()
     }
 
     override fun onDestroy() {
-        saveResumePosition()
+        saveResumePosition(commitSync = true, notifyUi = true)
         playerView.player = null
         releasePlayer()
         super.onDestroy()
@@ -641,6 +769,8 @@ class PlayerActivity : Activity() {
         private const val EXTRA_EPISODE_ID = "episode_id"
         private const val MAX_RECONNECT_ATTEMPTS = 5
         private const val RECONNECT_BASE_DELAY_MS = 2_500L
+        private const val PERIODIC_PROGRESS_SAVE_MS = 10_000L
+        private const val BUFFERING_STALL_TIMEOUT_MS = 18_000L
 
         fun start(
             ctx: Context,

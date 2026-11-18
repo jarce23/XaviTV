@@ -831,6 +831,7 @@ private fun PlaylistTypeTab(
 }
 
 /** Equivalente a HomeActivity: accesos a TV en directo, Películas y Series + información de la cuenta o lista M3U. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun HomeScreen(onOpen: (String) -> Unit, onSearch: () -> Unit, onPlaylists: () -> Unit) {
     val repo = MiTVApp.instance.repo ?: return
@@ -840,27 +841,29 @@ fun HomeScreen(onOpen: (String) -> Unit, onSearch: () -> Unit, onPlaylists: () -
     val scope = rememberCoroutineScope()
     val account = rememberLoad(repo, refreshKey) { repo.login().userInfo }
 
+    val triggerRefresh: () -> Unit = {
+        if (!isRefreshing) {
+            isRefreshing = true
+            refreshFeedback = "Actualizando catálogo de ${repo.playlist.name}..."
+            scope.launch {
+                val res = repo.refreshAllXtream()
+                isRefreshing = false
+                refreshKey++
+                refreshFeedback = if (res.success) {
+                    if (repo.playlist.isM3u) "Lista M3U actualizada (${res.liveCount} canales)"
+                    else "Lista actualizada (${res.liveCount} TV, ${res.vodCount} Películas, ${res.seriesCount} Series)"
+                } else {
+                    res.error ?: "Error al actualizar la lista"
+                }
+            }
+        }
+    }
+
     AppScaffold(
         title = "XaviTV  ·  ${repo.playlist.name}",
         actions = {
             IconButton(
-                onClick = {
-                    if (!isRefreshing) {
-                        isRefreshing = true
-                        refreshFeedback = "Actualizando catálogo de ${repo.playlist.name}..."
-                        scope.launch {
-                            val res = repo.refreshAllXtream()
-                            isRefreshing = false
-                            refreshKey++
-                            refreshFeedback = if (res.success) {
-                                if (repo.playlist.isM3u) "Lista M3U actualizada (${res.liveCount} canales)"
-                                else "Lista actualizada (${res.liveCount} TV, ${res.vodCount} Películas, ${res.seriesCount} Series)"
-                            } else {
-                                res.error ?: "Error al actualizar la lista"
-                            }
-                        }
-                    }
-                },
+                onClick = triggerRefresh,
                 enabled = !isRefreshing
             ) {
                 if (isRefreshing) {
@@ -877,7 +880,7 @@ fun HomeScreen(onOpen: (String) -> Unit, onSearch: () -> Unit, onPlaylists: () -
             }
         },
     ) { pad ->
-        Column(
+        BoxWithConstraints(
             Modifier
                 .padding(pad)
                 .fillMaxSize()
@@ -889,120 +892,137 @@ fun HomeScreen(onOpen: (String) -> Unit, onSearch: () -> Unit, onPlaylists: () -
                         )
                     )
                 )
-                .padding(24.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (refreshFeedback != null) {
-                Surface(
-                    color = DarkSurface,
-                    border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.5f)),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.padding(bottom = 16.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        if (isRefreshing) {
-                            CircularProgressIndicator(Modifier.size(16.dp), color = GoldLight, strokeWidth = 2.dp)
-                        } else {
-                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = GoldLight, modifier = Modifier.size(18.dp))
-                        }
-                        Text(
-                            text = refreshFeedback ?: "",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = GoldLight,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
-                }
-            }
-
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(22.dp)) {
-                HomeTile(
-                    title = "TV en directo",
-                    subtitle = "Canales y guía EPG",
-                    icon = Icons.Default.Tv,
-                    modifier = Modifier.weight(1f),
-                ) { onOpen("live") }
-                HomeTile(
-                    title = "Películas",
-                    subtitle = "Catálogo de cine VOD",
-                    icon = Icons.Default.Movie,
-                    modifier = Modifier.weight(1f),
-                ) { onOpen("movie") }
-                HomeTile(
-                    title = "Series",
-                    subtitle = "Temporadas y episodios",
-                    icon = Icons.Default.VideoLibrary,
-                    modifier = Modifier.weight(1f),
-                ) { onOpen("series") }
-            }
-            Spacer(Modifier.height(20.dp))
-            Button(
-                onClick = {
-                    if (!isRefreshing) {
-                        isRefreshing = true
-                        refreshFeedback = "Actualizando catálogo de ${repo.playlist.name}..."
-                        scope.launch {
-                            val res = repo.refreshAllXtream()
-                            isRefreshing = false
-                            refreshKey++
-                            refreshFeedback = if (res.success) {
-                                if (repo.playlist.isM3u) "Lista M3U actualizada (${res.liveCount} canales)"
-                                else "Lista actualizada (${res.liveCount} TV, ${res.vodCount} Películas, ${res.seriesCount} Series)"
-                            } else {
-                                res.error ?: "Error al actualizar la lista"
-                            }
-                        }
-                    }
-                },
-                enabled = !isRefreshing,
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = BetisGreenDark,
-                    contentColor = GoldLight
-                ),
-                border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.55f)),
-                modifier = Modifier.height(44.dp)
+            val isCompact = maxWidth < 600.dp
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = if (isCompact) 16.dp else 24.dp, vertical = if (isCompact) 16.dp else 24.dp),
+                verticalArrangement = if (isCompact) Arrangement.Top else Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                if (isRefreshing) {
-                    CircularProgressIndicator(Modifier.size(16.dp), color = GoldLight, strokeWidth = 2.dp)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Actualizando catálogo…", fontWeight = FontWeight.Bold)
-                } else {
-                    Icon(Icons.Default.Refresh, contentDescription = null, tint = GoldLight)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Actualizar lista Xtream / M3U", fontWeight = FontWeight.Bold)
+                if (refreshFeedback != null) {
+                    Surface(
+                        color = DarkSurface,
+                        border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.5f)),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (isRefreshing) {
+                                CircularProgressIndicator(Modifier.size(16.dp), color = GoldLight, strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = GoldLight, modifier = Modifier.size(18.dp))
+                            }
+                            Text(
+                                text = refreshFeedback ?: "",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = GoldLight,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
                 }
-            }
-            Spacer(Modifier.height(18.dp))
-            (account as? Load.Ok)?.data?.let { u ->
-                Row(
-                    modifier = Modifier
-                        .background(DarkSurface, RoundedCornerShape(12.dp))
-                        .border(1.dp, GoldPrimary.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 20.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+
+                if (isCompact) {
+                    Column(
+                        Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        HomeTile(
+                            title = "TV en directo",
+                            subtitle = "Canales y guía EPG",
+                            icon = Icons.Default.Tv,
+                            modifier = Modifier.fillMaxWidth(),
+                            compact = true,
+                        ) { onOpen("live") }
+                        HomeTile(
+                            title = "Películas",
+                            subtitle = "Catálogo de cine VOD",
+                            icon = Icons.Default.Movie,
+                            modifier = Modifier.fillMaxWidth(),
+                            compact = true,
+                        ) { onOpen("movie") }
+                        HomeTile(
+                            title = "Series",
+                            subtitle = "Temporadas y episodios",
+                            icon = Icons.Default.VideoLibrary,
+                            modifier = Modifier.fillMaxWidth(),
+                            compact = true,
+                        ) { onOpen("series") }
+                    }
+                } else {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(22.dp)) {
+                        HomeTile(
+                            title = "TV en directo",
+                            subtitle = "Canales y guía EPG",
+                            icon = Icons.Default.Tv,
+                            modifier = Modifier.weight(1f),
+                        ) { onOpen("live") }
+                        HomeTile(
+                            title = "Películas",
+                            subtitle = "Catálogo de cine VOD",
+                            icon = Icons.Default.Movie,
+                            modifier = Modifier.weight(1f),
+                        ) { onOpen("movie") }
+                        HomeTile(
+                            title = "Series",
+                            subtitle = "Temporadas y episodios",
+                            icon = Icons.Default.VideoLibrary,
+                            modifier = Modifier.weight(1f),
+                        ) { onOpen("series") }
+                    }
+                }
+
+                Spacer(Modifier.height(20.dp))
+                Button(
+                    onClick = triggerRefresh,
+                    enabled = !isRefreshing,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = BetisGreenDark,
+                        contentColor = GoldLight
+                    ),
+                    border = BorderStroke(1.dp, GoldPrimary.copy(alpha = 0.55f)),
+                    modifier = (if (isCompact) Modifier.fillMaxWidth() else Modifier).height(44.dp)
                 ) {
-                    if (repo.playlist.isM3u) {
-                        AccountStatItem("Lista", u.username ?: repo.playlist.name)
-                        Text("·", color = GoldPrimary, fontWeight = FontWeight.Bold)
-                        AccountStatItem("Resumen", u.status ?: "M3U activa")
+                    if (isRefreshing) {
+                        CircularProgressIndicator(Modifier.size(16.dp), color = GoldLight, strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Actualizando catálogo…", fontWeight = FontWeight.Bold)
                     } else {
-                        val exp = u.expDate?.toLongOrNull()?.let {
-                            SimpleDateFormat("dd/MM/yyyy", Locale.getDefault()).format(Date(it * 1000))
-                        } ?: "Ilimitado"
-                        AccountStatItem("Usuario", u.username ?: "-")
-                        Text("·", color = GoldPrimary, fontWeight = FontWeight.Bold)
-                        AccountStatItem("Estado", u.status ?: "-")
-                        Text("·", color = GoldPrimary, fontWeight = FontWeight.Bold)
-                        AccountStatItem("Caducidad", exp)
-                        Text("·", color = GoldPrimary, fontWeight = FontWeight.Bold)
-                        AccountStatItem("Conexiones", "${u.activeConnections ?: "0"}/${u.maxConnections ?: "-"}")
+                        Icon(Icons.Default.Refresh, contentDescription = null, tint = GoldLight)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Actualizar lista Xtream / M3U", fontWeight = FontWeight.Bold)
+                    }
+                }
+                Spacer(Modifier.height(18.dp))
+                (account as? Load.Ok)?.data?.let { u ->
+                    FlowRow(
+                        modifier = Modifier
+                            .background(DarkSurface, RoundedCornerShape(12.dp))
+                            .border(1.dp, GoldPrimary.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        if (repo.playlist.isM3u) {
+                            AccountStatItem("Lista", u.username ?: repo.playlist.name)
+                            AccountStatItem("Resumen", u.status ?: "M3U activa")
+                        } else {
+                            val exp = u.expDate?.toLongOrNull()?.let {
+                                SimpleDateFormat("dd/MM/yyyy", Locale.getDefault()).format(Date(it * 1000))
+                            } ?: "Ilimitado"
+                            AccountStatItem("Usuario", u.username ?: "-")
+                            AccountStatItem("Estado", u.status ?: "-")
+                            AccountStatItem("Caducidad", exp)
+                            AccountStatItem("Conexiones", "${u.activeConnections ?: "0"}/${u.maxConnections ?: "-"}")
+                        }
                     }
                 }
             }
@@ -1033,10 +1053,68 @@ private fun HomeTile(
     subtitle: String,
     icon: ImageVector,
     modifier: Modifier,
+    compact: Boolean = false,
     onClick: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
     val shape = RoundedCornerShape(18.dp)
+    if (compact) {
+        Row(
+            modifier = modifier
+                .height(92.dp)
+                .onFocusChanged { focused = it.isFocused }
+                .tvClickable(
+                    shape = shape,
+                    borderWidth = 2.5.dp,
+                    idleBorderColor = GoldPrimary.copy(alpha = 0.40f),
+                    onClick = onClick,
+                )
+                .background(
+                    Brush.horizontalGradient(
+                        colors = if (focused) {
+                            listOf(BetisGreenLeaf, BetisGreenPrimary, BetisGreenDark)
+                        } else {
+                            listOf(BetisGreenPrimary, BetisGreenDark, DarkSurface)
+                        }
+                    ),
+                    shape = shape,
+                )
+                .padding(horizontal = 18.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(54.dp)
+                    .clip(CircleShape)
+                    .background(DarkBackground.copy(alpha = 0.45f))
+                    .border(1.5.dp, if (focused) GoldLight else GoldPrimary.copy(alpha = 0.65f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = title,
+                    tint = GoldLight,
+                    modifier = Modifier.size(28.dp),
+                )
+            }
+            Spacer(Modifier.width(16.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = TextPrimaryWhite,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (focused) GoldLight else TextSecondaryGray,
+                )
+            }
+        }
+        return
+    }
     Column(
         modifier = modifier
             .height(195.dp)

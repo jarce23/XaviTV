@@ -31,9 +31,11 @@ class MiTVApp : Application(), ImageLoaderFactory {
         okHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(45, TimeUnit.SECONDS)
+            .writeTimeout(20, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .followRedirects(true)
             .followSslRedirects(true)
-            .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
+            .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
             .build()
 
         store = PlaylistStore(this)
@@ -43,7 +45,12 @@ class MiTVApp : Application(), ImageLoaderFactory {
     override fun newImageLoader(): ImageLoader {
         // Detectar límite de RAM del dispositivo (Fire TV / Android TV suelen tener 1 GB - 2 GB)
         val maxHeapBytes = Runtime.getRuntime().maxMemory()
-        val strictMaxCacheBytes = (maxHeapBytes / 10).coerceAtMost(24L * 1024 * 1024).toInt()
+        val maxCapBytes = if (BuildConfig.FORCE_SOFTWARE_DECODER || maxHeapBytes <= 256L * 1024 * 1024) {
+            16L * 1024 * 1024
+        } else {
+            24L * 1024 * 1024
+        }
+        val strictMaxCacheBytes = (maxHeapBytes / 10).coerceAtMost(maxCapBytes).toInt()
 
         return ImageLoader.Builder(this)
             .okHttpClient(okHttpClient)
@@ -51,7 +58,7 @@ class MiTVApp : Application(), ImageLoaderFactory {
             .bitmapConfig(Bitmap.Config.RGB_565)
             .allowRgb565(true)
             .allowHardware(true)
-            .crossfade(150)
+            .crossfade(if (BuildConfig.FORCE_SOFTWARE_DECODER) 0 else 120)
             .respectCacheHeaders(false)
             .memoryCache {
                 MemoryCache.Builder(this)

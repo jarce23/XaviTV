@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -26,9 +27,6 @@ import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,11 +36,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.minuevaapp.tv.MiTVApp
 import com.minuevaapp.tv.data.Category
 import com.minuevaapp.tv.data.XtreamRepository
 import com.minuevaapp.tv.player.PlayerActivity
 import com.minuevaapp.tv.ui.theme.*
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 private const val ALL = "__all"
@@ -50,6 +55,7 @@ private const val RECENT = "__recent"
 private const val FAV = "__fav"
 
 /** Elemento genérico para la parrilla de cualquier tipo de contenido. */
+@Immutable
 private data class CatalogItem(
     val id: String,
     val name: String?,
@@ -81,6 +87,8 @@ private fun RecentChannelChip(
             contentDescription = item.name,
             fallbackIcon = Icons.Default.Tv,
             contentScale = ContentScale.Fit,
+            targetWidthPx = 96,
+            targetHeightPx = 96,
             modifier = Modifier
                 .size(36.dp)
                 .clip(RoundedCornerShape(6.dp))
@@ -113,9 +121,11 @@ private fun RecentChannelChip(
 }
 
 /**
- * Pantalla de catálogo: categorías a la izquierda y contenido con buscador rápido en tiempo real a la derecha.
- * Sustituye a LiveActivity, MovieActivity, SeriesActivity y CategoryActivity.
+ * Pantalla de catálogo responsive y optimizada para Fire TV / Android TV y Android móvil:
+ * - En pantallas anchas (TV / Tablet / Landscape): panel lateral de categorías + contenido + EPG lateral.
+ * - En pantallas compactas (móvil vertical): chips horizontales de categorías + EPG desplegable bajo demanda.
  */
+@OptIn(FlowPreview::class)
 @Composable
 fun CatalogScreen(
     type: String,
@@ -150,6 +160,16 @@ fun CatalogScreen(
     }
     var selected by remember(type) { mutableStateOf(app.store.getSelectedCategory(type)) }
     var searchQuery by rememberSaveable(type) { mutableStateOf("") }
+    var debouncedQuery by remember(type) { mutableStateOf(searchQuery) }
+    LaunchedEffect(searchQuery) {
+        if (searchQuery.isBlank()) {
+            debouncedQuery = ""
+        } else {
+            delay(150L)
+            debouncedQuery = searchQuery
+        }
+    }
+
     var favs by remember(type) { mutableStateOf(app.store.favorites(type)) }
     var recentRefresh by remember { mutableIntStateOf(0) }
     val storeRecentVersion by app.store.recentUpdates.collectAsState()
@@ -213,15 +233,17 @@ fun CatalogScreen(
 
             val recentIds = remember(recentRefresh, storeRecentVersion, type) { app.store.getRecentlyViewed(type) }
             val recentItems = remember(items, recentIds) {
-                val map = items.associateBy { it.id }
-                recentIds.mapNotNull { map[it] }
+                if (recentIds.isEmpty()) emptyList()
+                else {
+                    val map = items.associateBy { it.id }
+                    recentIds.mapNotNull { map[it] }
+                }
             }
-            val shown = remember(selected, items, favs, searchQuery, recentItems) {
-                val q = searchQuery.trim()
+            val shown = remember(selected, items, favs, debouncedQuery, recentItems) {
+                val q = debouncedQuery.trim()
                 val baseList = when {
                     selected == FAV -> items.filter { it.id in favs }
                     selected == RECENT -> recentItems
-                    // Si el usuario escribe en el buscador rápido, busca en toda la sección sin obligar a cambiar de categoría
                     q.isNotEmpty() -> items
                     selected == ALL -> items
                     else -> items.filter { it.categoryId == selected }
@@ -232,202 +254,194 @@ fun CatalogScreen(
                     baseList.filter { it.name?.contains(q, ignoreCase = true) == true }
                 }
             }
-            Row(Modifier.padding(pad).fillMaxSize()) {
-                // Panel lateral de categorías con acentos en verde oscuro y dorado
-                LazyColumn(
-                    Modifier
-                        .width(230.dp)
-                        .fillMaxHeight()
-                        .background(DarkSurface)
-                        .padding(vertical = 8.dp)
-                ) {
-                    items(cats, key = { it.id }) { c ->
-                        val sel = c.id == selected
-                        val rowShape = RoundedCornerShape(10.dp)
+
+            BoxWithConstraints(Modifier.padding(pad).fillMaxSize()) {
+                val isCompact = maxWidth < 600.dp
+
+                val contentBody: @Composable (Modifier) -> Unit = { bodyModifier ->
+                    Column(bodyModifier) {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 8.dp, vertical = 3.dp)
-                                .tvClickable(
-                                    shape = rowShape,
-                                    idleBorderColor = if (sel) GoldPrimary.copy(alpha = 0.55f) else GoldPrimary.copy(alpha = 0.08f),
-                                ) {
-                                    selected = c.id
-                                    app.store.setSelectedCategory(type, c.id)
-                                }
-                                .background(
-                                    if (sel) BetisGreenDark else DarkSurface,
-                                    rowShape,
-                                )
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                                .background(DarkSurface.copy(alpha = 0.65f))
+                                .padding(horizontal = if (isCompact) 10.dp else 14.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
-                            if (sel) {
-                                Box(
-                                    Modifier
-                                        .width(4.dp)
-                                        .height(18.dp)
-                                        .clip(RoundedCornerShape(2.dp))
-                                        .background(GoldLight)
-                                )
-                                Spacer(Modifier.width(8.dp))
-                            }
-                            Text(
-                                text = c.name?.ifBlank { "Sin nombre" } ?: "Sin nombre",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
-                                color = if (sel) GoldLight else TextPrimaryWhite,
-                                style = MaterialTheme.typography.bodyMedium,
+                            GoldOutlinedTextField(
+                                value = searchQuery,
+                                onValueChange = { searchQuery = it },
+                                label = "Buscar en $title…",
+                                leadingIcon = {
+                                    Icon(Icons.Default.Search, contentDescription = "Buscar", tint = GoldLight)
+                                },
+                                trailingIcon = {
+                                    if (searchQuery.isNotEmpty()) {
+                                        IconButton(onClick = { searchQuery = "" }) {
+                                            Icon(
+                                                imageVector = Icons.Default.Clear,
+                                                contentDescription = "Limpiar búsqueda",
+                                                tint = GoldLight,
+                                            )
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
                             )
+                            Box(
+                                Modifier
+                                    .background(BetisGreenDark, RoundedCornerShape(10.dp))
+                                    .border(1.dp, GoldPrimary.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                            ) {
+                                Text(
+                                    text = "${shown.size}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = GoldLight,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
                         }
-                    }
-                }
-                VerticalDivider(thickness = 1.dp, color = GoldPrimary.copy(alpha = 0.22f))
 
-                // Panel derecho: Barra de búsqueda rápida en la parte superior + contenido filtrado en tiempo real
-                Column(Modifier.weight(1f).fillMaxHeight()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(DarkSurface.copy(alpha = 0.65f))
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        GoldOutlinedTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            label = "Buscar en $title…",
-                            leadingIcon = {
-                                Icon(Icons.Default.Search, contentDescription = "Buscar", tint = GoldLight)
-                            },
-                            trailingIcon = {
-                                if (searchQuery.isNotEmpty()) {
-                                    IconButton(onClick = { searchQuery = "" }) {
-                                        Icon(
-                                            imageVector = Icons.Default.Clear,
-                                            contentDescription = "Limpiar búsqueda",
-                                            tint = GoldLight,
+                        if (isCompact) {
+                            LazyRow(
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth().background(DarkSurface.copy(alpha = 0.45f))
+                            ) {
+                                items(cats, key = { it.id }) { c ->
+                                    val sel = c.id == selected
+                                    val chipShape = RoundedCornerShape(10.dp)
+                                    Box(
+                                        modifier = Modifier
+                                            .tvClickable(
+                                                shape = chipShape,
+                                                idleBorderColor = if (sel) GoldLight else GoldPrimary.copy(alpha = 0.25f),
+                                            ) {
+                                                selected = c.id
+                                                app.store.setSelectedCategory(type, c.id)
+                                            }
+                                            .background(if (sel) BetisGreenPrimary else DarkSurface, chipShape)
+                                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    ) {
+                                        Text(
+                                            text = c.name?.ifBlank { "Sin nombre" } ?: "Sin nombre",
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            fontWeight = if (sel) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (sel) GoldLight else TextPrimaryWhite,
+                                            style = MaterialTheme.typography.labelMedium,
                                         )
                                     }
                                 }
-                            },
-                            modifier = Modifier.weight(1f),
-                        )
-                        Box(
-                            Modifier
-                                .background(BetisGreenDark, RoundedCornerShape(10.dp))
-                                .border(1.dp, GoldPrimary.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
-                                .padding(horizontal = 12.dp, vertical = 10.dp)
-                        ) {
-                            Text(
-                                text = "${shown.size}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = GoldLight,
-                                fontWeight = FontWeight.Bold,
-                            )
-                        }
-                    }
-                    HorizontalDivider(thickness = 1.dp, color = GoldPrimary.copy(alpha = 0.18f))
-
-                    val scrollKey = remember(type, selected) { "${type}_$selected" }
-                    val savedScroll = remember(scrollKey) { app.store.getScrollPosition(scrollKey) }
-
-                    if (shown.isEmpty()) {
-                        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                            Text(
-                                text = if (searchQuery.isNotBlank()) {
-                                    "No se encontraron resultados para «$searchQuery» en $title."
-                                } else if (selected == RECENT) {
-                                    "No has visto ningún contenido recientemente.\nLos contenidos que reproduzcas aparecerán aquí automáticamente."
-                                } else {
-                                    "No hay elementos en esta categoría."
-                                },
-                                textAlign = TextAlign.Center,
-                                color = TextSecondaryGray,
-                            )
-                        }
-                    } else if (type == "live") {
-                        key(type, selected) {
-                            val listState = rememberLazyListState(
-                                initialFirstVisibleItemIndex = savedScroll.first,
-                                initialFirstVisibleItemScrollOffset = savedScroll.second
-                            )
-                            LaunchedEffect(listState) {
-                                snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
-                                    .collect { (idx, off) ->
-                                        app.store.saveScrollPosition(scrollKey, idx, off)
-                                    }
                             }
-                            LiveList(
-                                repo = repo,
-                                items = shown,
-                                favs = favs,
-                                listState = listState,
-                                recentItems = if (selected == ALL && searchQuery.isEmpty()) recentItems else emptyList(),
-                                onPlayRecent = { ch ->
-                                    PlayerActivity.start(ctx, repo.liveUrl(ch.id), ch.name, live = true, streamType = type, streamId = ch.id)
-                                },
-                                onToggleFav = { id ->
-                                    app.store.toggleFavorite(type, id)
-                                    favs = app.store.favorites(type)
-                                },
-                                onPlay = { item ->
-                                    PlayerActivity.start(ctx, repo.liveUrl(item.id), item.name, live = true, streamType = type, streamId = item.id)
-                                },
-                                modifier = Modifier.weight(1f).fillMaxWidth(),
-                            )
                         }
-                    } else {
-                        key(type, selected) {
-                            val gridState = rememberLazyGridState(
-                                initialFirstVisibleItemIndex = savedScroll.first,
-                                initialFirstVisibleItemScrollOffset = savedScroll.second
-                            )
-                            LaunchedEffect(gridState) {
-                                snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
-                                    .collect { (idx, off) ->
-                                        app.store.saveScrollPosition(scrollKey, idx, off)
-                                    }
+                        HorizontalDivider(thickness = 1.dp, color = GoldPrimary.copy(alpha = 0.18f))
+
+                        val scrollKey = remember(type, selected) { "${type}_$selected" }
+                        val savedScroll = remember(scrollKey) { app.store.getScrollPosition(scrollKey) }
+
+                        if (shown.isEmpty()) {
+                            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = if (searchQuery.isNotBlank()) {
+                                        "No se encontraron resultados para «$searchQuery» en $title."
+                                    } else if (selected == RECENT) {
+                                        "No has visto ningún contenido recientemente.\nLos contenidos que reproduzcas aparecerán aquí automáticamente."
+                                    } else {
+                                        "No hay elementos en esta categoría."
+                                    },
+                                    textAlign = TextAlign.Center,
+                                    color = TextSecondaryGray,
+                                    modifier = Modifier.padding(24.dp),
+                                )
                             }
-                            LazyVerticalGrid(
-                                state = gridState,
-                                columns = GridCells.Adaptive(140.dp),
-                                modifier = Modifier.weight(1f).fillMaxWidth().padding(14.dp),
-                                horizontalArrangement = Arrangement.spacedBy(14.dp),
-                                verticalArrangement = Arrangement.spacedBy(14.dp),
-                            ) {
-                                if (selected == ALL && searchQuery.isEmpty() && recentItems.isNotEmpty()) {
-                                    item(span = { GridItemSpan(maxLineSpan) }) {
-                                        Column(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
-                                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
-                                                Icon(Icons.Default.History, contentDescription = null, tint = GoldLight, modifier = Modifier.size(18.dp))
-                                                Spacer(Modifier.width(6.dp))
-                                                Text(
-                                                    text = if (type == "movie") "Películas vistas recientemente" else "Series vistas recientemente",
-                                                    fontWeight = FontWeight.Bold,
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                    color = GoldLight,
-                                                )
-                                            }
-                                            LazyRow(
-                                                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                                contentPadding = PaddingValues(vertical = 4.dp),
-                                            ) {
-                                                items(recentItems, key = { "rec_row_${it.id}" }) { item ->
-                                                    val badge = item.extra?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
-                                                    val itemProg = remember(item.id, type, progressMap, recentRefresh) {
-                                                        val key = if (type == "movie") "movie:${item.id}" else "series_cover:${item.id}"
-                                                        app.store.getPlaybackProgress(key)?.progressFraction ?: 0f
-                                                    }
-                                                    Box(Modifier.width(115.dp)) {
+                        } else if (type == "live") {
+                            key(type, selected) {
+                                val listState = rememberLazyListState(
+                                    initialFirstVisibleItemIndex = savedScroll.first,
+                                    initialFirstVisibleItemScrollOffset = savedScroll.second
+                                )
+                                LaunchedEffect(listState, scrollKey) {
+                                    snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+                                        .distinctUntilChanged()
+                                        .debounce(400L)
+                                        .collect { (idx, off) ->
+                                            app.store.saveScrollPosition(scrollKey, idx, off)
+                                        }
+                                }
+                                LiveList(
+                                    repo = repo,
+                                    items = shown,
+                                    favs = favs,
+                                    listState = listState,
+                                    isCompact = isCompact,
+                                    recentItems = if (selected == ALL && debouncedQuery.isEmpty()) recentItems else emptyList(),
+                                    onPlayRecent = { ch ->
+                                        PlayerActivity.start(ctx, repo.liveUrl(ch.id), ch.name, live = true, streamType = type, streamId = ch.id)
+                                    },
+                                    onToggleFav = { id ->
+                                        app.store.toggleFavorite(type, id)
+                                        favs = app.store.favorites(type)
+                                    },
+                                    onPlay = { item ->
+                                        PlayerActivity.start(ctx, repo.liveUrl(item.id), item.name, live = true, streamType = type, streamId = item.id)
+                                    },
+                                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                                )
+                            }
+                        } else {
+                            key(type, selected) {
+                                val gridState = rememberLazyGridState(
+                                    initialFirstVisibleItemIndex = savedScroll.first,
+                                    initialFirstVisibleItemScrollOffset = savedScroll.second
+                                )
+                                LaunchedEffect(gridState, scrollKey) {
+                                    snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                        .distinctUntilChanged()
+                                        .debounce(400L)
+                                        .collect { (idx, off) ->
+                                            app.store.saveScrollPosition(scrollKey, idx, off)
+                                        }
+                                }
+                                LazyVerticalGrid(
+                                    state = gridState,
+                                    columns = GridCells.Adaptive(if (isCompact) 118.dp else 140.dp),
+                                    modifier = Modifier.weight(1f).fillMaxWidth().padding(if (isCompact) 10.dp else 14.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(if (isCompact) 10.dp else 14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(if (isCompact) 10.dp else 14.dp),
+                                ) {
+                                    if (selected == ALL && debouncedQuery.isEmpty() && recentItems.isNotEmpty()) {
+                                        item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_vod") {
+                                            Column(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
+                                                    Icon(Icons.Default.History, contentDescription = null, tint = GoldLight, modifier = Modifier.size(18.dp))
+                                                    Spacer(Modifier.width(6.dp))
+                                                    Text(
+                                                        text = if (type == "movie") "Películas vistas recientemente" else "Series vistas recientemente",
+                                                        fontWeight = FontWeight.Bold,
+                                                        style = MaterialTheme.typography.bodyMedium,
+                                                        color = GoldLight,
+                                                    )
+                                                }
+                                                LazyRow(
+                                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                                    contentPadding = PaddingValues(vertical = 4.dp),
+                                                ) {
+                                                    items(recentItems, key = { "rec_row_${it.id}" }) { item ->
+                                                        val badge = item.extra?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                                        val itemProg = if (type == "movie") {
+                                                            resolveMovieProgressFraction(progressMap, item.id)
+                                                        } else {
+                                                            resolveSeriesProgressFraction(progressMap, item.id)
+                                                        }
                                                         PosterCard(
                                                             title = item.name,
                                                             image = item.image,
                                                             subtitle = badge,
                                                             isFavorite = item.id in favs,
                                                             progress = itemProg,
+                                                            modifier = Modifier.width(115.dp),
                                                         ) {
                                                             app.store.addRecentlyViewed(type, item.id)
                                                             recentRefresh++
@@ -438,27 +452,87 @@ fun CatalogScreen(
                                             }
                                         }
                                     }
-                                }
-                                items(shown, key = { it.id }) { item ->
-                                    val badge = item.extra?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
-                                    val itemProg = remember(item.id, type, progressMap, recentRefresh) {
-                                        val key = if (type == "movie") "movie:${item.id}" else "series_cover:${item.id}"
-                                        app.store.getPlaybackProgress(key)?.progressFraction ?: 0f
-                                    }
-                                    PosterCard(
-                                        title = item.name,
-                                        image = item.image,
-                                        subtitle = badge,
-                                        isFavorite = item.id in favs,
-                                        progress = itemProg,
-                                    ) {
-                                        app.store.addRecentlyViewed(type, item.id)
-                                        recentRefresh++
-                                        if (type == "movie") onMovie(item.id) else onSeries(item.id)
+                                    items(shown, key = { it.id }) { item ->
+                                        val badge = item.extra?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                        val itemProg = if (type == "movie") {
+                                            resolveMovieProgressFraction(progressMap, item.id)
+                                        } else {
+                                            resolveSeriesProgressFraction(progressMap, item.id)
+                                        }
+                                        PosterCard(
+                                            title = item.name,
+                                            image = item.image,
+                                            subtitle = badge,
+                                            isFavorite = item.id in favs,
+                                            progress = itemProg,
+                                            modifier = Modifier.fillMaxWidth(),
+                                        ) {
+                                            app.store.addRecentlyViewed(type, item.id)
+                                            recentRefresh++
+                                            if (type == "movie") onMovie(item.id) else onSeries(item.id)
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
+                }
+
+                if (isCompact) {
+                    contentBody(Modifier.fillMaxSize())
+                } else {
+                    Row(Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            Modifier
+                                .width(230.dp)
+                                .fillMaxHeight()
+                                .background(DarkSurface)
+                                .padding(vertical = 8.dp)
+                        ) {
+                            items(cats, key = { it.id }) { c ->
+                                val sel = c.id == selected
+                                val rowShape = RoundedCornerShape(10.dp)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                                        .tvClickable(
+                                            shape = rowShape,
+                                            idleBorderColor = if (sel) GoldPrimary.copy(alpha = 0.55f) else GoldPrimary.copy(alpha = 0.08f),
+                                        ) {
+                                            selected = c.id
+                                            app.store.setSelectedCategory(type, c.id)
+                                        }
+                                        .background(
+                                            if (sel) BetisGreenDark else DarkSurface,
+                                            rowShape,
+                                        )
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    if (sel) {
+                                        Box(
+                                            Modifier
+                                                .width(4.dp)
+                                                .height(18.dp)
+                                                .clip(RoundedCornerShape(2.dp))
+                                                .background(GoldLight)
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                    }
+                                    Text(
+                                        text = c.name?.ifBlank { "Sin nombre" } ?: "Sin nombre",
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                                        color = if (sel) GoldLight else TextPrimaryWhite,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                    )
+                                }
+                            }
+                        }
+                        VerticalDivider(thickness = 1.dp, color = GoldPrimary.copy(alpha = 0.22f))
+                        contentBody(Modifier.weight(1f).fillMaxHeight())
                     }
                 }
             }
@@ -466,13 +540,14 @@ fun CatalogScreen(
     }
 }
 
-/** Lista de canales con vista previa de la guía (EPG corta), como LiveChannelActivity. */
+/** Lista de canales con vista previa de la guía (EPG corta) con debounce D-Pad y soporte móvil compacto. */
 @Composable
 private fun LiveList(
     repo: XtreamRepository,
     items: List<CatalogItem>,
     favs: Set<String>,
     listState: LazyListState,
+    isCompact: Boolean,
     recentItems: List<CatalogItem> = emptyList(),
     onPlayRecent: (CatalogItem) -> Unit = {},
     onToggleFav: (String) -> Unit,
@@ -480,12 +555,23 @@ private fun LiveList(
     modifier: Modifier = Modifier,
 ) {
     var focusedId by rememberSaveable { mutableStateOf<String?>(null) }
-    val epg = rememberLoad(focusedId) { focusedId?.let { repo.shortEpg(it) }.orEmpty() }
+    var debouncedEpgId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(focusedId) {
+        val target = focusedId
+        if (target == null) {
+            debouncedEpgId = null
+        } else {
+            // Evita tormenta de peticiones EPG al desplazarse rápido con el mando D-Pad en Fire TV / Android TV
+            delay(350L)
+            debouncedEpgId = target
+        }
+    }
+    val epg = rememberLoad(debouncedEpgId) { debouncedEpgId?.let { repo.shortEpg(it) }.orEmpty() }
 
-    Row(modifier) {
+    val channelListContent: @Composable (Modifier) -> Unit = { listMod ->
         LazyColumn(
             state = listState,
-            modifier = Modifier.weight(1f).fillMaxHeight().padding(horizontal = 10.dp, vertical = 8.dp),
+            modifier = listMod.padding(horizontal = 10.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             if (recentItems.isNotEmpty()) {
@@ -523,7 +609,7 @@ private fun LiveList(
                         .tvClickable(
                             shape = rowShape,
                             idleBorderColor = if (isSelected) GoldPrimary.copy(alpha = 0.65f) else GoldPrimary.copy(alpha = 0.16f),
-                            onFocused = { focusedId = item.id },
+                            onFocused = { if (!isCompact) focusedId = item.id },
                             onClick = {
                                 focusedId = item.id
                                 onPlay(item)
@@ -541,8 +627,10 @@ private fun LiveList(
                         contentDescription = item.name,
                         fallbackIcon = Icons.Default.Tv,
                         contentScale = ContentScale.Fit,
+                        targetWidthPx = 96,
+                        targetHeightPx = 96,
                         modifier = Modifier
-                            .size(48.dp)
+                            .size(46.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .border(1.dp, GoldPrimary.copy(alpha = 0.25f), RoundedCornerShape(8.dp))
                             .padding(4.dp),
@@ -564,11 +652,14 @@ private fun LiveList(
                             modifier = Modifier.size(18.dp).padding(end = 4.dp),
                         )
                     }
-                    TextButton(
-                        onClick = { focusedId = item.id },
-                        colors = ButtonDefaults.textButtonColors(contentColor = GoldLight),
-                    ) {
-                        Text("Guía", fontWeight = FontWeight.SemiBold)
+                    if (!repo.playlist.isM3u) {
+                        TextButton(
+                            onClick = { focusedId = if (isCompact && focusedId == item.id) null else item.id },
+                            colors = ButtonDefaults.textButtonColors(contentColor = GoldLight),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        ) {
+                            Text("Guía", fontWeight = FontWeight.SemiBold)
+                        }
                     }
                     IconButton(onClick = { onToggleFav(item.id) }) {
                         Icon(
@@ -580,21 +671,35 @@ private fun LiveList(
                 }
             }
         }
-        VerticalDivider(thickness = 1.dp, color = GoldPrimary.copy(alpha = 0.22f))
+    }
+
+    val epgPanelContent: @Composable (Modifier, Boolean) -> Unit = { panelMod, showClose ->
         Column(
-            Modifier
-                .width(310.dp)
-                .fillMaxHeight()
+            panelMod
                 .background(DarkSurface)
                 .padding(14.dp)
         ) {
-            Text(
-                text = "Guía de programación (EPG)",
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.titleSmall,
-                color = GoldLight,
-            )
-            Spacer(Modifier.height(10.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = "Guía de programación (EPG)",
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = GoldLight,
+                )
+                if (showClose) {
+                    IconButton(
+                        onClick = { focusedId = null },
+                        modifier = Modifier.size(28.dp),
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Cerrar guía", tint = GoldLight, modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
             if (focusedId == null) {
                 Text(
                     text = "Selecciona o pulsa «Guía» en un canal para consultar su emisión actual.",
@@ -642,6 +747,22 @@ private fun LiveList(
                     }
                 }
             }
+        }
+    }
+
+    if (isCompact) {
+        Column(modifier) {
+            channelListContent(Modifier.weight(1f).fillMaxWidth())
+            if (focusedId != null && !repo.playlist.isM3u) {
+                HorizontalDivider(thickness = 1.dp, color = GoldPrimary.copy(alpha = 0.35f))
+                epgPanelContent(Modifier.fillMaxWidth().heightIn(min = 140.dp, max = 230.dp), true)
+            }
+        }
+    } else {
+        Row(modifier) {
+            channelListContent(Modifier.weight(1f).fillMaxHeight())
+            VerticalDivider(thickness = 1.dp, color = GoldPrimary.copy(alpha = 0.22f))
+            epgPanelContent(Modifier.width(310.dp).fillMaxHeight(), false)
         }
     }
 }

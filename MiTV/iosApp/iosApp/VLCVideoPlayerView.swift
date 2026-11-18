@@ -27,18 +27,26 @@ public class VLCPlayerHostView: UIView {
 
     // Posición guardada para reanudar automáticamente una vez que el motor esté listo
     private var pendingResumeSeconds: Double? = nil
+    private var _isLiveStream: Bool = true
+    private var wasPlayingBeforeInterruption: Bool = false
+    private var activeAspectMode: String = "DEFAULT"
+    private var lastAppliedFillSize: CGSize = .zero
+
+    // Punteros C persistentes para libvlc (evita use-after-free al salir de withCString)
+    private var aspectRatioCString: UnsafeMutablePointer<CChar>? = nil
+    private var cropGeometryCString: UnsafeMutablePointer<CChar>? = nil
 
     // Almacenamiento seguro interno de textos accesible a nivel de módulo
     internal var _statusMsg: String = "Iniciando motor VLCKit..."
     internal var _currentUrl: String = ""
 
     @objc public var currentStatusMessage: NSString {
-        get { return NSMutableString(string: _statusMsg) }
+        get { return _statusMsg as NSString }
         set { _statusMsg = String(newValue) }
     }
 
     @objc public var currentUrl: NSString {
-        get { return NSMutableString(string: _currentUrl) }
+        get { return _currentUrl as NSString }
         set { _currentUrl = String(newValue) }
     }
 
@@ -50,23 +58,96 @@ public class VLCPlayerHostView: UIView {
     }
 
     @objc public func getStatusMessageCopy() -> NSString {
-        return NSMutableString(string: _statusMsg)
+        return _statusMsg as NSString
     }
 
     @objc public func getCurrentUrlCopy() -> NSString {
-        return NSMutableString(string: _currentUrl)
+        return _currentUrl as NSString
     }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         setupViews()
         configureAudioSession()
+        registerLifecycleObservers()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setupViews()
         configureAudioSession()
+        registerLifecycleObservers()
+    }
+
+    private func registerLifecycleObservers() {
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(handleDidEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(handleWillEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(handleAudioSessionInterruption(_:)), name: AVAudioSession.interruptionNotification, object: nil)
+        nc.addObserver(self, selector: #selector(handleAudioRouteChange(_:)), name: AVAudioSession.routeChangeNotification, object: nil)
+    }
+
+    @objc private func handleDidEnterBackground() {
+        // En VOD pausamos limpiamente para ahorrar batería y evitar desincronización de frames al volver
+        if !_isLiveStream && getIsPlaying() {
+            wasPlayingBeforeInterruption = true
+            pauseStream()
+        }
+    }
+
+    @objc private func handleWillEnterForeground() {
+        configureAudioSession()
+        if wasPlayingBeforeInterruption {
+            wasPlayingBeforeInterruption = false
+            resumeStream()
+        }
+    }
+
+    @objc private func handleAudioSessionInterruption(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeRaw = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else {
+            return
+        }
+        switch type {
+        case .began:
+            if getIsPlaying() {
+                wasPlayingBeforeInterruption = true
+                pauseStream()
+            }
+        case .ended:
+            let optionsRaw = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+            if wasPlayingBeforeInterruption && options.contains(.shouldResume) {
+                wasPlayingBeforeInterruption = false
+                configureAudioSession()
+                resumeStream()
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    @objc private func handleAudioRouteChange(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let reasonRaw = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw) else {
+            return
+        }
+        if reason == .oldDeviceUnavailable && getIsPlaying() {
+            pauseStream()
+        }
+    }
+
+    private func freeAspectCStrings() {
+        if let ptr = aspectRatioCString {
+            free(ptr)
+            aspectRatioCString = nil
+        }
+        if let ptr = cropGeometryCString {
+            free(ptr)
+            cropGeometryCString = nil
+        }
     }
 
     private func setupViews() {
@@ -87,6 +168,12 @@ public class VLCPlayerHostView: UIView {
     public override func layoutSubviews() {
         super.layoutSubviews()
         avPlayerLayer?.frame = bounds
+        if activeAspectMode == "FILL" && bounds.width > 1 && bounds.height > 1 {
+            let roundedSize = CGSize(width: bounds.width.rounded(), height: bounds.height.rounded())
+            if roundedSize != lastAppliedFillSize {
+                applyAspectRatio("FILL")
+            }
+        }
     }
 
     private func configureAudioSession() {
@@ -127,6 +214,8 @@ public class VLCPlayerHostView: UIView {
             }
 
             self._currentUrl = clean
+            self._isLiveStream = isLive
+            self.wasPlayingBeforeInterruption = false
             self.currentHasError = false
 
             // 1. Prioridad: Motor nativo VLCKit
@@ -435,14 +524,12 @@ public class VLCPlayerHostView: UIView {
 
             #if canImport(MobileVLCKit)
             if let player = self.vlcMediaPlayer as? VLCMediaPlayer {
-                let vlcTime = VLCTime(int: Int32(seconds * 1000.0))
-                player.time = vlcTime
-                if let media = player.media {
-                    let len = media.length.intValue
-                    if len > 0 {
-                        let pos = Float(seconds * 1000.0) / Float(len)
-                        player.position = min(max(pos, 0.0), 1.0)
-                    }
+                let targetMs = Int64(seconds * 1000.0)
+                if targetMs <= Int64(Int32.max) {
+                    player.time = VLCTime(int: Int32(targetMs))
+                } else if let media = player.media, media.length.intValue > 0 {
+                    let pos = Float(targetMs) / Float(media.length.intValue)
+                    player.position = min(max(pos, 0.0), 1.0)
                 }
                 return
             }
@@ -580,35 +667,59 @@ public class VLCPlayerHostView: UIView {
 
     private func applyAspectRatio(_ safeRatio: String) {
         let upper = safeRatio.uppercased()
+        activeAspectMode = upper.isEmpty ? "DEFAULT" : upper
+
+        let isFill = (upper == "FILL")
+        let isExplicitRatio = !upper.isEmpty && upper != "DEFAULT" && upper != "AUTO" && !isFill
+
+        // Crear nuevos punteros C antes de liberar los anteriores para evitar cualquier ventana de use-after-free
+        let oldAspectPtr = aspectRatioCString
+        let oldCropPtr = cropGeometryCString
+
+        let newAspectPtr: UnsafeMutablePointer<CChar>? = isExplicitRatio ? strdup(safeRatio) : nil
+        let newCropPtr: UnsafeMutablePointer<CChar>?
+        if isFill && bounds.width > 1 && bounds.height > 1 {
+            let rw = bounds.width.rounded()
+            let rh = bounds.height.rounded()
+            lastAppliedFillSize = CGSize(width: rw, height: rh)
+            newCropPtr = strdup("\(Int(rw)):\(Int(rh))")
+        } else {
+            lastAppliedFillSize = .zero
+            newCropPtr = nil
+        }
+
+        aspectRatioCString = newAspectPtr
+        cropGeometryCString = newCropPtr
+
         #if canImport(MobileVLCKit)
         if let player = vlcMediaPlayer as? VLCMediaPlayer {
-            if !safeRatio.isEmpty && upper != "DEFAULT" && upper != "AUTO" {
-                safeRatio.withCString { cStr in
-                    player.videoAspectRatio = UnsafeMutablePointer(mutating: cStr)
-                }
-            } else {
-                player.videoAspectRatio = nil
-            }
+            player.videoAspectRatio = newAspectPtr
+            player.videoCropGeometry = newCropPtr
         }
         #else
         if let playerObj = vlcMediaPlayer as? NSObject {
-            let sel = NSSelectorFromString("setVideoAspectRatio:")
-            if playerObj.responds(to: sel) {
-                typealias SetAspectRatioIMP = @convention(c) (AnyObject, Selector, UnsafePointer<CChar>?) -> Void
-                let imp = playerObj.method(for: sel)
+            let aspectSel = NSSelectorFromString("setVideoAspectRatio:")
+            if playerObj.responds(to: aspectSel) {
+                typealias SetAspectRatioIMP = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<CChar>?) -> Void
+                let imp = playerObj.method(for: aspectSel)
                 let fn = unsafeBitCast(imp, to: SetAspectRatioIMP.self)
-                if !safeRatio.isEmpty && upper != "DEFAULT" && upper != "AUTO" {
-                    safeRatio.withCString { cStr in
-                        fn(playerObj, sel, cStr)
-                    }
-                } else {
-                    fn(playerObj, sel, nil)
-                }
+                fn(playerObj, aspectSel, newAspectPtr)
+            }
+            let cropSel = NSSelectorFromString("setVideoCropGeometry:")
+            if playerObj.responds(to: cropSel) {
+                typealias SetCropIMP = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<CChar>?) -> Void
+                let imp = playerObj.method(for: cropSel)
+                let fn = unsafeBitCast(imp, to: SetCropIMP.self)
+                fn(playerObj, cropSel, newCropPtr)
             }
         }
         #endif
+
+        if let ptr = oldAspectPtr { free(ptr) }
+        if let ptr = oldCropPtr { free(ptr) }
+
         if let layer = avPlayerLayer {
-            layer.videoGravity = (upper == "FILL") ? .resizeAspectFill : .resizeAspect
+            layer.videoGravity = isFill ? .resizeAspectFill : .resizeAspect
         }
     }
 
@@ -769,6 +880,13 @@ public class VLCPlayerHostView: UIView {
                 }
             case 6:
                 self._statusMsg = "VLCKit • En pausa"
+            case 3:
+                if self._isLiveStream {
+                    self._statusMsg = "Corte de emisión en directo · Reconectando..."
+                    self.currentHasError = true
+                } else {
+                    self._statusMsg = "VLCKit • Finalizado"
+                }
             case 4:
                 self._statusMsg = "Error decodificando stream con VLCKit"
                 self.currentHasError = true
@@ -782,13 +900,17 @@ public class VLCPlayerHostView: UIView {
 
     private func destroyEngine() {
         pendingResumeSeconds = nil
+        wasPlayingBeforeInterruption = false
         #if canImport(MobileVLCKit)
         if let player = vlcMediaPlayer as? VLCMediaPlayer {
             player.delegate = nil
             player.drawable = nil
+            player.videoAspectRatio = nil
+            player.videoCropGeometry = nil
             player.stop()
             self.vlcMediaPlayer = nil
             self.vlcMedia = nil
+            freeAspectCStrings()
             return
         }
         #endif
@@ -817,6 +939,7 @@ public class VLCPlayerHostView: UIView {
             self.vlcMediaPlayer = nil
             self.vlcMedia = nil
         }
+        freeAspectCStrings()
     }
 
     public override func willMove(toSuperview newSuperview: UIView?) {
@@ -828,6 +951,7 @@ public class VLCPlayerHostView: UIView {
     }
 
     deinit {
+        NotificationCenter.default.removeObserver(self)
         destroyEngine()
     }
 }
@@ -891,7 +1015,7 @@ public class VLCPlayerBridge: NSObject {
         if let host = shared.currentHost {
             return host.getStatusMessageCopy()
         }
-        return NSMutableString(string: "VLCKit • Decodificador interno activo")
+        return "VLCKit • Decodificador interno activo" as NSString
     }
 
     @objc public static func getHasError() -> Bool {

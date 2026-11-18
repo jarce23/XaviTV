@@ -8,10 +8,14 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Label
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -33,7 +37,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.minuevaapp.tv.data.*
 import com.minuevaapp.tv.ui.theme.*
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.awt.Cursor
 import java.text.SimpleDateFormat
@@ -276,7 +284,7 @@ fun PlaylistsScreen(onConnected: () -> Unit) {
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Icon(
-                                            if (pl.isM3u) Icons.Default.PlaylistPlay else Icons.Default.Tv,
+                                            if (pl.isM3u) Icons.AutoMirrored.Filled.PlaylistPlay else Icons.Default.Tv,
                                             contentDescription = null,
                                             tint = if (isCurrent) BgDeepCharcoal else GoldChampagne,
                                             modifier = Modifier.size(20.dp)
@@ -476,7 +484,7 @@ fun PlaylistsScreen(onConnected: () -> Unit) {
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
-                                    Icons.Default.PlaylistPlay,
+                                    Icons.AutoMirrored.Filled.PlaylistPlay,
                                     contentDescription = null,
                                     tint = if (isM3u) BgDeepCharcoal else GoldChampagne,
                                     modifier = Modifier.size(18.dp)
@@ -498,7 +506,7 @@ fun PlaylistsScreen(onConnected: () -> Unit) {
                         value = name,
                         onValueChange = { name = it },
                         label = "Nombre de la lista (ej. Salón Principal)",
-                        leadingIcon = { Icon(Icons.Default.Label, contentDescription = null) },
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.Label, contentDescription = null) },
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(10.dp))
@@ -843,7 +851,7 @@ fun HomeScreen(
                 HomeActionPill(
                     title = "Gestionar Listas",
                     subtitle = "Cambiar entre servidores Xtream Codes o listas M3U",
-                    icon = Icons.Default.PlaylistPlay,
+                    icon = Icons.AutoMirrored.Filled.PlaylistPlay,
                     onClick = onOpenPlaylists,
                     modifier = Modifier.weight(1f).fillMaxHeight()
                 )
@@ -977,6 +985,7 @@ private fun HomeActionPill(
 // ─── 3. CATALOG SCREEN (LIVE / MOVIES / SERIES / FAVORITES) ──────────
 enum class CatalogKind { LIVE, MOVIES, SERIES, FAVORITES }
 
+@OptIn(FlowPreview::class)
 @Composable
 fun CatalogScreen(
     kind: CatalogKind,
@@ -1001,6 +1010,15 @@ fun CatalogScreen(
         mutableStateOf(appState.store.getSelectedCategory(kindKey))
     }
     var searchQuery by remember { mutableStateOf("") }
+    var debouncedQuery by remember { mutableStateOf("") }
+    LaunchedEffect(searchQuery) {
+        if (searchQuery.isBlank()) {
+            debouncedQuery = ""
+        } else {
+            delay(150L)
+            debouncedQuery = searchQuery
+        }
+    }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var reloadTrigger by remember { mutableIntStateOf(0) }
@@ -1011,6 +1029,7 @@ fun CatalogScreen(
 
     var selectedLive by remember { mutableStateOf<LiveStream?>(null) }
     var epgList by remember { mutableStateOf<List<EpgListing>>(emptyList()) }
+    var epgJob by remember { mutableStateOf<Job?>(null) }
     var favRefresh by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
 
@@ -1080,33 +1099,33 @@ fun CatalogScreen(
         recentIds.mapNotNull { map[it] }
     }
 
-    val filteredLiveItems = remember(liveItems, selectedCategory, searchQuery, recentLiveItems) {
+    val filteredLiveItems = remember(liveItems, selectedCategory, debouncedQuery, recentLiveItems) {
         val byCat = when (selectedCategory) {
             "ALL" -> liveItems
             "RECENT" -> recentLiveItems
             else -> liveItems.filter { it.categoryId == selectedCategory }
         }
-        val q = searchQuery.trim()
+        val q = debouncedQuery.trim()
         if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
     }
 
-    val filteredMovieItems = remember(movieItems, selectedCategory, searchQuery, recentMovieItems) {
+    val filteredMovieItems = remember(movieItems, selectedCategory, debouncedQuery, recentMovieItems) {
         val byCat = when (selectedCategory) {
             "ALL" -> movieItems
             "RECENT" -> recentMovieItems
             else -> movieItems.filter { it.categoryId == selectedCategory }
         }
-        val q = searchQuery.trim()
+        val q = debouncedQuery.trim()
         if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
     }
 
-    val filteredSeriesItems = remember(seriesItems, selectedCategory, searchQuery, recentSeriesItems) {
+    val filteredSeriesItems = remember(seriesItems, selectedCategory, debouncedQuery, recentSeriesItems) {
         val byCat = when (selectedCategory) {
             "ALL" -> seriesItems
             "RECENT" -> recentSeriesItems
             else -> seriesItems.filter { it.categoryId == selectedCategory }
         }
-        val q = searchQuery.trim()
+        val q = debouncedQuery.trim()
         if (q.isEmpty()) byCat else byCat.filter { it.name?.contains(q, ignoreCase = true) == true }
     }
 
@@ -1133,7 +1152,6 @@ fun CatalogScreen(
                 onClick = {
                     if (!appState.isRefreshing) {
                         appState.refreshCurrentPlaylistAsync()
-                        reloadTrigger++
                     }
                 },
                 enabled = !appState.isRefreshing,
@@ -1270,10 +1288,12 @@ fun CatalogScreen(
                             store = store,
                             recentChannels = recentLiveItems,
                             selectedCategory = selectedCategory,
-                            searchQuery = searchQuery,
+                            searchQuery = debouncedQuery,
                             onSelect = { ch ->
                                 selectedLive = ch
-                                scope.launch {
+                                epgJob?.cancel()
+                                epgJob = scope.launch {
+                                    delay(150L)
                                     epgList = repo.shortEpg(ch.streamId)
                                 }
                             },
@@ -1294,75 +1314,88 @@ fun CatalogScreen(
                         kind == CatalogKind.MOVIES -> {
                             val favVodIds = remember(favRefresh) { store.favorites("vod") }
                             if (filteredMovieItems.isEmpty()) {
-                                EmptySearchMessage(searchQuery, isRecent = selectedCategory == "RECENT")
+                                EmptySearchMessage(debouncedQuery, isRecent = selectedCategory == "RECENT")
                             } else {
-                                LazyVerticalGrid(
-                                    columns = GridCells.Adaptive(156.dp),
-                                    contentPadding = PaddingValues(18.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(14.dp),
-                                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                                ) {
-                                    if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentMovieItems.isNotEmpty()) {
-                                        item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_movies") {
-                                            Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
-                                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
-                                                    Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
-                                                    Spacer(Modifier.width(6.dp))
-                                                    Text(
-                                                        "Películas vistas recientemente",
-                                                        fontWeight = FontWeight.Bold,
-                                                        fontSize = 14.sp,
-                                                        color = GoldChampagne
-                                                    )
-                                                }
-                                                LazyRow(
-                                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                                    contentPadding = PaddingValues(vertical = 4.dp)
-                                                ) {
-                                                    items(recentMovieItems, key = { "rec_mov_${it.streamId}" }) { m ->
-                                                        val movProg = remember(m.streamId, progressMap) {
-                                                            store.getPlaybackProgress("vod:${m.streamId}")?.progressFraction ?: 0f
-                                                        }
-                                                        Box(Modifier.width(130.dp)) {
-                                                            PosterCard(
-                                                                title = m.name ?: "Película",
-                                                                image = m.icon,
-                                                                subtitle = m.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
-                                                                    ?: m.extension?.uppercase(),
-                                                                isFavorite = favVodIds.contains(m.streamId),
-                                                                progress = movProg,
-                                                                onClick = {
-                                                                    store.addRecentlyViewed("movie", m.streamId)
-                                                                    favRefresh++
-                                                                    onOpenMovie(m)
-                                                                }
-                                                            )
+                                val scrollKey = remember(kindKey, selectedCategory) { "${kindKey}_$selectedCategory" }
+                                key(scrollKey) {
+                                    val savedScroll = remember(scrollKey) { store.getScrollPosition(scrollKey) }
+                                    val gridState = rememberLazyGridState(
+                                        initialFirstVisibleItemIndex = savedScroll.first,
+                                        initialFirstVisibleItemScrollOffset = savedScroll.second
+                                    )
+                                    LaunchedEffect(gridState, scrollKey) {
+                                        snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                            .distinctUntilChanged()
+                                            .debounce(400L)
+                                            .collect { (idx, off) ->
+                                                store.saveScrollPosition(scrollKey, idx, off)
+                                            }
+                                    }
+                                    LazyVerticalGrid(
+                                        state = gridState,
+                                        columns = GridCells.Adaptive(156.dp),
+                                        contentPadding = PaddingValues(18.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                                    ) {
+                                        if (selectedCategory == "ALL" && debouncedQuery.isEmpty() && recentMovieItems.isNotEmpty()) {
+                                            item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_movies") {
+                                                Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
+                                                        Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                                                        Spacer(Modifier.width(6.dp))
+                                                        Text(
+                                                            "Películas vistas recientemente",
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontSize = 14.sp,
+                                                            color = GoldChampagne
+                                                        )
+                                                    }
+                                                    LazyRow(
+                                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                                        contentPadding = PaddingValues(vertical = 4.dp)
+                                                    ) {
+                                                        items(recentMovieItems, key = { "rec_mov_${it.streamId}" }) { m ->
+                                                            val movProg = resolveDesktopMovieProgressFraction(progressMap, m.streamId)
+                                                            Box(Modifier.width(130.dp)) {
+                                                                PosterCard(
+                                                                    title = m.name ?: "Película",
+                                                                    image = m.icon,
+                                                                    subtitle = m.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                                                        ?: m.extension?.uppercase(),
+                                                                    isFavorite = favVodIds.contains(m.streamId),
+                                                                    progress = movProg,
+                                                                    onClick = {
+                                                                        store.addRecentlyViewed("movie", m.streamId)
+                                                                        favRefresh++
+                                                                        onOpenMovie(m)
+                                                                    }
+                                                                )
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    items(
-                                        filteredMovieItems,
-                                        key = { it.streamId }
-                                    ) { m ->
-                                        val movProg = remember(m.streamId, progressMap) {
-                                            store.getPlaybackProgress("vod:${m.streamId}")?.progressFraction ?: 0f
+                                        items(
+                                            filteredMovieItems,
+                                            key = { it.streamId }
+                                        ) { m ->
+                                            val movProg = resolveDesktopMovieProgressFraction(progressMap, m.streamId)
+                                            PosterCard(
+                                                title = m.name ?: "Película",
+                                                image = m.icon,
+                                                subtitle = m.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                                    ?: m.extension?.uppercase(),
+                                                isFavorite = favVodIds.contains(m.streamId),
+                                                progress = movProg,
+                                                onClick = {
+                                                    store.addRecentlyViewed("movie", m.streamId)
+                                                    favRefresh++
+                                                    onOpenMovie(m)
+                                                }
+                                            )
                                         }
-                                        PosterCard(
-                                            title = m.name ?: "Película",
-                                            image = m.icon,
-                                            subtitle = m.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
-                                                ?: m.extension?.uppercase(),
-                                            isFavorite = favVodIds.contains(m.streamId),
-                                            progress = movProg,
-                                            onClick = {
-                                                store.addRecentlyViewed("movie", m.streamId)
-                                                favRefresh++
-                                                onOpenMovie(m)
-                                            }
-                                        )
                                     }
                                 }
                             }
@@ -1370,75 +1403,88 @@ fun CatalogScreen(
                         kind == CatalogKind.SERIES -> {
                             val favSeriesIds = remember(favRefresh) { store.favorites("series") }
                             if (filteredSeriesItems.isEmpty()) {
-                                EmptySearchMessage(searchQuery, isRecent = selectedCategory == "RECENT")
+                                EmptySearchMessage(debouncedQuery, isRecent = selectedCategory == "RECENT")
                             } else {
-                                LazyVerticalGrid(
-                                    columns = GridCells.Adaptive(156.dp),
-                                    contentPadding = PaddingValues(18.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(14.dp),
-                                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                                ) {
-                                    if (selectedCategory == "ALL" && searchQuery.isEmpty() && recentSeriesItems.isNotEmpty()) {
-                                        item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_series") {
-                                            Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
-                                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
-                                                    Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
-                                                    Spacer(Modifier.width(6.dp))
-                                                    Text(
-                                                        "Series vistas recientemente",
-                                                        fontWeight = FontWeight.Bold,
-                                                        fontSize = 14.sp,
-                                                        color = GoldChampagne
-                                                    )
-                                                }
-                                                LazyRow(
-                                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                                    contentPadding = PaddingValues(vertical = 4.dp)
-                                                ) {
-                                                    items(recentSeriesItems, key = { "rec_ser_${it.seriesId}" }) { s ->
-                                                        val serProg = remember(s.seriesId, progressMap) {
-                                                            store.getPlaybackProgress("series_cover:${s.seriesId}")?.progressFraction ?: 0f
-                                                        }
-                                                        Box(Modifier.width(130.dp)) {
-                                                            PosterCard(
-                                                                title = s.name ?: "Serie",
-                                                                image = s.cover,
-                                                                subtitle = s.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
-                                                                    ?: s.genre,
-                                                                isFavorite = favSeriesIds.contains(s.seriesId),
-                                                                progress = serProg,
-                                                                onClick = {
-                                                                    store.addRecentlyViewed("series", s.seriesId)
-                                                                    favRefresh++
-                                                                    onOpenSeries(s)
-                                                                }
-                                                            )
+                                val scrollKey = remember(kindKey, selectedCategory) { "${kindKey}_$selectedCategory" }
+                                key(scrollKey) {
+                                    val savedScroll = remember(scrollKey) { store.getScrollPosition(scrollKey) }
+                                    val gridState = rememberLazyGridState(
+                                        initialFirstVisibleItemIndex = savedScroll.first,
+                                        initialFirstVisibleItemScrollOffset = savedScroll.second
+                                    )
+                                    LaunchedEffect(gridState, scrollKey) {
+                                        snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                                            .distinctUntilChanged()
+                                            .debounce(400L)
+                                            .collect { (idx, off) ->
+                                                store.saveScrollPosition(scrollKey, idx, off)
+                                            }
+                                    }
+                                    LazyVerticalGrid(
+                                        state = gridState,
+                                        columns = GridCells.Adaptive(156.dp),
+                                        contentPadding = PaddingValues(18.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                                    ) {
+                                        if (selectedCategory == "ALL" && debouncedQuery.isEmpty() && recentSeriesItems.isNotEmpty()) {
+                                            item(span = { GridItemSpan(maxLineSpan) }, key = "header_recent_series") {
+                                                Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
+                                                        Icon(Icons.Default.History, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                                                        Spacer(Modifier.width(6.dp))
+                                                        Text(
+                                                            "Series vistas recientemente",
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontSize = 14.sp,
+                                                            color = GoldChampagne
+                                                        )
+                                                    }
+                                                    LazyRow(
+                                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                                        contentPadding = PaddingValues(vertical = 4.dp)
+                                                    ) {
+                                                        items(recentSeriesItems, key = { "rec_ser_${it.seriesId}" }) { s ->
+                                                            val serProg = resolveDesktopSeriesProgressFraction(progressMap, s.seriesId)
+                                                            Box(Modifier.width(130.dp)) {
+                                                                PosterCard(
+                                                                    title = s.name ?: "Serie",
+                                                                    image = s.cover,
+                                                                    subtitle = s.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                                                        ?: s.genre,
+                                                                    isFavorite = favSeriesIds.contains(s.seriesId),
+                                                                    progress = serProg,
+                                                                    onClick = {
+                                                                        store.addRecentlyViewed("series", s.seriesId)
+                                                                        favRefresh++
+                                                                        onOpenSeries(s)
+                                                                    }
+                                                                )
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    items(
-                                        filteredSeriesItems,
-                                        key = { it.seriesId }
-                                    ) { s ->
-                                        val serProg = remember(s.seriesId, progressMap) {
-                                            store.getPlaybackProgress("series_cover:${s.seriesId}")?.progressFraction ?: 0f
+                                        items(
+                                            filteredSeriesItems,
+                                            key = { it.seriesId }
+                                        ) { s ->
+                                            val serProg = resolveDesktopSeriesProgressFraction(progressMap, s.seriesId)
+                                            PosterCard(
+                                                title = s.name ?: "Serie",
+                                                image = s.cover,
+                                                subtitle = s.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
+                                                    ?: s.genre,
+                                                isFavorite = favSeriesIds.contains(s.seriesId),
+                                                progress = serProg,
+                                                onClick = {
+                                                    store.addRecentlyViewed("series", s.seriesId)
+                                                    favRefresh++
+                                                    onOpenSeries(s)
+                                                }
+                                            )
                                         }
-                                        PosterCard(
-                                            title = s.name ?: "Serie",
-                                            image = s.cover,
-                                            subtitle = s.rating?.takeIf { it.isNotBlank() && it != "0" }?.let { "★ $it" }
-                                                ?: s.genre,
-                                            isFavorite = favSeriesIds.contains(s.seriesId),
-                                            progress = serProg,
-                                            onClick = {
-                                                store.addRecentlyViewed("series", s.seriesId)
-                                                favRefresh++
-                                                onOpenSeries(s)
-                                            }
-                                        )
                                     }
                                 }
                             }
@@ -1512,6 +1558,7 @@ private fun BoxScope.EmptySearchMessage(query: String, isRecent: Boolean = false
     }
 }
 
+@OptIn(FlowPreview::class)
 @Composable
 private fun LiveChannelsView(
     channels: List<LiveStream>,
@@ -1534,9 +1581,25 @@ private fun LiveChannelsView(
         return
     }
 
+    val scrollKey = remember(selectedCategory) { "live_$selectedCategory" }
+    val savedScroll = remember(scrollKey) { store.getScrollPosition(scrollKey) }
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = savedScroll.first,
+        initialFirstVisibleItemScrollOffset = savedScroll.second
+    )
+    LaunchedEffect(listState, scrollKey) {
+        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+            .distinctUntilChanged()
+            .debounce(400L)
+            .collect { (idx, off) ->
+                store.saveScrollPosition(scrollKey, idx, off)
+            }
+    }
+
     Row(Modifier.fillMaxSize()) {
         LazyColumn(
-            Modifier
+            state = listState,
+            modifier = Modifier
                 .weight(1.25f)
                 .fillMaxHeight()
                 .padding(14.dp),
@@ -1573,6 +1636,7 @@ private fun LiveChannelsView(
                                         url = ch.icon,
                                         contentDescription = ch.name,
                                         contentScale = ContentScale.Fit,
+                                        maxDimension = 96,
                                         modifier = Modifier
                                             .size(32.dp)
                                             .clip(RoundedCornerShape(6.dp))
@@ -1628,6 +1692,7 @@ private fun LiveChannelsView(
                         url = ch.icon,
                         contentDescription = ch.name,
                         contentScale = ContentScale.Fit,
+                        maxDimension = 96,
                         modifier = Modifier
                             .size(46.dp)
                             .clip(RoundedCornerShape(10.dp))
@@ -2261,6 +2326,15 @@ fun SearchScreen(
     val store = remember { appState.store }
     val progressMap by store.playbackProgressFlow.collectAsState()
     var query by remember { mutableStateOf("") }
+    var debouncedQuery by remember { mutableStateOf("") }
+    LaunchedEffect(query) {
+        if (query.isBlank()) {
+            debouncedQuery = ""
+        } else {
+            delay(150L)
+            debouncedQuery = query
+        }
+    }
     var liveAll by remember { mutableStateOf<List<LiveStream>>(emptyList()) }
     var vodAll by remember { mutableStateOf<List<VodStream>>(emptyList()) }
     var seriesAll by remember { mutableStateOf<List<Series>>(emptyList()) }
@@ -2273,7 +2347,7 @@ fun SearchScreen(
         loading = false
     }
 
-    val q = query.trim()
+    val q = debouncedQuery.trim()
     val liveMatches = remember(q, liveAll) {
         if (q.length < 2) emptyList() else liveAll.filter { it.name?.contains(q, true) == true }.take(30)
     }
